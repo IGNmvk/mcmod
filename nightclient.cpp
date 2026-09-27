@@ -116,7 +116,7 @@ static volatile double g_play_time = 0;      /* last time the gameplay screen wa
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
 static float           g_zoom_cur = 1.0f;
-static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; int arrow_count; float elytra_angle; int elytra_angle_valid; float x, y, z; } g_snap;
+static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; int arrow_count; float elytra_angle; int elytra_angle_valid; float x, y, z; int combat_target; float combat_target_t; } g_snap;
 static float g_last_px = 0.0f, g_last_py = 0.0f, g_last_pz = 0.0f;
 static double g_last_pos_time = 0.0;
 static bool g_have_last_pos = false;
@@ -1066,9 +1066,70 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     glColorMask(old_color[0], old_color[1], old_color[2], old_color[3]);
 }
 
+
+static bool combat_ray_aabb(const NcAabb6 &b, const float origin[3], const float dir[3], float max_t, float *out_t) {
+    float tmin = 0.0f, tmax = max_t;
+    const float minv[3] = { b.minx, b.miny, b.minz };
+    const float maxv[3] = { b.maxx, b.maxy, b.maxz };
+    for (int i = 0; i < 3; ++i) {
+        float o = origin[i], d = dir[i];
+        if (fabsf(d) < 1e-6f) {
+            if (o < minv[i] || o > maxv[i]) return false;
+            continue;
+        }
+        float a = (minv[i] - o) / d;
+        float c = (maxv[i] - o) / d;
+        if (a > c) { float tmp = a; a = c; c = tmp; }
+        if (a > tmin) tmin = a;
+        if (c < tmax) tmax = c;
+        if (tmin > tmax) return false;
+    }
+    if (out_t) *out_t = tmin;
+    return tmin <= max_t && tmax >= 0.0f;
+}
+
+static void combat_consider_entity(void *entity) {
+    if (!g_cfg.combat_crosshair_on || !g_local_player || !entity || entity == g_local_player) return;
+
+    const float *pp = entity_getPos(g_local_player);
+    if (!pp || !entity_getPos(entity)) return;
+
+    const NcAabb6 *raw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
+    NcAabb6 b = *raw;
+    if (!isfinite(b.minx) || !isfinite(b.miny) || !isfinite(b.minz) ||
+        !isfinite(b.maxx) || !isfinite(b.maxy) || !isfinite(b.maxz)) return;
+    if (b.maxx <= b.minx || b.maxy <= b.miny || b.maxz <= b.minz) return;
+
+    NcVec2 rot = {0.0f, 0.0f};
+    entity_getRotation(&rot, g_local_player);
+    if (!isfinite(rot.x) || !isfinite(rot.y)) return;
+
+    const float deg = 0.01745329251994329577f;
+    const float p = rot.x * deg;
+    const float y = rot.y * deg;
+    const float cp = cosf(p), sp = sinf(p);
+    const float sy = sinf(y), cy = cosf(y);
+
+    float origin[3] = { pp[0], pp[1] + 1.62f, pp[2] };
+    float dir[3] = { -sy * cp, -sp, cy * cp };
+
+    /* Vanilla survival reach is around three blocks. A tiny extra margin
+     * keeps entities right on the boundary from flickering between states. */
+    const float reach = 3.10f;
+    float hit_t = 0.0f;
+    if (!combat_ray_aabb(b, origin, dir, reach, &hit_t)) return;
+
+    if (!g_snap.combat_target || hit_t < g_snap.combat_target_t) {
+        g_snap.combat_target = 1;
+        g_snap.combat_target_t = hit_t;
+    }
+}
+
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
+    if (g_cfg.combat_crosshair_on)
+        combat_consider_entity(entity);
     if (g_cfg.hitbox_on && entity && pos)
         hit_draw_entity(entity, (const float *)pos, partial);
 }
@@ -1256,7 +1317,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_COORDS, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_COORDS, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_FAST_TOTEM, E_N, E_COUNT };
 
 static float fpx(float size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, float size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -1521,17 +1582,17 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 static int *elem_on(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
                  case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_COORDS: return &g_cfg.coords_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
-                 case E_DROP: return &g_cfg.drop_on; default: return 0; }
+                 case E_DROP: return &g_cfg.drop_on; case E_FAST_TOTEM: return &g_cfg.fast_totem_on; default: return 0; }
 }
 static float *elem_x(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
                  case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_COORDS: return &g_cfg.coords_x; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
-                 case E_DROP: return &g_cfg.drop_x; default: return &g_cfg.n_x; }
+                 case E_DROP: return &g_cfg.drop_x; case E_FAST_TOTEM: return &g_cfg.fast_totem_x; default: return &g_cfg.n_x; }
 }
 static float *elem_y(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
                  case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_COORDS: return &g_cfg.coords_y; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
-                 case E_DROP: return &g_cfg.drop_y; default: return &g_cfg.n_y; }
+                 case E_DROP: return &g_cfg.drop_y; case E_FAST_TOTEM: return &g_cfg.fast_totem_y; default: return &g_cfg.n_y; }
 }
 static ImVec2 elem_size(int e) {
     switch (e) {
@@ -1544,9 +1605,25 @@ static ImVec2 elem_size(int e) {
         case E_ELYTRA_ANGLE: return size_elytra_angle();
         case E_DROP:  return btn_size(g_cfg.drop_text,  g_cfg.drop_btn);
         case E_ZOOM:  return btn_size(g_cfg.zoom_text,  g_cfg.zoom_btn);
-        case E_PERSP: return btn_size(g_cfg.persp_text, g_cfg.persp_btn);
-        default:      return btn_size(g_cfg.n_text,     g_cfg.n_btn);
+        case E_PERSP:      return btn_size(g_cfg.persp_text, g_cfg.persp_btn);
+        case E_FAST_TOTEM: return btn_size("TOTEM", g_cfg.fast_totem_btn);
+        default:           return btn_size(g_cfg.n_text, g_cfg.n_btn);
     }
+}
+
+
+static void draw_combat_crosshair(ImDrawList *dl, float w, float h) {
+    if (!g_cfg.combat_crosshair_on || !g_snap.combat_target) return;
+    const float cx = floorf(w * 0.5f);
+    const float cy = floorf(h * 0.5f);
+    const ImU32 red = packed(g_cfg.combat_crosshair_col, g_cfg.combat_crosshair_alpha);
+    const float t = g_cfg.combat_crosshair_thickness;
+    const float gap = g_cfg.combat_crosshair_gap;
+    const float len = g_cfg.combat_crosshair_length;
+    dl->AddLine(V(cx - gap - len, cy), V(cx - gap, cy), red, t);
+    dl->AddLine(V(cx + gap, cy), V(cx + gap + len, cy), red, t);
+    dl->AddLine(V(cx, cy - gap - len), V(cx, cy - gap), red, t);
+    dl->AddLine(V(cx, cy + gap), V(cx, cy + gap + len), red, t);
 }
 
 /* ------------------------------------------------------------------ "Move on screen" */
@@ -1562,7 +1639,7 @@ static void build_edit(float w, float h) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
-    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "coords", "elytra_angle", "zoom", "persp", "drop", "n" };
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "coords", "elytra_angle", "zoom", "persp", "drop", "fast_totem", "n" };
 
     for (int e = 0; e < E_COUNT; e++) {
         int *on = elem_on(e);
@@ -1575,8 +1652,9 @@ static void build_edit(float w, float h) {
             case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? -1 : g_snap.arrow_count); break;
             case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
             case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
-            case E_DROP:   draw_button(dl, pos, sz, g_cfg.drop_text,  g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col); break;
-            case E_ZOOM:   draw_button(dl, pos, sz, g_cfg.zoom_text,  g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_bg_col, g_cfg.zoom_col); break;
+            case E_DROP:       draw_button(dl, pos, sz, g_cfg.drop_text,  g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col); break;
+            case E_FAST_TOTEM: draw_button(dl, pos, sz, "TOTEM", g_cfg.fast_totem_alpha, g_cfg.fast_totem_text_alpha, false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col); break;
+            case E_ZOOM:       draw_button(dl, pos, sz, g_cfg.zoom_text,  g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_bg_col, g_cfg.zoom_col); break;
             case E_PERSP:  draw_button(dl, pos, sz, g_cfg.persp_text, g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col); break;
             default:       draw_button(dl, pos, sz, g_cfg.n_text,     g_cfg.n_alpha, g_cfg.n_text_alpha, true,  false, g_cfg.n_bg_col, g_cfg.n_col); break;
         }
@@ -1786,6 +1864,16 @@ static void panel_drop() {
     hud_pos(&g_cfg.drop_x, &g_cfg.drop_y);
     ImGui::TextDisabled("Works after you have touched the screen in a world once.");
 }
+static void panel_combat_crosshair() {
+    head("Combat crosshair", &g_cfg.combat_crosshair_on,
+         "Turns the crosshair red while an entity is directly in front of you and within close combat reach.");
+    color_picker("Crosshair color", &g_cfg.combat_crosshair_col);
+    sl_f("Length", &g_cfg.combat_crosshair_length, 1.0f, 12.0f);
+    sl_f("Gap", &g_cfg.combat_crosshair_gap, 0.0f, 8.0f);
+    sl_f("Thickness", &g_cfg.combat_crosshair_thickness, 1.0f, 6.0f);
+    sl_f("Opacity", &g_cfg.combat_crosshair_alpha, 0.1f, 1.0f);
+    ImGui::TextDisabled("Detection follows the center view ray and uses a 3.1 block reach.");
+}
 static void panel_fast_totem() {
     head("Fast Totem", &g_cfg.fast_totem_on,
          "Shows only in the inventory. Tap it to move a totem into your offhand.");
@@ -1829,6 +1917,7 @@ static const Mod g_mods[] = {
     { "Crystal optimizer",   &g_cfg.crystal_opt_on, panel_crystal_optimizer },
     { "Elytra angle",       &g_cfg.elytra_angle_on, panel_elytra_angle },
     { "Quick drop",         &g_cfg.drop_on,    panel_drop },
+    { "Combat crosshair",    &g_cfg.combat_crosshair_on, panel_combat_crosshair },
     { "Fast Totem",         &g_cfg.fast_totem_on, panel_fast_totem },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
@@ -1932,7 +2021,8 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool fast_totem_vis = g_cfg.fast_totem_on && hud_btns;
     if (!zoom_vis) g_zoom_active = 0;
 
-    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || menu_reach || g_menu_open || g_edit;
+    bool combat_vis = g_cfg.combat_crosshair_on && in_world && !g_menu_open && !g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || combat_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -2034,6 +2124,8 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
                           false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col, &hud[3]))
                 fast_totem_move();
         }
+        if (in_world && !g_menu_open)
+            draw_combat_crosshair(fg, (float)w, (float)h);
         if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
             if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, g_cfg.n_text,
@@ -2073,6 +2165,8 @@ static swap_fn g_orig_swap = 0;
 static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     nc_frame(d, s);
     g_hit_seen_n = 0;
+    g_snap.combat_target = 0;
+    g_snap.combat_target_t = 999.0f;
     return g_orig_swap(d, s);
 }
 
@@ -2137,9 +2231,7 @@ static void nc_init(void) {
         reg("End Crystal render optimizer", "_ZN20EnderCrystalRenderer6renderER6EntityRK4Vec3ff", (void *)hook_crystal_render, (void **)&g_orig_crystal_render);
         reg("End Crystal effects optimizer", "_ZN20EnderCrystalRenderer13renderEffectsER6EntityRK4Vec3ff", (void *)hook_crystal_effects, (void **)&g_orig_crystal_effects);
     }
-    if (g_cfg.hook_hitbox) {
-        reg("entity render hitboxes", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff", (void *)hook_entity_render, (void **)&g_orig_entity_render);
-    }
+    reg("entity render hitboxes/combat crosshair", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff", (void *)hook_entity_render, (void **)&g_orig_entity_render);
     if (g_cfg.hook_perf) {
         reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
         reg("fancy skies", "_ZNK7Options13getFancySkiesEv", (void *)hook_skies, (void **)&g_orig_skies);
