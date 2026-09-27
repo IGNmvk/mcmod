@@ -1,0 +1,5 @@
+code:
+- {name: nightclient, type: native}
+id: nightclient
+name: Night Client
+version: '0.4.3'

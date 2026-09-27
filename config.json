@@ -1,0 +1,9 @@
+{
+  "metal": "1.1/metal.apk",
+  "mods": [
+    "1.1/mods/io.mrarm.tml.assetpatch",
+    "1.1/mods/io.mrarm.tml.assetloader",
+    "1.0/mods/android-ad",
+    "1.1.3/mods/nightclient"
+  ]
+}
