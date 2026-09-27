@@ -1926,7 +1926,14 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
     bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
     bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
-    bool inventory_open = (now - g_inventory_render_time) < 0.30;
+    /* InventoryScreen hooks are not emitted consistently by every 1.1.5 build.
+     * Use them when available, but also recognize the player-inventory state from
+     * the screen stack: gameplay input has stopped, while neither Settings nor
+     * Pause is active. This keeps the button inventory-only without depending on
+     * one fragile InventoryScreen symbol. */
+    bool inventory_hook_open = (now - g_inventory_render_time) < 0.30;
+    bool inventory_fallback_open = g_local_player && !play_hud && !in_pause && !in_settings && !in_world;
+    bool inventory_open = inventory_hook_open || inventory_fallback_open;
     bool fast_totem_vis = g_cfg.fast_totem_on && inventory_open && !g_menu_open && !g_edit;
     if (!zoom_vis) g_zoom_active = 0;
 
