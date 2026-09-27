@@ -158,6 +158,8 @@ static char *g_kb_text = 0;
 
 /* Forward declaration: the keyboard bridge is above the logger definition. */
 static void nclog(const char *fmt, ...);
+static void ctrl_apply_player_actions();
+static void sl_f(const char *label, float *v, float lo, float hi);
 
 typedef jint (*fn_JNI_GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
 
