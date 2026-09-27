@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <vector>
 #include <jni.h>
 
 #include <EGL/egl.h>
@@ -34,6 +35,7 @@ extern "C" {
 }
 #include "nc_font.h"
 #include "nc_icons.h"
+#include "nc_controls.h"
 
 #define NC_VERSION "0.4.4"
 #define NC_DIR "/sdcard/games/com.mojang/NightClient/"
@@ -359,6 +361,181 @@ static void kb_stop() {
     kb_release(env, attached);
 }
 
+/* ---------------- New 1.21-style touch controls ---------------- */
+enum {
+    NC_CTRL_JOY = 0,
+    NC_CTRL_ATTACK,
+    NC_CTRL_INTERACT,
+    NC_CTRL_JUMP,
+    NC_CTRL_SNEAK,
+    NC_CTRL_UP,
+    NC_CTRL_DOWN,
+    NC_CTRL_COUNT
+};
+
+static volatile int g_ctrl_pressed[NC_CTRL_COUNT] = {0};
+static volatile int g_ctrl_touch_id = -1;
+static volatile int g_ctrl_joy_id = -1;
+static volatile int g_ctrl_ids[NC_CTRL_COUNT] = {-1,-1,-1,-1,-1,-1,-1};
+static volatile float g_ctrl_joy_x = 0.0f;
+static volatile float g_ctrl_joy_y = 0.0f;
+static NcRect g_ctrl_rects[NC_CTRL_COUNT];
+static bool g_ctrl_assets_ready = false;
+static GLuint g_ctrl_tex[NC_CTRL_COUNT][2] = {};
+static int g_ctrl_selected = NC_CTRL_JOY;
+static int g_ctrl_editor_tab = 0; /* 0 = opacity, 1 = size */
+
+static void ctrl_reset_states() {
+    for (int i = 0; i < NC_CTRL_COUNT; ++i) g_ctrl_pressed[i] = 0;
+    g_ctrl_touch_id = -1;
+    g_ctrl_joy_id = -1;
+    for (int i=0;i<NC_CTRL_COUNT;i++) g_ctrl_ids[i] = -1;
+    g_ctrl_joy_x = 0.0f;
+    g_ctrl_joy_y = 0.0f;
+}
+
+static bool ctrl_point_in(const NcRect &r, float x, float y) {
+    return r.visible && x >= r.x && y >= r.y && x <= r.x + r.w && y <= r.y + r.h;
+}
+static float *ctrl_x(int i) {
+    static float *p[NC_CTRL_COUNT];
+    p[0]=&g_cfg.ctrl_joy_x; p[1]=&g_cfg.ctrl_attack_x; p[2]=&g_cfg.ctrl_interact_x;
+    p[3]=&g_cfg.ctrl_jump_x; p[4]=&g_cfg.ctrl_sneak_x; p[5]=&g_cfg.ctrl_up_x; p[6]=&g_cfg.ctrl_down_x;
+    return (i>=0 && i<NC_CTRL_COUNT) ? p[i] : &g_cfg.ctrl_joy_x;
+}
+static float *ctrl_y(int i) {
+    static float *p[NC_CTRL_COUNT];
+    p[0]=&g_cfg.ctrl_joy_y; p[1]=&g_cfg.ctrl_attack_y; p[2]=&g_cfg.ctrl_interact_y;
+    p[3]=&g_cfg.ctrl_jump_y; p[4]=&g_cfg.ctrl_sneak_y; p[5]=&g_cfg.ctrl_up_y; p[6]=&g_cfg.ctrl_down_y;
+    return (i>=0 && i<NC_CTRL_COUNT) ? p[i] : &g_cfg.ctrl_joy_y;
+}
+static float *ctrl_size(int i) {
+    static float *p[NC_CTRL_COUNT];
+    p[0]=&g_cfg.ctrl_joy_size; p[1]=&g_cfg.ctrl_attack_size; p[2]=&g_cfg.ctrl_interact_size;
+    p[3]=&g_cfg.ctrl_jump_size; p[4]=&g_cfg.ctrl_sneak_size; p[5]=&g_cfg.ctrl_up_size; p[6]=&g_cfg.ctrl_down_size;
+    return (i>=0 && i<NC_CTRL_COUNT) ? p[i] : &g_cfg.ctrl_joy_size;
+}
+static float *ctrl_alpha(int i) {
+    static float *p[NC_CTRL_COUNT];
+    p[0]=&g_cfg.ctrl_joy_alpha; p[1]=&g_cfg.ctrl_attack_alpha; p[2]=&g_cfg.ctrl_interact_alpha;
+    p[3]=&g_cfg.ctrl_jump_alpha; p[4]=&g_cfg.ctrl_sneak_alpha; p[5]=&g_cfg.ctrl_up_alpha; p[6]=&g_cfg.ctrl_down_alpha;
+    return (i>=0 && i<NC_CTRL_COUNT) ? p[i] : &g_cfg.ctrl_joy_alpha;
+}
+static const char *ctrl_name(int i) {
+    static const char *n[NC_CTRL_COUNT] = {"Joystick","Attack","Interact","Jump","Sneak","Fly up","Fly down"};
+    return (i>=0 && i<NC_CTRL_COUNT) ? n[i] : "Joystick";
+}
+static float ctrl_px(float base, float size) {
+    return base * 3.0f * size;
+}
+
+static const NcControlPng *ctrl_png(int i, bool pressed) {
+    switch (i) {
+        case NC_CTRL_ATTACK:  return pressed ? &nc_ctrl_png_attack_pressed : &nc_ctrl_png_attack;
+        case NC_CTRL_INTERACT:return pressed ? &nc_ctrl_png_interact_pressed : &nc_ctrl_png_interact;
+        case NC_CTRL_JUMP:    return pressed ? &nc_ctrl_png_jump_pressed : &nc_ctrl_png_jump;
+        case NC_CTRL_SNEAK:   return pressed ? &nc_ctrl_png_sneak_pressed : &nc_ctrl_png_sneak;
+        case NC_CTRL_UP:      return pressed ? &nc_ctrl_png_flyingascend_pressed : &nc_ctrl_png_flyingascend;
+        case NC_CTRL_DOWN:    return pressed ? &nc_ctrl_png_flyingdescend_pressed : &nc_ctrl_png_flyingdescend;
+        default: return 0;
+    }
+}
+
+/*
+ * We intentionally keep the PNG bytes embedded in the client, but decode them
+ * with Android's BitmapFactory on first use instead of depending on stb_image.
+ */
+static bool ctrl_decode_png_texture(const NcControlPng *png, GLuint *out) {
+    if (!png || !out || !png->data || png->size == 0) return false;
+    GLint prev = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return false;
+
+    jclass bf = env->FindClass("android/graphics/BitmapFactory");
+    jclass bitmap_cls = env->FindClass("android/graphics/Bitmap");
+    jclass bos = env->FindClass("java/io/ByteArrayInputStream");
+    if (!bf || !bitmap_cls || !bos) { kb_release(env, attached); return false; }
+
+    jmethodID ctor = env->GetMethodID(bos, "<init>", "([B)V");
+    jmethodID decode = env->GetStaticMethodID(bf, "decodeStream",
+        "(Ljava/io/InputStream;)Landroid/graphics/Bitmap;");
+    jmethodID getW = env->GetMethodID(bitmap_cls, "getWidth", "()I");
+    jmethodID getH = env->GetMethodID(bitmap_cls, "getHeight", "()I");
+    jmethodID copy = env->GetMethodID(bitmap_cls, "copy", "(Landroid/graphics/Bitmap$Config;Z)Landroid/graphics/Bitmap;");
+    if (!ctor || !decode || !getW || !getH || !copy) {
+        kb_release(env, attached); return false;
+    }
+
+    jbyteArray arr = env->NewByteArray((jsize)png->size);
+    env->SetByteArrayRegion(arr, 0, (jsize)png->size, (const jbyte *)png->data);
+    jobject stream = env->NewObject(bos, ctor, arr);
+    jobject bmp = stream ? env->CallStaticObjectMethod(bf, decode, stream) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); bmp = 0; }
+    if (!bmp) {
+        if (arr) env->DeleteLocalRef(arr);
+        if (stream) env->DeleteLocalRef(stream);
+        kb_release(env, attached); return false;
+    }
+
+    jint bw = env->CallIntMethod(bmp, getW);
+    jint bh = env->CallIntMethod(bmp, getH);
+    if (bw <= 0 || bh <= 0) {
+        env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
+        kb_release(env, attached); return false;
+    }
+
+    /* readPixels through Bitmap.copy(ARGB_8888,true), then getPixels() */
+    jclass config_cls = env->FindClass("android/graphics/Bitmap$Config");
+    jfieldID argb = config_cls ? env->GetStaticFieldID(config_cls, "ARGB_8888",
+                                                        "Landroid/graphics/Bitmap$Config;") : 0;
+    jobject cfg = argb ? env->GetStaticObjectField(config_cls, argb) : 0;
+    jobject copybmp = cfg ? env->CallObjectMethod(bmp, copy, cfg, JNI_FALSE) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); copybmp = 0; }
+
+    jmethodID getPixels = env->GetMethodID(bitmap_cls, "getPixels", "([IIIIIII)V");
+    if (!copybmp || !getPixels) {
+        if (copybmp) env->DeleteLocalRef(copybmp);
+        env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
+        if (cfg) env->DeleteLocalRef(cfg); if (config_cls) env->DeleteLocalRef(config_cls);
+        kb_release(env, attached); return false;
+    }
+
+    const int count = bw * bh;
+    jintArray px = env->NewIntArray(count);
+    env->CallVoidMethod(copybmp, getPixels, px, 0, bw, 0, 0, bw, bh);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr); if (cfg) env->DeleteLocalRef(cfg); if(config_cls) env->DeleteLocalRef(config_cls); kb_release(env, attached); return false; }
+
+    jint *pix = env->GetIntArrayElements(px, 0);
+    if (!pix) { env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr); if(cfg) env->DeleteLocalRef(cfg); if(config_cls) env->DeleteLocalRef(config_cls); kb_release(env, attached); return false; }
+
+    glGenTextures(1, out);
+    glBindTexture(GL_TEXTURE_2D, *out);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    std::vector<unsigned char> rgba8((size_t)count * 4);
+    for (int i=0; i<count; ++i) {
+        unsigned int v = (unsigned int)pix[i];
+        rgba8[i*4+0] = (unsigned char)((v >> 16) & 0xff);
+        rgba8[i*4+1] = (unsigned char)((v >> 8) & 0xff);
+        rgba8[i*4+2] = (unsigned char)(v & 0xff);
+        rgba8[i*4+3] = (unsigned char)((v >> 24) & 0xff);
+    }
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
+
+    env->ReleaseIntArrayElements(px, pix, JNI_ABORT);
+    env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp);
+    env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
+    if (cfg) env->DeleteLocalRef(cfg); if (config_cls) env->DeleteLocalRef(config_cls);
+    kb_release(env, attached);
+    return true;
+}
+
+
 
 /* ------------------------------------------------------------------ helpers */
 static void nclog(const char *fmt, ...) {
@@ -642,6 +819,7 @@ static void hook_tick(void *self, void *player) {
     snapshot_item_slot(mob_getOffhandSlot(player), &g_snap.offhand_present, &g_snap.offhand_id,
                        &g_snap.offhand_dur, &g_snap.offhand_max);
     snapshot_totem_state(player);
+    if (g_cfg.controls_mode == 1) ctrl_apply_player_actions();
     if (g_cfg.autosprint && mih_isMovingForward(self) && !mob_isSneaking(player) &&
         !player_isUsingItem(player) && !mob_isSprinting(player))
         lp_setSprinting(player, true);
@@ -1256,6 +1434,179 @@ static int  hook_view(void *s) {
     return v;
 }
 
+
+static void ctrl_init_textures() {
+    if (g_ctrl_assets_ready) return;
+    g_ctrl_assets_ready = true;
+    /* Android bitmap decoding requires a current GL context; nc_frame calls this after ImGui is initialized. */
+    ctrl_decode_png_texture(&nc_ctrl_png_attack, &g_ctrl_tex[NC_CTRL_ATTACK][0]);
+    ctrl_decode_png_texture(&nc_ctrl_png_attack_pressed, &g_ctrl_tex[NC_CTRL_ATTACK][1]);
+    ctrl_decode_png_texture(&nc_ctrl_png_interact, &g_ctrl_tex[NC_CTRL_INTERACT][0]);
+    ctrl_decode_png_texture(&nc_ctrl_png_interact_pressed, &g_ctrl_tex[NC_CTRL_INTERACT][1]);
+    ctrl_decode_png_texture(&nc_ctrl_png_jump, &g_ctrl_tex[NC_CTRL_JUMP][0]);
+    ctrl_decode_png_texture(&nc_ctrl_png_jump_pressed, &g_ctrl_tex[NC_CTRL_JUMP][1]);
+    ctrl_decode_png_texture(&nc_ctrl_png_sneak, &g_ctrl_tex[NC_CTRL_SNEAK][0]);
+    ctrl_decode_png_texture(&nc_ctrl_png_sneak_pressed, &g_ctrl_tex[NC_CTRL_SNEAK][1]);
+    ctrl_decode_png_texture(&nc_ctrl_png_flyingascend, &g_ctrl_tex[NC_CTRL_UP][0]);
+    ctrl_decode_png_texture(&nc_ctrl_png_flyingascend_pressed, &g_ctrl_tex[NC_CTRL_UP][1]);
+    ctrl_decode_png_texture(&nc_ctrl_png_flyingdescend, &g_ctrl_tex[NC_CTRL_DOWN][0]);
+    ctrl_decode_png_texture(&nc_ctrl_png_flyingdescend_pressed, &g_ctrl_tex[NC_CTRL_DOWN][1]);
+    ctrl_decode_png_texture(&nc_ctrl_png_joystick_frame, &g_ctrl_tex[NC_CTRL_JOY][0]);
+    ctrl_decode_png_texture(&nc_ctrl_png_joystick_knob, &g_ctrl_tex[NC_CTRL_JOY][1]);
+}
+
+static ImVec2 ctrl_size_px(int i) {
+    if (i == NC_CTRL_JOY) {
+        float side = 64.0f * (*ctrl_size(i)) * g_base;
+        return V(side, side);
+    }
+    float side = 22.0f * (*ctrl_size(i)) * g_base;
+    return V(side, side);
+}
+static ImVec2 ctrl_place(int i, float w, float h) {
+    ImVec2 sz = ctrl_size_px(i);
+    float rx = fmaxf(0.0f, w - sz.x);
+    float ry = fmaxf(0.0f, h - sz.y);
+    return V((*ctrl_x(i)) * rx, (*ctrl_y(i)) * ry);
+}
+
+static void ctrl_draw_icon(ImDrawList *dl, int i, ImVec2 p, bool pressed) {
+    const int tex_idx = pressed ? 1 : 0;
+    GLuint tex = g_ctrl_tex[i][tex_idx];
+    if (!tex) return;
+    ImVec2 sz = ctrl_size_px(i);
+    float a = clampf(*ctrl_alpha(i), 0.05f, 1.0f);
+    dl->AddImage((ImTextureID)(uintptr_t)tex, p, vadd(p, sz), V(0,0), V(1,1),
+                 IM_COL32(255,255,255,(int)(a*255.0f)));
+}
+
+static void ctrl_draw_joystick(ImDrawList *dl, ImVec2 p, bool editor_preview=false) {
+    GLuint frame = g_ctrl_tex[NC_CTRL_JOY][0];
+    GLuint knob  = g_ctrl_tex[NC_CTRL_JOY][1];
+    if (!frame || !knob) return;
+    ImVec2 sz = ctrl_size_px(NC_CTRL_JOY);
+    float a = clampf(*ctrl_alpha(NC_CTRL_JOY), 0.05f, 1.0f);
+    dl->AddImage((ImTextureID)(uintptr_t)frame, p, vadd(p,sz), V(0,0), V(1,1),
+                 IM_COL32(255,255,255,(int)(a*255.0f)));
+    float kside = sz.x * 0.5f;
+    float nx = clampf((float)g_ctrl_joy_x, -1.0f, 1.0f);
+    float ny = clampf((float)g_ctrl_joy_y, -1.0f, 1.0f);
+    if (editor_preview) { nx = 0; ny = 0; }
+    ImVec2 center = V(p.x + (sz.x - kside) * 0.5f, p.y + (sz.y - kside) * 0.5f);
+    center.x += nx * (sz.x - kside) * 0.35f;
+    center.y += ny * (sz.y - kside) * 0.35f;
+    dl->AddImage((ImTextureID)(uintptr_t)knob, center, V(center.x+kside, center.y+kside),
+                 V(0,0), V(1,1), IM_COL32(255,255,255,(int)(a*255.0f)));
+}
+
+static void ctrl_build_rects(float w, float h) {
+    for (int i=0;i<NC_CTRL_COUNT;i++) {
+        ImVec2 p = ctrl_place(i,w,h);
+        ImVec2 s = ctrl_size_px(i);
+        g_ctrl_rects[i].visible = 1;
+        g_ctrl_rects[i].x = p.x; g_ctrl_rects[i].y = p.y; g_ctrl_rects[i].w = s.x; g_ctrl_rects[i].h = s.y;
+    }
+}
+
+static void ctrl_apply_player_actions() {
+    if (!g_local_player || g_cfg.controls_mode != 1) return;
+
+    /* Jump/sneak: use the game's own methods. */
+    static bool resolved = false;
+    static void (*jump_fn)(void*) = 0;
+    static void (*sneak_fn)(void*, bool) = 0;
+    static void (*attack_fn)(void*, void*) = 0;
+    static void (*interact_fn)(void*, void*) = 0;
+    static void (*move_fn)(void*, const NcVec3*) = 0;
+
+    if (!resolved) {
+        resolved = true;
+        jump_fn = (void(*)(void*))dlsym(RTLD_DEFAULT, "_ZN11LocalPlayer14jumpFromGroundEv");
+        if (!jump_fn) jump_fn = (void(*)(void*))dlsym(RTLD_DEFAULT, "_ZN3Mob14jumpFromGroundEv");
+        sneak_fn = (void(*)(void*, bool))dlsym(RTLD_DEFAULT, "_ZN3Mob11setSneakingEb");
+
+        /* Best-effort movement/action bridges. These are looked up dynamically so
+         * an unavailable overload does not make the client fail to load. */
+        attack_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks23handleAttackButtonPressER14ClientInstance");
+        if (!attack_fn) attack_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks24handleAttackButtonPressER14ClientInstance");
+        interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks25handleInteractButtonPressER14ClientInstance");
+        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks26handleInteractButtonPressER14ClientInstance");
+        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks22handleBuildButtonPressER14ClientInstance");
+        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks23handleBuildButtonPressER14ClientInstance");
+
+        /* Fallback movement bridge for builds exposing Mob/LocalPlayer::lerpMotion.
+         * The joystick is converted into camera-relative horizontal motion. */
+        move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN3Mob10lerpMotionERK4Vec3");
+        if (!move_fn) move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN11LocalPlayer10lerpMotionERK4Vec3");
+        if (!move_fn) move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN6Entity10lerpMotionERK4Vec3");
+    }
+
+    if (jump_fn && g_ctrl_pressed[NC_CTRL_JUMP]) jump_fn(g_local_player);
+    if (sneak_fn) sneak_fn(g_local_player, g_ctrl_pressed[NC_CTRL_SNEAK] != 0);
+
+    if (g_cic && g_ci) {
+        if (g_ctrl_pressed[NC_CTRL_ATTACK] && attack_fn) attack_fn(g_cic, g_ci);
+        if (g_ctrl_pressed[NC_CTRL_INTERACT] && interact_fn) interact_fn(g_cic, g_ci);
+    }
+
+    if (move_fn && g_ctrl_joy_id >= 0) {
+        const float dead = 0.12f;
+        float sx = fabsf(g_ctrl_joy_x) < dead ? 0.0f : g_ctrl_joy_x;
+        float sy = fabsf(g_ctrl_joy_y) < dead ? 0.0f : g_ctrl_joy_y;
+        if (sx != 0.0f || sy != 0.0f) {
+            NcVec2 rot = {0.0f, 0.0f};
+            entity_getRotation(&rot, g_local_player);
+            const float r = rot.y * 0.01745329251994329577f;
+            const float sn = sinf(r), cs = cosf(r);
+            /* joystick Y is screen-down, so invert it for forward. */
+            const float fwd = -sy;
+            NcVec3 mv;
+            mv.x = (-sn * fwd + cs * sx) * 0.10f;
+            mv.y = 0.0f;
+            mv.z = ( cs * fwd + sn * sx) * 0.10f;
+            move_fn(g_local_player, &mv);
+        }
+    }
+}
+static void ctrl_consume_touch(int action, int id, float x, float y) {
+    if (g_cfg.controls_mode != 1) return;
+    if (action == NC_EV_DOWN) {
+        for (int i=0;i<NC_CTRL_COUNT;i++) {
+            if (!ctrl_point_in(g_ctrl_rects[i],x,y)) continue;
+            if (g_ctrl_ids[i] >= 0 && g_ctrl_ids[i] != id) continue;
+            g_ctrl_ids[i] = id;
+            if (i == NC_CTRL_JOY) {
+                g_ctrl_joy_id = id;
+                const NcRect &r = g_ctrl_rects[i];
+                g_ctrl_joy_x = clampf((x - (r.x+r.w*0.5f))/(r.w*0.5f),-1,1);
+                g_ctrl_joy_y = clampf((y - (r.y+r.h*0.5f))/(r.h*0.5f),-1,1);
+            } else {
+                g_ctrl_pressed[i] = 1;
+            }
+            g_ctrl_touch_id = id;
+            return;
+        }
+    } else if (action == NC_EV_MOVE) {
+        if (id == g_ctrl_joy_id) {
+            const NcRect &r = g_ctrl_rects[NC_CTRL_JOY];
+            g_ctrl_joy_x = clampf((x - (r.x+r.w*0.5f))/(r.w*0.5f),-1,1);
+            g_ctrl_joy_y = clampf((y - (r.y+r.h*0.5f))/(r.h*0.5f),-1,1);
+        }
+    } else if (action == NC_EV_UP) {
+        for (int i=0;i<NC_CTRL_COUNT;i++) {
+            if (g_ctrl_ids[i] != id) continue;
+            g_ctrl_ids[i] = -1;
+            g_ctrl_pressed[i] = 0;
+            if (i == NC_CTRL_JOY) {
+                g_ctrl_joy_id = -1;
+                g_ctrl_joy_x = 0;
+                g_ctrl_joy_y = 0;
+            }
+        }
+        if (id == g_ctrl_touch_id) g_ctrl_touch_id = -1;
+    }
+}
+
 /* ------------------------------------------------------------------ touch input */
 typedef int32_t (*getEvent_fn)(AInputQueue *, AInputEvent **);
 static getEvent_fn g_orig_getEvent = 0;
@@ -1282,9 +1633,36 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                 m.x[i] = AMotionEvent_getX(ev, (size_t)i);
                 m.y[i] = AMotionEvent_getY(ev, (size_t)i);
             }
+            if (g_cfg.controls_mode == 1 && !g_menu_open && !g_edit) {
+                int idx = m.idx;
+                if (idx >= 0 && idx < m.count) {
+                    int evt = (m.action == 0 || m.action == 5) ? NC_EV_DOWN :
+                              ((m.action == 1 || m.action == 6) ? NC_EV_UP : NC_EV_MOVE);
+                    bool inside = false;
+                    if (evt == NC_EV_DOWN) {
+                        for (int ci=0; ci<NC_CTRL_COUNT; ++ci) {
+                            if (ctrl_point_in(g_ctrl_rects[ci], m.x[idx], m.y[idx])) { inside = true; break; }
+                        }
+                    } else {
+                        if (g_ctrl_touch_id == m.id[idx] || g_ctrl_joy_id == m.id[idx]) inside = true;
+                        if (!inside) {
+                            for (int ci=0; ci<NC_CTRL_COUNT; ++ci) {
+                                if (g_ctrl_ids[ci] == m.id[idx]) { inside = true; break; }
+                            }
+                        }
+                    }
+                    if (inside) {
+                        ctrl_consume_touch(evt,m.id[idx],m.x[idx],m.y[idx]);
+                        AInputQueue_finishEvent(q, ev, 1);
+                        continue;
+                    }
+                }
+            }
             pthread_mutex_lock(&g_mu);
             int swallow = nc_touch_event(&g_touch, &m, push_ev, 0);
             pthread_mutex_unlock(&g_mu);
+            /* Legacy ImGui touch path above already handled every event that was
+             * not claimed by a New control. Do not feed the same event twice. */
             if (swallow) {
                 if (g_touch_logged < 6) { g_touch_logged++; nclog("touch taken: action=%d", m.action); }
                 AInputQueue_finishEvent(q, ev, 1);
@@ -1616,6 +1994,70 @@ static void draw_speed(ImDrawList *dl, ImVec2 p, float bps) {
     if (g_cfg.speed_bg) box_col(dl, p, sz, g_cfg.speed_bg_alpha, z, g_cfg.speed_bg_col);
     char b[32]; snprintf(b, sizeof b, "Speed: %.2f B/s", bps);
     put_text_sh(dl, V(p.x + pad, p.y + pad), z, packed(g_cfg.speed_col, a), b, !g_cfg.speed_bg);
+}
+
+
+static void draw_new_controls(ImDrawList *dl, float w, float h) {
+    ctrl_init_textures();
+    ctrl_build_rects(w,h);
+    ctrl_draw_joystick(dl, ctrl_place(NC_CTRL_JOY,w,h));
+    for (int i=1;i<NC_CTRL_COUNT;i++)
+        ctrl_draw_icon(dl, i, ctrl_place(i,w,h), g_ctrl_pressed[i] != 0);
+}
+
+static void panel_controls();
+static void build_control_editor(float w, float h) {
+    ImGui::SetNextWindowPos(V(0,0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(V(w,h), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,V(0,0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize,0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4(0,0,0,0));
+    ImGui::Begin("##night_controls_editor",NULL,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoBackground);
+    ImDrawList *dl=ImGui::GetWindowDrawList();
+    dl->AddRectFilled(V(0,0),V(w,h),IM_COL32(0,0,0,130));
+
+    ImGui::SetCursorScreenPos(V(w*0.5f-170*g_base,20*g_base));
+    if (ImGui::Button("Opacity",V(155*g_base,34*g_base))) g_ctrl_editor_tab=0;
+    ImGui::SameLine();
+    if (ImGui::Button("Size",V(155*g_base,34*g_base))) g_ctrl_editor_tab=1;
+
+    ctrl_init_textures();
+    for (int i=0;i<NC_CTRL_COUNT;i++) {
+        ImVec2 p=ctrl_place(i,w,h), s=ctrl_size_px(i);
+        if (i==NC_CTRL_JOY) ctrl_draw_joystick(dl,p,true);
+        else ctrl_draw_icon(dl,i,p,false);
+        if (i==g_ctrl_selected) dl->AddRect(p,vadd(p,s),IM_COL32(180,150,255,255),5.0f,0,3.0f);
+        ImGui::SetCursorScreenPos(p);
+        char id[32]; snprintf(id,sizeof(id),"##ctrl_%d",i);
+        ImGui::InvisibleButton(id,s);
+        if (ImGui::IsItemClicked()) g_ctrl_selected=i;
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0,0.0f)) {
+            ImGuiIO &io=ImGui::GetIO();
+            ImVec2 np=V(p.x+io.MouseDelta.x,p.y+io.MouseDelta.y);
+            float rx=fmaxf(1.0f,w-s.x), ry=fmaxf(1.0f,h-s.y);
+            *ctrl_x(i)=clampf(np.x/rx,0,1); *ctrl_y(i)=clampf(np.y/ry,0,1);
+        }
+    }
+
+    ImGui::SetCursorScreenPos(V(18*g_base,70*g_base));
+    ImGui::BeginChild("##ctrl_settings",V(260*g_base,165*g_base),true,0);
+    ImGui::TextColored(ACCENT,"Selected: %s",ctrl_name(g_ctrl_selected));
+    if (g_ctrl_editor_tab==0) {
+        sl_f("Opacity",ctrl_alpha(g_ctrl_selected),0.10f,1.0f);
+    } else {
+        sl_f("Size",ctrl_size(g_ctrl_selected),0.5f,2.0f);
+    }
+    ImGui::TextDisabled("Drag a control to move it.");
+    ImGui::EndChild();
+
+    ImGui::SetCursorScreenPos(V(w*0.5f-90*g_base,h-58*g_base));
+    if (ImGui::Button("Done",V(180*g_base,40*g_base))) {
+        g_edit=false; g_menu_open=true; g_edit_target=-1; nclog("controls editor done");
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
 }
 
 /* ---- round/square buttons (N, Zoom, Perspective) with preset labels ---- */
@@ -1982,6 +2424,23 @@ static void panel_fast_totem() {
     sl_f("Text opacity", &g_cfg.fast_totem_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.fast_totem_x, &g_cfg.fast_totem_y);
 }
+static void panel_controls() {
+    ImGui::TextColored(ACCENT,"Controls");
+    ImGui::Separator();
+    if (ImGui::RadioButton("Legacy", g_cfg.controls_mode == 0)) g_cfg.controls_mode = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("New", g_cfg.controls_mode == 1)) g_cfg.controls_mode = 1;
+    ImGui::TextDisabled("New uses the 1.21-style joystick and separate touch buttons.");
+    if (g_cfg.controls_mode == 1) {
+        if (ImGui::Button("Edit controls",V(180,0))) {
+            g_edit=true; g_menu_open=false; g_edit_target=-2; g_ctrl_selected=NC_CTRL_JOY;
+        }
+        ImGui::TextDisabled("Move each control, then choose Opacity or Size at the top.");
+        sl_f("Joystick opacity",&g_cfg.ctrl_joy_alpha,0.10f,1.0f);
+        sl_f("Button opacity",&g_cfg.ctrl_attack_alpha,0.10f,1.0f);
+    }
+}
+
 static void panel_client() {
     head("Client", 0, "Menu and N button.");
     sl_i("Menu text size (0 = auto)", &g_cfg.ui_font, 0, 6);
@@ -2022,6 +2481,7 @@ static const Mod g_mods[] = {
     { "Perspective button", &g_cfg.persp_on,   panel_persp },
     { "Hitboxes",           &g_cfg.hitbox_on,  panel_hitbox },
     { "FPS optimizer",      0,                 panel_perf },
+    { "Controls",            0,                 panel_controls },
     { "Client",             0,                 panel_client },
 };
 #define NC_NMODS ((int)(sizeof(g_mods) / sizeof(g_mods[0])))
@@ -2114,6 +2574,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool in_world = (now - g_tick_time) < 0.6;
     bool play_hud = (now - g_play_time) < 0.3;
     if (!menu_reach) { g_menu_open = false; g_edit = false; g_edit_target = -1; kb_stop(); }
+    if (g_cfg.controls_mode != 1 || !in_world) ctrl_reset_states();
 
     bool any_armor = g_snap.present[0] || g_snap.present[1] || g_snap.present[2] || g_snap.present[3] ||
                       g_snap.held_present || g_snap.offhand_present;
@@ -2125,16 +2586,17 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool coords_vis = g_cfg.coords_on && in_world && !g_menu_open && !g_edit;
     bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && g_snap.elytra_angle_valid && !g_menu_open && !g_edit;
     bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;         /* the world itself */
-    bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
-    bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
-    bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
+    bool zoom_vis   = g_cfg.controls_mode == 0 && g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
+    bool persp_vis  = g_cfg.controls_mode == 0 && g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
+    bool drop_vis   = g_cfg.controls_mode == 0 && g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
     /* Fast Totem remains on the in-game HUD for this test build, but only while
      * at least one totem exists in the inventory or offhand. */
-    bool fast_totem_vis = g_cfg.fast_totem_on && hud_btns && g_snap.totem_present;
+    bool fast_totem_vis = g_cfg.controls_mode == 0 && g_cfg.fast_totem_on && hud_btns && g_snap.totem_present;
     if (!zoom_vis) g_zoom_active = 0;
 
     bool combat_vis = g_cfg.combat_crosshair_on && in_world && !g_menu_open && !g_edit;
-    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || combat_vis || menu_reach || g_menu_open || g_edit;
+    bool controls_vis = g_cfg.controls_mode == 1 && in_world && !g_menu_open && !g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || combat_vis || controls_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -2196,7 +2658,8 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     ImDrawList *fg = ImGui::GetForegroundDrawList();
 
     if (g_edit) {
-        build_edit((float)w, (float)h);
+        if (g_edit_target == -2) build_control_editor((float)w, (float)h);
+        else build_edit((float)w, (float)h);
         wrect.visible = 1; wrect.x = 0; wrect.y = 0; wrect.w = (float)w; wrect.h = (float)h;   /* whole screen is ours */
     } else {
         if (fps_vis)    draw_fps(fg, place(g_cfg.fps_x, g_cfg.fps_y, size_fps()), fps);
@@ -2206,6 +2669,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         if (speed_vis)  draw_speed(fg, place(g_cfg.speed_x, g_cfg.speed_y, size_speed()), g_snap.speed_bps);
         if (coords_vis) draw_coords(fg, place(g_cfg.coords_x, g_cfg.coords_y, size_coords()));
         if (elytra_angle_vis) draw_elytra_angle(fg, place(g_cfg.elytra_angle_x, g_cfg.elytra_angle_y, size_elytra_angle()));
+        if (g_cfg.controls_mode == 1 && hud_btns) draw_new_controls(fg, (float)w, (float)h);
 
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
@@ -2266,9 +2730,14 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     GLenum gl_err = glGetError();
     if (gl_err != GL_NO_ERROR && !g_gl_err_logged) { g_gl_err_logged = true; nclog("GL error 0x%x after drawing", (unsigned)gl_err); }
 
+
     pthread_mutex_lock(&g_mu);
     g_touch.n = nrect; g_touch.win = wrect;
     for (int i = 0; i < NC_MAX_HUD; i++) g_touch.hud[i] = hud[i];
+    if (g_cfg.controls_mode == 1 && hud_btns && !g_edit && !g_menu_open) {
+        ctrl_build_rects((float)w,(float)h);
+        for (int i=0;i<NC_CTRL_COUNT && i<NC_MAX_HUD;i++) g_touch.hud[i] = g_ctrl_rects[i];
+    }
     pthread_mutex_unlock(&g_mu);
 }
 
