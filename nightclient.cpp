@@ -566,7 +566,6 @@ static void hook_tick(void *self, void *player) {
     } else {
         g_snap.elytra_angle_valid = 0;
     }
-    else g_snap.arrow_count = -1;
     if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
     if (g_cfg.arrow_on) {
         const void *held = player_getSelectedItem(player);
