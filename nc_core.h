@@ -34,9 +34,7 @@ extern "C" {
   X(drop_alpha,   F, 0.85, 0.0, 1) X(drop_text_alpha, F, 1.0, 0.0, 1) X(drop_bg_col, I, 0x38306E, 0, 0xFFFFFF) X(drop_label, I, 0, 0, 7) X(drop_col, I, 0x38306E, 0, 0xFFFFFF) X(drop_pause, I, 0, 0, 1) \
   X(fast_totem_on, I, 1, 0, 1) X(fast_totem_x, F, 0.78, 0, 1) X(fast_totem_y, F, 0.86, 0, 1) X(fast_totem_btn, F, 3.0, 0.5, 12.0) \
   X(fast_totem_alpha, F, 0.90, 0.0, 1) X(fast_totem_text_alpha, F, 1.0, 0.0, 1) X(fast_totem_col, I, 0xF0F0FA, 0, 0xFFFFFF) X(fast_totem_bg_col, I, 0x38306E, 0, 0xFFFFFF) \
-  X(combat_crosshair_on, I, 0, 0, 1) X(combat_crosshair_col, I, 0xFF3030, 0, 0xFFFFFF) \
-  X(combat_crosshair_length, F, 6.0, 1.0, 12.0) X(combat_crosshair_gap, F, 2.0, 0.0, 8.0) \
-  X(combat_crosshair_thickness, F, 2.0, 1.0, 6.0) X(combat_crosshair_alpha, F, 1.0, 0.1, 1.0) \
+  X(combat_crosshair_on, I, 0, 0, 1) \
   X(perf_gfx,     I, 0,    0, 1) X(perf_light, I, 0, 0, 1) X(perf_skies, I, 0, 0, 1) X(perf_bob, I, 0, 0, 1) \
   X(perf_view_on, I, 0,    0, 1) X(perf_view, I, 6, 2, 16) \
   X(ui_font,      I, 0,    0, 6) \

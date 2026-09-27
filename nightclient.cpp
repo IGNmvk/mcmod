@@ -116,13 +116,29 @@ static volatile double g_play_time = 0;      /* last time the gameplay screen wa
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
 static float           g_zoom_cur = 1.0f;
-static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; int arrow_count; float elytra_angle; int elytra_angle_valid; float x, y, z; int combat_target; float combat_target_t; } g_snap;
+static struct {
+    volatile int gliding;
+    int present[4], id[4], dur[4], max[4];
+    int held_present, held_id, held_dur, held_max;
+    int offhand_present, offhand_id, offhand_dur, offhand_max;
+    int holding_bow;
+    int totem_present;
+    float speed_bps;
+    int arrow_count;
+    float elytra_angle;
+    int elytra_angle_valid;
+    float x, y, z;
+    int combat_target;
+    float combat_target_t;
+    double combat_target_until;
+} g_snap;
 static float g_last_px = 0.0f, g_last_py = 0.0f, g_last_pz = 0.0f;
 static double g_last_pos_time = 0.0;
 static bool g_have_last_pos = false;
 
 static bool  g_menu_open = false, g_edit = false;
 static int   g_sel = 0;
+static int   g_edit_target = -1;
 static bool  g_imgui_ready = false, g_imgui_failed = false, g_tex_done = false;
 static float g_base = 2.0f;                  /* layout scale chosen from the screen height */
 static float g_w = 1920, g_h = 1080;
@@ -526,6 +542,44 @@ static void hook_apply(void *self, float dt) {
 }
 
 /* MoveInputHandler::tick(LocalPlayer&): autosprint + data snapshot for the HUD mods */
+static void snapshot_item_slot(const void *it, int *present, int *id, int *dur, int *max) {
+    if (it && !ii_isNull(it)) {
+        int item_id = ii_getId(it);
+        int item_max = ii_getMaxDamage(it);
+        int item_dmg = ii_getDamage(it);
+        *present = 1;
+        *id = item_id;
+        *max = item_max;
+        *dur = item_max > 0 ? item_max - item_dmg : 0;
+    } else {
+        *present = 0;
+        *id = 0;
+        *max = 0;
+        *dur = 0;
+    }
+}
+
+static void snapshot_totem_state(void *player) {
+    g_snap.totem_present = 0;
+    if (!player) return;
+    const void *offhand = mob_getOffhandSlot(player);
+    if (offhand && !ii_isNull(offhand) && ii_getId(offhand) == 450) {
+        g_snap.totem_present = 1;
+        return;
+    }
+    void *supplies = player_getSupplies(player);
+    if (!supplies) return;
+    int size = supplies_getContainerSize(supplies, 0);
+    if (size <= 0 || size > 128) return;
+    for (int i = 0; i < size; ++i) {
+        const void *it = supplies_getItem(supplies, i, 0);
+        if (it && !ii_isNull(it) && ii_getId(it) == 450) {
+            g_snap.totem_present = 1;
+            return;
+        }
+    }
+}
+
 static void hook_tick(void *self, void *player) {
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
@@ -578,14 +632,16 @@ static void hook_tick(void *self, void *player) {
     if (g_cfg.armor_on) {
         for (int i = 0; i < 4; i++) {
             const void *it = mob_getArmor(player, i);
-            if (it && !ii_isNull(it)) {
-                g_snap.id[i] = ii_getId(it);
-                g_snap.max[i] = ii_getMaxDamage(it);
-                g_snap.dur[i] = g_snap.max[i] - ii_getDamage(it);
-                g_snap.present[i] = 1;
-            } else g_snap.present[i] = 0;
+            snapshot_item_slot(it, &g_snap.present[i], &g_snap.id[i], &g_snap.dur[i], &g_snap.max[i]);
         }
+    } else {
+        for (int i = 0; i < 4; i++) g_snap.present[i] = 0;
     }
+    snapshot_item_slot(player_getSelectedItem(player), &g_snap.held_present, &g_snap.held_id,
+                       &g_snap.held_dur, &g_snap.held_max);
+    snapshot_item_slot(mob_getOffhandSlot(player), &g_snap.offhand_present, &g_snap.offhand_id,
+                       &g_snap.offhand_dur, &g_snap.offhand_max);
+    snapshot_totem_state(player);
     if (g_cfg.autosprint && mih_isMovingForward(self) && !mob_isSneaking(player) &&
         !player_isUsingItem(player) && !mob_isSprinting(player))
         lp_setSprinting(player, true);
@@ -1088,51 +1144,59 @@ static bool combat_ray_aabb(const NcAabb6 &b, const float origin[3], const float
     return tmin <= max_t && tmax >= 0.0f;
 }
 
-static void combat_consider_entity(void *entity) {
+static void combat_consider_entity(void *entity, float partial) {
     if (!g_cfg.combat_crosshair_on || !g_local_player || !entity || entity == g_local_player) return;
 
     const float *pp = entity_getPos(g_local_player);
-    if (!pp || !entity_getPos(entity)) return;
+    if (!pp) return;
 
     const NcAabb6 *raw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
     NcAabb6 b = *raw;
     if (!isfinite(b.minx) || !isfinite(b.miny) || !isfinite(b.minz) ||
         !isfinite(b.maxx) || !isfinite(b.maxy) || !isfinite(b.maxz)) return;
     if (b.maxx <= b.minx || b.maxy <= b.miny || b.maxz <= b.minz) return;
+    if ((b.maxy - b.miny) < 0.55f) return;
+
+    const float cx = (b.minx + b.maxx) * 0.5f;
+    const float cy = (b.miny + b.maxy) * 0.5f;
+    const float cz = (b.minz + b.maxz) * 0.5f;
+    const float dx = cx - pp[0], dy = cy - (pp[1] + 1.2f), dz = cz - pp[2];
+    if ((dx * dx + dy * dy + dz * dz) > (3.45f * 3.45f)) return;
 
     NcVec2 rot = {0.0f, 0.0f};
-    entity_getRotation(&rot, g_local_player);
+    entity_getInterpolatedRotation(&rot, g_local_player, partial);
+    if (!isfinite(rot.x) || !isfinite(rot.y))
+        entity_getRotation(&rot, g_local_player);
     if (!isfinite(rot.x) || !isfinite(rot.y)) return;
 
     const float deg = 0.01745329251994329577f;
-    const float p = rot.x * deg;
-    const float y = rot.y * deg;
-    const float cp = cosf(p), sp = sinf(p);
-    const float sy = sinf(y), cy = cosf(y);
+    const float pitch = rot.x * deg, yaw = rot.y * deg;
+    const float cp = cosf(pitch), sp = sinf(pitch), sy = sinf(yaw), cyaw = cosf(yaw);
+    const float eye = mob_isSneaking(g_local_player) ? 1.54f : 1.62f;
+    float origin[3] = { pp[0], pp[1] + eye, pp[2] };
+    float dir[3] = { -sy * cp, -sp, cyaw * cp };
 
-    float origin[3] = { pp[0], pp[1] + 1.62f, pp[2] };
-    float dir[3] = { -sy * cp, -sp, cy * cp };
+    const float pad = 0.14f;
+    b.minx -= pad; b.miny -= pad; b.minz -= pad;
+    b.maxx += pad; b.maxy += pad; b.maxz += pad;
 
-    /* Vanilla survival reach is around three blocks. A tiny extra margin
-     * keeps entities right on the boundary from flickering between states. */
-    const float reach = 3.10f;
     float hit_t = 0.0f;
-    if (!combat_ray_aabb(b, origin, dir, reach, &hit_t)) return;
-
+    if (!combat_ray_aabb(b, origin, dir, 3.15f, &hit_t)) return;
     if (!g_snap.combat_target || hit_t < g_snap.combat_target_t) {
         g_snap.combat_target = 1;
         g_snap.combat_target_t = hit_t;
     }
+    g_snap.combat_target_until = now_s() + 0.045;
 }
-
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
     if (g_cfg.combat_crosshair_on)
-        combat_consider_entity(entity);
+        combat_consider_entity(entity, partial);
     if (g_cfg.hitbox_on && entity && pos)
         hit_draw_entity(entity, (const float *)pos, partial);
 }
+
 
 /* ------------------------------------------------------------------ local entity render optimizers
  * These are deliberately render-only: they never change entity state, inventory,
@@ -1359,17 +1423,39 @@ static void draw_fps(ImDrawList *dl, ImVec2 p, float fps) {
 /* ---- Armor HUD ---- */
 struct ArmorRow { int present, id, dur, max, slot; };
 
-static void armor_style(int id, ImU32 *col, float a) {
-    int r = 150, g = 150, b = 165;
-    if      (id >= 298 && id <= 301) { r = 160; g = 100; b = 60; }    /* leather */
-    else if (id >= 302 && id <= 305) { r = 130; g = 135; b = 150; }   /* chain */
-    else if (id >= 306 && id <= 309) { r = 205; g = 205; b = 215; }   /* iron */
-    else if (id >= 310 && id <= 313) { r = 70;  g = 215; b = 215; }   /* diamond */
-    else if (id >= 314 && id <= 317) { r = 235; g = 200; b = 60; }    /* gold */
-    else if (id == 444)              { r = 150; g = 110; b = 230; }   /* elytra */
-    *col = rgba(r, g, b, a);
+static int embedded_item_icon(int id) {
+    if (id >= 298 && id <= 317) return id - 298;
+    if (id == 444) return NC_ICON_ELYTRA;
+    if (id == 262) return NC_ICON_ARROW;
+    return -1;
 }
-static void armor_rows(ArmorRow rows[4], bool preview) {
+
+static void draw_item_fallback(ImDrawList *dl, ImVec2 q, float icon, float a, int id) {
+    /* Pack-independent pixel-style silhouettes for held/offhand items. */
+    const ImU32 edge = rgba(230, 230, 240, a);
+    const ImU32 dark = rgba(28, 28, 38, a);
+    dl->AddRectFilled(q, V(q.x + icon, q.y + icon), dark, 1.5f);
+    const float u = icon / 8.0f;
+    if (id == 450) {
+        dl->AddRectFilled(V(q.x + 3*u, q.y + 1*u), V(q.x + 5*u, q.y + 7*u), rgba(255, 240, 120, a));
+        dl->AddRectFilled(V(q.x + 2*u, q.y + 2*u), V(q.x + 6*u, q.y + 6*u), rgba(80, 210, 110, a));
+        dl->AddRectFilled(V(q.x + 3*u, q.y + 3*u), V(q.x + 5*u, q.y + 5*u), rgba(235, 235, 245, a));
+    } else if (id == 261) {
+        dl->AddLine(V(q.x + 2*u, q.y + 6*u), V(q.x + 6*u, q.y + 2*u), edge, 1.5f);
+        dl->AddLine(V(q.x + 6*u, q.y + 2*u), V(q.x + 6*u, q.y + 6*u), edge, 1.5f);
+    } else if (id == 267 || id == 268 || id == 272 || id == 276 || id == 283) {
+        dl->AddLine(V(q.x + 2*u, q.y + 6*u), V(q.x + 6*u, q.y + 2*u), edge, 2.0f);
+        dl->AddLine(V(q.x + 2*u, q.y + 5*u), V(q.x + 4*u, q.y + 7*u), edge, 1.2f);
+        dl->AddLine(V(q.x + 2*u, q.y + 6*u), V(q.x + 3*u, q.y + 7*u), edge, 1.2f);
+    } else if (id == 256 || id == 257 || id == 258 || id == 269 || id == 270 || id == 273 || id == 274 || id == 277 || id == 278 || id == 279 || id == 284 || id == 285) {
+        dl->AddLine(V(q.x + 2*u, q.y + 6*u), V(q.x + 6*u, q.y + 2*u), edge, 2.0f);
+        dl->AddLine(V(q.x + 2*u, q.y + 5*u), V(q.x + 4*u, q.y + 7*u), edge, 1.0f);
+    } else {
+        dl->AddRect(V(q.x + 2*u, q.y + 2*u), V(q.x + 6*u, q.y + 6*u), edge, 1.0f, 0, 1.2f);
+    }
+}
+
+static void armor_rows(ArmorRow rows[6], bool preview) {
     static const int sample_id[4] = { 310, 311, 312, 313 };
     static const int sample_dur[4] = { 300, 330, 210, 150 };
     for (int i = 0; i < 4; i++) {
@@ -1377,7 +1463,17 @@ static void armor_rows(ArmorRow rows[4], bool preview) {
         else { rows[i].present = g_snap.present[i]; rows[i].id = g_snap.id[i]; rows[i].max = g_snap.max[i]; rows[i].dur = g_snap.dur[i]; }
         rows[i].slot = i;
     }
+    if (preview) {
+        rows[4].present = 1; rows[4].id = 276; rows[4].max = 1561; rows[4].dur = 1200;
+        rows[5].present = 1; rows[5].id = 450; rows[5].max = 0; rows[5].dur = 0;
+    } else {
+        rows[4].present = g_snap.held_present; rows[4].id = g_snap.held_id; rows[4].max = g_snap.held_max; rows[4].dur = g_snap.held_dur;
+        rows[5].present = g_snap.offhand_present; rows[5].id = g_snap.offhand_id; rows[5].max = g_snap.offhand_max; rows[5].dur = g_snap.offhand_dur;
+    }
+    rows[4].slot = 4;
+    rows[5].slot = 5;
 }
+
 static void armor_metrics(ImVec2 *row, ImVec2 *total) {
     float s = g_cfg.armor_size;
     float icon = 16.0f * icon_k(s), gap = 2.0f * s;
@@ -1385,43 +1481,42 @@ static void armor_metrics(ImVec2 *row, ImVec2 *total) {
     row->x = icon + (tw > 0 ? gap + tw : 0.0f);
     row->y = icon + (g_cfg.armor_bar ? 3.0f * s : 0.0f);
     float pad = 2.0f * s;
-    if (g_cfg.armor_horiz) { total->x = 4 * row->x + 3 * gap + 2 * pad; total->y = row->y + 2 * pad; }
-    else                   { total->x = row->x + 2 * pad;              total->y = 4 * row->y + 3 * gap + 2 * pad; }
+    if (g_cfg.armor_horiz) { total->x = 6 * row->x + 5 * gap + 2 * pad; total->y = row->y + 2 * pad; }
+    else                   { total->x = row->x + 2 * pad;              total->y = 6 * row->y + 5 * gap + 2 * pad; }
 }
 static ImVec2 size_armor() { ImVec2 r, t; armor_metrics(&r, &t); return t; }
 
 static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
-    ArmorRow rows[4]; armor_rows(rows, preview);
+    ArmorRow rows[6]; armor_rows(rows, preview);
     ImVec2 rs, total; armor_metrics(&rs, &total);
     float s = g_cfg.armor_size; float a = g_cfg.armor_alpha, pad = 2.0f * s, gap = 2.0f * s, icon = 16.0f * icon_k(s);
-    static const char *letters[4] = { "H", "C", "L", "B" };
     if (g_cfg.armor_bg) box_col(dl, p, total, g_cfg.armor_bg_alpha, s, g_cfg.armor_bg_col);
     int shown = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         if (!rows[i].present) continue;
         ImVec2 o = g_cfg.armor_horiz ? V(pad + shown * (rs.x + gap), pad) : V(pad, pad + shown * (rs.y + gap));
         ImVec2 q = vadd(p, o);
-        int id = rows[i].id, ix = (id >= 298 && id <= 317) ? id - 298 : (id == 444 ? NC_ICON_ELYTRA : -1);
-        ImU32 tint = (ix >= 0 && ix <= 3) ? rgba(160, 101, 64, a) : rgba(255, 255, 255, a);     /* leather is tinted brown, like in the game */
-        if (!draw_icon(dl, ix, q, icon, tint)) {                                                  /* unknown item: coloured square */
-            ImU32 col; armor_style(id, &col, a);
-            dl->AddRectFilled(q, V(q.x + icon, q.y + icon), col, 1.5f * s);
-            put_text(dl, V(q.x + (icon - fpx(s)) * 0.5f, q.y + (icon - fpx(s)) * 0.5f), s, rgba(10, 10, 16, a), letters[rows[i].slot]);
+        int id = rows[i].id, ix = embedded_item_icon(id);
+        if (ix >= 0) {
+            ImU32 tint = (id >= 298 && id <= 301) ? rgba(160, 101, 64, a) : rgba(255,255,255,a);
+            draw_icon(dl, ix, q, icon, tint);
+        } else {
+            draw_item_fallback(dl, q, icon, a, id);
         }
         float frac = rows[i].max > 0 ? clampf((float)rows[i].dur / (float)rows[i].max, 0.0f, 1.0f) : 1.0f;
-        if (g_cfg.armor_num) {
+        if (g_cfg.armor_num && rows[i].max > 0) {
             char b[16];
             if (g_cfg.armor_num == 1) snprintf(b, sizeof b, "%d/%d", rows[i].dur, rows[i].max);
             else                      snprintf(b, sizeof b, "%d%%", (int)(frac * 100.0f + 0.5f));
             put_text_sh(dl, V(q.x + icon + gap, q.y + (icon - fpx(s)) * 0.5f), s, packed(g_cfg.armor_col, a), b, !g_cfg.armor_bg);
         }
-        if (g_cfg.armor_bar) {
+        if (g_cfg.armor_bar && rows[i].max > 0) {
             float by = q.y + icon + s;
-            dl->AddRectFilled(V(q.x, by), V(q.x + rs.x, by + 2.0f * s), rgba(40, 40, 55, g_cfg.armor_bg_alpha));
-            int rr, gg;                                   /* green -> yellow -> red as it wears out */
+            dl->AddRectFilled(V(q.x, by), V(q.x + rs.x, by + 2.0f * s), rgba(40,40,55,g_cfg.armor_bg_alpha));
+            int rr, gg;
             if (frac > 0.5f) { float t = (frac - 0.5f) * 2.0f; rr = (int)(235.0f - 145.0f * t); gg = (int)(215.0f + 15.0f * t); }
-            else             { float t = frac * 2.0f;          rr = 235;                        gg = (int)(70.0f + 145.0f * t); }
-            dl->AddRectFilled(V(q.x, by), V(q.x + rs.x * frac, by + 2.0f * s), rgba(rr, gg, 60, a));
+            else             { float t = frac * 2.0f; rr = 235; gg = (int)(70.0f + 145.0f * t); }
+            dl->AddRectFilled(V(q.x, by), V(q.x + rs.x * frac, by + 2.0f * s), rgba(rr,gg,60,a));
         }
         shown++;
     }
@@ -1614,16 +1709,15 @@ static ImVec2 elem_size(int e) {
 
 static void draw_combat_crosshair(ImDrawList *dl, float w, float h) {
     if (!g_cfg.combat_crosshair_on || !g_snap.combat_target) return;
-    const float cx = floorf(w * 0.5f);
-    const float cy = floorf(h * 0.5f);
-    const ImU32 red = packed(g_cfg.combat_crosshair_col, g_cfg.combat_crosshair_alpha);
-    const float t = g_cfg.combat_crosshair_thickness;
-    const float gap = g_cfg.combat_crosshair_gap;
-    const float len = g_cfg.combat_crosshair_length;
-    dl->AddLine(V(cx - gap - len, cy), V(cx - gap, cy), red, t);
-    dl->AddLine(V(cx + gap, cy), V(cx + gap + len, cy), red, t);
-    dl->AddLine(V(cx, cy - gap - len), V(cx, cy - gap), red, t);
-    dl->AddLine(V(cx, cy + gap), V(cx, cy + gap + len), red, t);
+    if (g_snap.combat_target_until > 0.0 && now_s() > g_snap.combat_target_until) return;
+    const float cx = floorf(w * 0.5f), cy = floorf(h * 0.5f);
+    const ImU32 red = IM_COL32(255, 48, 48, 255);
+    /* Same small fixed footprint as the vanilla 1.1.x center crosshair. */
+    const float gap = 1.0f, len = 3.0f;
+    dl->AddLine(V(cx - gap - len, cy), V(cx - gap, cy), red, 1.0f);
+    dl->AddLine(V(cx + gap, cy), V(cx + gap + len, cy), red, 1.0f);
+    dl->AddLine(V(cx, cy - gap - len), V(cx, cy - gap), red, 1.0f);
+    dl->AddLine(V(cx, cy + gap), V(cx, cy + gap + len), red, 1.0f);
 }
 
 /* ------------------------------------------------------------------ "Move on screen" */
@@ -1640,23 +1734,22 @@ static void build_edit(float w, float h) {
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
     static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "coords", "elytra_angle", "zoom", "persp", "drop", "fast_totem", "n" };
-
-    for (int e = 0; e < E_COUNT; e++) {
-        int *on = elem_on(e);
-        if (on && !*on) continue;
+    const int e = g_edit_target;
+    if (e >= 0 && e < E_COUNT) {
         ImVec2 sz = elem_size(e), pos = place(*elem_x(e), *elem_y(e), sz);
         switch (e) {
             case E_FPS:    draw_fps(dl, pos, 60.0f); break;
             case E_ARMOR:  draw_armor(dl, pos, true); break;
             case E_ELYTRA: draw_elytra(dl, pos); break;
-            case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? -1 : g_snap.arrow_count); break;
+            case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? 64 : g_snap.arrow_count); break;
             case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
+            case E_COORDS: draw_coords(dl, pos); break;
             case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
             case E_DROP:       draw_button(dl, pos, sz, g_cfg.drop_text,  g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col); break;
             case E_FAST_TOTEM: draw_button(dl, pos, sz, "TOTEM", g_cfg.fast_totem_alpha, g_cfg.fast_totem_text_alpha, false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col); break;
             case E_ZOOM:       draw_button(dl, pos, sz, g_cfg.zoom_text,  g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_bg_col, g_cfg.zoom_col); break;
-            case E_PERSP:  draw_button(dl, pos, sz, g_cfg.persp_text, g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col); break;
-            default:       draw_button(dl, pos, sz, g_cfg.n_text,     g_cfg.n_alpha, g_cfg.n_text_alpha, true,  false, g_cfg.n_bg_col, g_cfg.n_col); break;
+            case E_PERSP:      draw_button(dl, pos, sz, g_cfg.persp_text, g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col); break;
+            default:           draw_button(dl, pos, sz, g_cfg.n_text,     g_cfg.n_alpha, g_cfg.n_text_alpha, true,  false, g_cfg.n_bg_col, g_cfg.n_col); break;
         }
         dl->AddRect(pos, vadd(pos, sz), IM_COL32(150, 130, 255, 255), 3.0f, 0, 2.0f);
         ImGui::SetCursorScreenPos(pos);
@@ -1669,12 +1762,18 @@ static void build_edit(float w, float h) {
         }
     }
 
-    const char *hint = "Drag anything to move it";
+    const char *hint = "Drag the selected module to move it";
     ImVec2 ht = txt(hint, 3);
     put_text(dl, V((w - ht.x) * 0.5f, h * 0.06f), 3, IM_COL32(235, 235, 245, 255), hint);
     float bw = fpx(3) * 5.0f, bh = fpx(3) * 2.4f;
     ImGui::SetCursorScreenPos(V((w - bw) * 0.5f, h * 0.06f + fpx(3) * 1.8f));
-    if (ImGui::Button("Done", V(bw, bh))) { g_edit = false; g_menu_open = true; kb_stop(); nclog("layout saved"); }
+    if (ImGui::Button("Done", V(bw, bh))) {
+        g_edit = false;
+        g_edit_target = -1;
+        g_menu_open = true;
+        kb_stop();
+        nclog("layout saved");
+    }
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
@@ -1690,7 +1789,11 @@ static void chk(const char *label, int *v) { bool b = *v != 0; if (ImGui::Checkb
 static void sl_f(const char *label, float *v, float lo, float hi) { ImGui::SliderFloat(label, v, lo, hi, "%.2f"); }
 static void sl_i(const char *label, int *v, int lo, int hi) { ImGui::SliderInt(label, v, lo, hi, "%d"); }
 static void move_btn() {
-    if (ImGui::Button("Move on screen")) { g_edit = true; g_menu_open = false; nclog("edit mode"); }
+    if (ImGui::Button("Move on screen")) {
+        g_edit = true;
+        g_menu_open = false;
+        nclog("edit mode target=%d", g_edit_target);
+    }
 }
 static void head(const char *title, int *on, const char *desc) {
     ImGui::TextColored(ACCENT, "%s", title);
@@ -1866,17 +1969,12 @@ static void panel_drop() {
 }
 static void panel_combat_crosshair() {
     head("Combat crosshair", &g_cfg.combat_crosshair_on,
-         "Turns the crosshair red while an entity is directly in front of you and within close combat reach.");
-    color_picker("Crosshair color", &g_cfg.combat_crosshair_col);
-    sl_f("Length", &g_cfg.combat_crosshair_length, 1.0f, 12.0f);
-    sl_f("Gap", &g_cfg.combat_crosshair_gap, 0.0f, 8.0f);
-    sl_f("Thickness", &g_cfg.combat_crosshair_thickness, 1.0f, 6.0f);
-    sl_f("Opacity", &g_cfg.combat_crosshair_alpha, 0.1f, 1.0f);
-    ImGui::TextDisabled("Detection follows the center view ray and uses a 3.1 block reach.");
+         "Changes the normal crosshair to red when a player or mob is in combat reach.");
+    ImGui::TextDisabled("Fixed vanilla-style red crosshair. No extra overlay controls.");
 }
 static void panel_fast_totem() {
     head("Fast Totem", &g_cfg.fast_totem_on,
-         "Shows only in the inventory. Tap it to move a totem into your offhand.");
+         "Shows in-game when you have a totem. Tap it to move one into your offhand.");
     color_picker("Text color", &g_cfg.fast_totem_col);
     color_picker("Background color", &g_cfg.fast_totem_bg_col);
     sl_f("Button size", &g_cfg.fast_totem_btn, 0.5f, 12.0f);
@@ -1969,6 +2067,20 @@ static void build_menu(float w, float h, NcRect *win_rect) {
     ImGui::BeginChild("##panel", V(0, body.y), false, 0);
     touch_scroll();
     if (g_sel < 0 || g_sel >= NC_NMODS) g_sel = 0;
+    const char *selected_mod = g_mods[g_sel].name;
+    g_edit_target = -1;
+    if (!strcmp(selected_mod, "FPS counter")) g_edit_target = E_FPS;
+    else if (!strcmp(selected_mod, "Armor HUD")) g_edit_target = E_ARMOR;
+    else if (!strcmp(selected_mod, "Elytra indicator")) g_edit_target = E_ELYTRA;
+    else if (!strcmp(selected_mod, "Arrow HUD")) g_edit_target = E_ARROW;
+    else if (!strcmp(selected_mod, "Speed indicator")) g_edit_target = E_SPEED;
+    else if (!strcmp(selected_mod, "Coordinates")) g_edit_target = E_COORDS;
+    else if (!strcmp(selected_mod, "Elytra angle")) g_edit_target = E_ELYTRA_ANGLE;
+    else if (!strcmp(selected_mod, "Zoom")) g_edit_target = E_ZOOM;
+    else if (!strcmp(selected_mod, "Perspective button")) g_edit_target = E_PERSP;
+    else if (!strcmp(selected_mod, "Quick drop")) g_edit_target = E_DROP;
+    else if (!strcmp(selected_mod, "Fast Totem")) g_edit_target = E_FAST_TOTEM;
+    else if (!strcmp(selected_mod, "Client")) g_edit_target = E_N;
     g_mods[g_sel].panel();
     ImGui::EndChild();
     ImGui::End();
@@ -2001,13 +2113,14 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool menu_reach  = in_settings || in_pause;                 /* N button appears in either */
     bool in_world = (now - g_tick_time) < 0.6;
     bool play_hud = (now - g_play_time) < 0.3;
-    if (!menu_reach) { g_menu_open = false; g_edit = false; kb_stop(); }
+    if (!menu_reach) { g_menu_open = false; g_edit = false; g_edit_target = -1; kb_stop(); }
 
-    bool any_armor = g_snap.present[0] || g_snap.present[1] || g_snap.present[2] || g_snap.present[3];
+    bool any_armor = g_snap.present[0] || g_snap.present[1] || g_snap.present[2] || g_snap.present[3] ||
+                      g_snap.held_present || g_snap.offhand_present;
     bool fps_vis    = g_cfg.fps_on && (g_cfg.fps_menus || in_world);
     bool armor_vis  = g_cfg.armor_on && in_world && any_armor && !g_menu_open && !g_edit;
     bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
-    bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.holding_bow && !g_menu_open && !g_edit;
+    bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.holding_bow && g_snap.arrow_count > 0 && !g_menu_open && !g_edit;
     bool speed_vis  = g_cfg.speed_on && in_world && !g_menu_open && !g_edit;
     bool coords_vis = g_cfg.coords_on && in_world && !g_menu_open && !g_edit;
     bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && g_snap.elytra_angle_valid && !g_menu_open && !g_edit;
@@ -2015,10 +2128,9 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
     bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
     bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
-    /* TEMP TEST: show Fast Totem on the normal in-game HUD, using the same
-     * visibility gate as the F5/perspective button. Once placement and tapping
-     * are confirmed, this can be switched back to inventory-only. */
-    bool fast_totem_vis = g_cfg.fast_totem_on && hud_btns;
+    /* Fast Totem remains on the in-game HUD for this test build, but only while
+     * at least one totem exists in the inventory or offhand. */
+    bool fast_totem_vis = g_cfg.fast_totem_on && hud_btns && g_snap.totem_present;
     if (!zoom_vis) g_zoom_active = 0;
 
     bool combat_vis = g_cfg.combat_crosshair_on && in_world && !g_menu_open && !g_edit;
