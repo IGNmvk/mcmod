@@ -13,6 +13,14 @@ static const Field FIELDS[] = { NC_FIELDS(NC_ROW) };
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+static void set_text_value(char *dst, size_t n, const char *src) {
+    if (!dst || n == 0) return;
+    strncpy(dst, src ? src : "", n - 1);
+    dst[n - 1] = 0;
+    char *e = strpbrk(dst, "\r\n");
+    if (e) *e = 0;
+}
+
 static void set_field(NcConfig *c, const Field *f, float v) {
     v = clampf(v, f->mn, f->mx);
     if (f->is_float) *(float *)((char *)c + f->off) = v;
@@ -46,23 +54,19 @@ int nc_cfg_load(NcConfig *c, const char *path) {
         }
 
         if (!strcmp(line, "zoom_text")) {
-            strncpy(c->zoom_text, eq + 1, sizeof(c->zoom_text) - 1);
-            c->zoom_text[sizeof(c->zoom_text) - 1] = 0;
+            set_text_value(c->zoom_text, sizeof(c->zoom_text), eq + 1);
             goto loaded_line;
         }
         if (!strcmp(line, "persp_text")) {
-            strncpy(c->persp_text, eq + 1, sizeof(c->persp_text) - 1);
-            c->persp_text[sizeof(c->persp_text) - 1] = 0;
+            set_text_value(c->persp_text, sizeof(c->persp_text), eq + 1);
             goto loaded_line;
         }
         if (!strcmp(line, "drop_text")) {
-            strncpy(c->drop_text, eq + 1, sizeof(c->drop_text) - 1);
-            c->drop_text[sizeof(c->drop_text) - 1] = 0;
+            set_text_value(c->drop_text, sizeof(c->drop_text), eq + 1);
             goto loaded_line;
         }
         if (!strcmp(line, "n_text")) {
-            strncpy(c->n_text, eq + 1, sizeof(c->n_text) - 1);
-            c->n_text[sizeof(c->n_text) - 1] = 0;
+            set_text_value(c->n_text, sizeof(c->n_text), eq + 1);
             goto loaded_line;
         }
 
