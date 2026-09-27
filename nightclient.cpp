@@ -431,6 +431,10 @@ static float ctrl_px(float base, float size) {
     return base * 3.0f * size;
 }
 
+/* Text helpers are defined later in this translation unit. */
+static ImVec2 txt(const char *s, float size);
+static void put_text(ImDrawList *dl, ImVec2 p, float size, ImU32 col, const char *s);
+
 static const NcControlPng *ctrl_png(int i, bool pressed) {
     switch (i) {
         case NC_CTRL_ATTACK:  return pressed ? &nc_ctrl_png_attack_pressed : &nc_ctrl_png_attack;
@@ -2044,6 +2048,9 @@ static void draw_new_controls(ImDrawList *dl, float w, float h) {
 }
 
 static void panel_controls();
+static ImVec2 txt(const char *s, float size);
+static void put_text(ImDrawList *dl, ImVec2 p, float size, ImU32 col, const char *s);
+
 static void build_control_editor(float w, float h) {
     ImGui::SetNextWindowPos(V(0,0), ImGuiCond_Always);
     ImGui::SetNextWindowSize(V(w,h), ImGuiCond_Always);
