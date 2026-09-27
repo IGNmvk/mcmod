@@ -383,6 +383,7 @@ static volatile float g_ctrl_joy_x = 0.0f;
 static volatile float g_ctrl_joy_y = 0.0f;
 static NcRect g_ctrl_rects[NC_CTRL_COUNT];
 static bool g_ctrl_assets_ready = false;
+static jobject g_ctrl_asset_mgr_java = 0;
 static GLuint g_ctrl_tex[NC_CTRL_COUNT][2] = {};
 static int g_ctrl_selected = NC_CTRL_JOY;
 static int g_ctrl_editor_tab = 0; /* 0 = opacity, 1 = size */
@@ -451,8 +452,8 @@ static const NcControlPng *ctrl_png(int i, bool pressed) {
  * We intentionally keep the PNG bytes embedded in the client, but decode them
  * with Android's BitmapFactory on first use instead of depending on stb_image.
  */
-static bool ctrl_decode_png_texture(const NcControlPng *png, GLuint *out) {
-    if (!png || !out || !png->data || png->size == 0) return false;
+static bool ctrl_decode_bytes_texture(const unsigned char *data, size_t size, GLuint *out) {
+    if (!data || !out || size == 0) return false;
     GLint prev = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
     bool attached = false;
@@ -474,8 +475,8 @@ static bool ctrl_decode_png_texture(const NcControlPng *png, GLuint *out) {
         kb_release(env, attached); return false;
     }
 
-    jbyteArray arr = env->NewByteArray((jsize)png->size);
-    env->SetByteArrayRegion(arr, 0, (jsize)png->size, (const jbyte *)png->data);
+    jbyteArray arr = env->NewByteArray((jsize)size);
+    env->SetByteArrayRegion(arr, 0, (jsize)size, (const jbyte *)data);
     jobject stream = env->NewObject(bos, ctor, arr);
     jobject bmp = stream ? env->CallStaticObjectMethod(bf, decode, stream) : 0;
     if (env->ExceptionCheck()) { env->ExceptionClear(); bmp = 0; }
@@ -541,6 +542,86 @@ static bool ctrl_decode_png_texture(const NcControlPng *png, GLuint *out) {
     return true;
 }
 
+
+static jobject ctrl_get_asset_manager_java() {
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return 0;
+    if (g_ctrl_asset_mgr_java) {
+        jobject out = env->NewLocalRef(g_ctrl_asset_mgr_java);
+        kb_release(env, attached);
+        return out;
+    }
+    bool activity_global = false;
+    jobject activity = 0;
+    if (g_kb_activity) activity = env->NewLocalRef(g_kb_activity);
+    else { activity = kb_find_activity(env); activity_global = activity != 0; }
+    if (!activity) { kb_release(env, attached); return 0; }
+    jclass ac = env->GetObjectClass(activity);
+    jmethodID getAssets = ac ? env->GetMethodID(ac, "getAssets", "()Landroid/content/res/AssetManager;") : 0;
+    jobject am = getAssets ? env->CallObjectMethod(activity, getAssets) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); am = 0; }
+    if (am) g_ctrl_asset_mgr_java = env->NewGlobalRef(am);
+    if (am) env->DeleteLocalRef(am);
+    if (ac) env->DeleteLocalRef(ac);
+    if (activity_global) env->DeleteGlobalRef(activity);
+    else env->DeleteLocalRef(activity);
+    jobject out = g_ctrl_asset_mgr_java ? env->NewLocalRef(g_ctrl_asset_mgr_java) : 0;
+    kb_release(env, attached);
+    return out;
+}
+
+static bool ctrl_decode_asset_texture(const char *path, GLuint *out) {
+    if (!path || !out) return false;
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return false;
+    jobject am = ctrl_get_asset_manager_java();
+    if (!am) { kb_release(env, attached); return false; }
+    jclass amCls = env->GetObjectClass(am);
+    jmethodID open = amCls ? env->GetMethodID(amCls, "open", "(Ljava/lang/String;I)Ljava/io/InputStream;") : 0;
+    jstring jpath = env->NewStringUTF(path);
+    jobject stream = open ? env->CallObjectMethod(am, open, jpath, 0) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); stream = 0; }
+    if (jpath) env->DeleteLocalRef(jpath);
+    if (!stream) { if (amCls) env->DeleteLocalRef(amCls); env->DeleteLocalRef(am); kb_release(env, attached); return false; }
+    jclass inCls = env->GetObjectClass(stream);
+    jmethodID available = inCls ? env->GetMethodID(inCls, "available", "()I") : 0;
+    jmethodID read = inCls ? env->GetMethodID(inCls, "read", "([BII)I") : 0;
+    int len = available ? env->CallIntMethod(stream, available) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); len = 0; }
+    bool ok = false;
+    if (len > 0 && len < (1 << 20) && read) {
+        jbyteArray arr = env->NewByteArray(len);
+        if (arr) {
+            jint n = env->CallIntMethod(stream, read, arr, 0, len);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); n = -1; }
+            if (n > 0) {
+                jbyte *bytes = env->GetByteArrayElements(arr, 0);
+                if (bytes) {
+                    ok = ctrl_decode_bytes_texture((const unsigned char *)bytes, (size_t)n, out);
+                    env->ReleaseByteArrayElements(arr, bytes, JNI_ABORT);
+                }
+            }
+            env->DeleteLocalRef(arr);
+        }
+    }
+    jclass closeCls = env->GetObjectClass(stream);
+    jmethodID close = closeCls ? env->GetMethodID(closeCls, "close", "()V") : 0;
+    if (close) env->CallVoidMethod(stream, close);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (closeCls) env->DeleteLocalRef(closeCls);
+    if (inCls) env->DeleteLocalRef(inCls);
+    env->DeleteLocalRef(stream);
+    if (amCls) env->DeleteLocalRef(amCls);
+    env->DeleteLocalRef(am);
+    kb_release(env, attached);
+    return ok;
+}
+
+static bool ctrl_decode_png_texture(const NcControlPng *png, GLuint *out) {
+    return png && ctrl_decode_bytes_texture(png->data, png->size, out);
+}
 
 
 /* ------------------------------------------------------------------ helpers */
@@ -1443,24 +1524,29 @@ static int  hook_view(void *s) {
 
 static void ctrl_init_textures() {
     if (g_ctrl_assets_ready) return;
-    /* Android bitmap decoding requires a current GL context; nc_frame calls this after ImGui is initialized. */
     bool ok = true;
-    if (!g_ctrl_tex[NC_CTRL_ATTACK][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_attack, &g_ctrl_tex[NC_CTRL_ATTACK][0]);
-    if (!g_ctrl_tex[NC_CTRL_ATTACK][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_attack_pressed, &g_ctrl_tex[NC_CTRL_ATTACK][1]);
-    if (!g_ctrl_tex[NC_CTRL_INTERACT][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_interact, &g_ctrl_tex[NC_CTRL_INTERACT][0]);
-    if (!g_ctrl_tex[NC_CTRL_INTERACT][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_interact_pressed, &g_ctrl_tex[NC_CTRL_INTERACT][1]);
-    if (!g_ctrl_tex[NC_CTRL_JUMP][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_jump, &g_ctrl_tex[NC_CTRL_JUMP][0]);
-    if (!g_ctrl_tex[NC_CTRL_JUMP][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_jump_pressed, &g_ctrl_tex[NC_CTRL_JUMP][1]);
-    if (!g_ctrl_tex[NC_CTRL_SNEAK][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_sneak, &g_ctrl_tex[NC_CTRL_SNEAK][0]);
-    if (!g_ctrl_tex[NC_CTRL_SNEAK][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_sneak_pressed, &g_ctrl_tex[NC_CTRL_SNEAK][1]);
-    if (!g_ctrl_tex[NC_CTRL_UP][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_flyingascend, &g_ctrl_tex[NC_CTRL_UP][0]);
-    if (!g_ctrl_tex[NC_CTRL_UP][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_flyingascend_pressed, &g_ctrl_tex[NC_CTRL_UP][1]);
-    if (!g_ctrl_tex[NC_CTRL_DOWN][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_flyingdescend, &g_ctrl_tex[NC_CTRL_DOWN][0]);
-    if (!g_ctrl_tex[NC_CTRL_DOWN][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_flyingdescend_pressed, &g_ctrl_tex[NC_CTRL_DOWN][1]);
-    if (!g_ctrl_tex[NC_CTRL_JOY][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_joystick_frame, &g_ctrl_tex[NC_CTRL_JOY][0]);
-    if (!g_ctrl_tex[NC_CTRL_JOY][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_joystick_knob, &g_ctrl_tex[NC_CTRL_JOY][1]);
+    const char *paths[NC_CTRL_COUNT][2] = {
+        {"controls/joystick_frame.png", "controls/joystick_knob.png"},
+        {"controls/attack.png", "controls/attack_pressed.png"},
+        {"controls/interact.png", "controls/interact_pressed.png"},
+        {"controls/jump.png", "controls/jump_pressed.png"},
+        {"controls/sneak.png", "controls/sneak_pressed.png"},
+        {"controls/flyingascend.png", "controls/flyingascend_pressed.png"},
+        {"controls/flyingdescend.png", "controls/flyingdescend_pressed.png"}
+    };
+    for (int i=0; i<NC_CTRL_COUNT; ++i) {
+        for (int j=0; j<2; ++j) {
+            if (g_ctrl_tex[i][j]) continue;
+            bool loaded = ctrl_decode_asset_texture(paths[i][j], &g_ctrl_tex[i][j]);
+            if (!loaded) {
+                const NcControlPng *fallback = ctrl_png(i, j != 0);
+                loaded = fallback && ctrl_decode_png_texture(fallback, &g_ctrl_tex[i][j]);
+            }
+            if (!loaded) ok = false;
+        }
+    }
     g_ctrl_assets_ready = ok;
-    if (!ok && (g_frames % 60 == 0)) nclog("controls: waiting for texture decode (GL/JNI context)");
+    if (!ok && (g_frames % 60 == 0)) nclog("controls: waiting for APK asset/embedded texture decode");
 }
 
 static ImVec2 ctrl_size_px(int i) {
@@ -1560,11 +1646,14 @@ static void ctrl_apply_player_actions() {
     static void (*attack_fn)(void*, void*) = 0;
     static void (*interact_fn)(void*, void*) = 0;
     static void (*move_fn)(void*, const NcVec3*) = 0;
+    static bool (*ground_fn)(void*) = 0;
+    static double last_jump = 0.0;
 
     if (!resolved) {
         resolved = true;
         jump_fn = (void(*)(void*))dlsym(RTLD_DEFAULT, "_ZN11LocalPlayer14jumpFromGroundEv");
         if (!jump_fn) jump_fn = (void(*)(void*))dlsym(RTLD_DEFAULT, "_ZN3Mob14jumpFromGroundEv");
+        ground_fn = (bool(*)(void*))dlsym(RTLD_DEFAULT, "_ZNK6Entity11isOnGroundEv");
         sneak_fn = (void(*)(void*, bool))dlsym(RTLD_DEFAULT, "_ZN3Mob11setSneakingEb");
 
         /* Best-effort movement/action bridges. These are looked up dynamically so
@@ -1575,6 +1664,8 @@ static void ctrl_apply_player_actions() {
         if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks26handleInteractButtonPressER14ClientInstance");
         if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks22handleBuildButtonPressER14ClientInstance");
         if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks23handleBuildButtonPressER14ClientInstance");
+        nclog("new controls symbols: jump=%p ground=%p sneak=%p attack=%p interact=%p move=%p",
+              (void*)jump_fn, (void*)ground_fn, (void*)sneak_fn, (void*)attack_fn, (void*)interact_fn, (void*)move_fn);
 
         /* Fallback movement bridge for builds exposing Mob/LocalPlayer::lerpMotion.
          * The joystick is converted into camera-relative horizontal motion. */
@@ -1583,7 +1674,14 @@ static void ctrl_apply_player_actions() {
         if (!move_fn) move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN6Entity10lerpMotionERK4Vec3");
     }
 
-    if (jump_fn && g_ctrl_pressed[NC_CTRL_JUMP]) jump_fn(g_local_player);
+    const double tnow = now_s();
+    if (g_ctrl_pressed[NC_CTRL_JUMP]) {
+        bool can_jump = ground_fn ? ground_fn(g_local_player) : ((tnow - last_jump) > 0.80);
+        if (can_jump && jump_fn && (tnow - last_jump) > 0.08) {
+            jump_fn(g_local_player);
+            last_jump = tnow;
+        }
+    }
     if (sneak_fn) sneak_fn(g_local_player, g_ctrl_pressed[NC_CTRL_SNEAK] != 0);
 
     if (g_cic && g_ci) {
@@ -1602,10 +1700,13 @@ static void ctrl_apply_player_actions() {
             const float sn = sinf(r), cs = cosf(r);
             /* joystick Y is screen-down, so invert it for forward. */
             const float fwd = -sy;
+            const bool sprint = (fwd > 0.60f && !mob_isSneaking(g_local_player) && !player_isUsingItem(g_local_player));
+            lp_setSprinting(g_local_player, sprint);
+            const float speed = sprint ? 0.13f : 0.10f;
             NcVec3 mv;
-            mv.x = (-sn * fwd + cs * sx) * 0.10f;
+            mv.x = (-sn * fwd - cs * sx) * speed;
             mv.y = 0.0f;
-            mv.z = ( cs * fwd + sn * sx) * 0.10f;
+            mv.z = ( cs * fwd - sn * sx) * speed;
             move_fn(g_local_player, &mv);
         }
     }
@@ -1676,35 +1777,37 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                 m.y[i] = AMotionEvent_getY(ev, (size_t)i);
             }
             if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
-                int idx = m.idx;
-                if (idx >= 0 && idx < m.count) {
-                    int evt = (m.action == 0 || m.action == 5) ? NC_EV_DOWN :
-                              ((m.action == 1 || m.action == 6) ? NC_EV_UP : NC_EV_MOVE);
-                    bool inside = false;
-                    if (evt == NC_EV_DOWN) {
-                        for (int ci=0; ci<NC_CTRL_COUNT; ++ci) {
-                            if (ctrl_point_in(g_ctrl_rects[ci], m.x[idx], m.y[idx])) { inside = true; break; }
-                        }
-                    } else {
-                        if (g_ctrl_touch_id == m.id[idx] || g_ctrl_joy_id == m.id[idx]) inside = true;
-                        if (!inside) {
-                            for (int ci=0; ci<NC_CTRL_COUNT; ++ci) {
-                                if (g_ctrl_ids[ci] == m.id[idx]) { inside = true; break; }
-                            }
+                bool claimed = false;
+                int idx = (m.idx >= 0 && m.idx < m.count) ? m.idx : 0;
+                int evt = (m.action == AMOTION_EVENT_ACTION_DOWN || m.action == AMOTION_EVENT_ACTION_POINTER_DOWN) ? NC_EV_DOWN :
+                          ((m.action == AMOTION_EVENT_ACTION_UP || m.action == AMOTION_EVENT_ACTION_POINTER_UP || m.action == AMOTION_EVENT_ACTION_CANCEL) ? NC_EV_UP : NC_EV_MOVE);
+                if (evt == NC_EV_DOWN) {
+                    for (int ci=0; ci<NC_CTRL_COUNT; ++ci) {
+                        if (ctrl_point_in(g_ctrl_rects[ci], m.x[idx], m.y[idx])) { claimed = true; break; }
+                    }
+                    if (claimed) ctrl_consume_touch(NC_EV_DOWN, m.id[idx], m.x[idx], m.y[idx]);
+                } else if (evt == NC_EV_MOVE) {
+                    for (int pi=0; pi<m.count; ++pi) {
+                        bool owned = false;
+                        for (int ci=0; ci<NC_CTRL_COUNT; ++ci) if (g_ctrl_ids[ci] == m.id[pi]) { owned = true; break; }
+                        if (owned || g_ctrl_joy_id == m.id[pi]) {
+                            ctrl_consume_touch(NC_EV_MOVE, m.id[pi], m.x[pi], m.y[pi]);
+                            claimed = true;
                         }
                     }
-                    if (inside) {
-                        ctrl_consume_touch(evt,m.id[idx],m.x[idx],m.y[idx]);
-                        AInputQueue_finishEvent(q, ev, 1);
-                        continue;
+                } else {
+                    if (idx >= 0 && idx < m.count) {
+                        for (int ci=0; ci<NC_CTRL_COUNT; ++ci) if (g_ctrl_ids[ci] == m.id[idx]) { claimed = true; break; }
+                        if (g_ctrl_joy_id == m.id[idx]) claimed = true;
+                        if (claimed) ctrl_consume_touch(NC_EV_UP, m.id[idx], m.x[idx], m.y[idx]);
                     }
+                    if (m.action == AMOTION_EVENT_ACTION_CANCEL) ctrl_reset_states();
                 }
+                if (claimed) { AInputQueue_finishEvent(q, ev, 1); continue; }
             }
             pthread_mutex_lock(&g_mu);
             int swallow = nc_touch_event(&g_touch, &m, push_ev, 0);
             pthread_mutex_unlock(&g_mu);
-            /* Legacy ImGui touch path above already handled every event that was
-             * not claimed by a New control. Do not feed the same event twice. */
             if (swallow) {
                 if (g_touch_logged < 6) { g_touch_logged++; nclog("touch taken: action=%d", m.action); }
                 AInputQueue_finishEvent(q, ev, 1);
@@ -2090,7 +2193,7 @@ static void build_control_editor(float w, float h) {
     if (g_ctrl_editor_tab==0) {
         sl_f("Opacity",ctrl_alpha(g_ctrl_selected),0.10f,1.0f);
     } else {
-        sl_f("Size",ctrl_size(g_ctrl_selected),0.5f,2.0f);
+        sl_f("Size",ctrl_size(g_ctrl_selected),0.5f,4.0f);
     }
     ImGui::TextDisabled("Drag a control to move it.");
     ImGui::EndChild();
@@ -2112,12 +2215,15 @@ static const char *const LBL_N[]     = { "N", "NC", "NIGHT" };
 static const char *const LBL_DROP[]  = { "Q", "DROP", "V" };
 #define NC_COUNT_OF(a) ((int)(sizeof(a) / sizeof((a)[0])))
 static const char *pick(const char *const *list, int n, int idx) { return list[(idx < 0 || idx >= n) ? 0 : idx]; }
+static const char *nc_nonempty(const char *s, const char *fallback) {
+    return (s && s[0]) ? s : fallback;
+}
 static const char *button_text(int e) {
     switch (e) {
-        case E_ZOOM: return g_cfg.zoom_text;
-        case E_PERSP: return g_cfg.persp_text;
-        case E_DROP: return g_cfg.drop_text;
-        default: return g_cfg.n_text;
+        case E_ZOOM: return nc_nonempty(g_cfg.zoom_text, "Z");
+        case E_PERSP: return nc_nonempty(g_cfg.persp_text, "F5");
+        case E_DROP: return nc_nonempty(g_cfg.drop_text, "Q");
+        default: return nc_nonempty(g_cfg.n_text, "N");
     }
 }
 
@@ -2185,11 +2291,11 @@ static ImVec2 elem_size(int e) {
         case E_SPEED: return size_speed();
         case E_COORDS: return size_coords();
         case E_ELYTRA_ANGLE: return size_elytra_angle();
-        case E_DROP:  return btn_size(g_cfg.drop_text,  g_cfg.drop_btn);
-        case E_ZOOM:  return btn_size(g_cfg.zoom_text,  g_cfg.zoom_btn);
-        case E_PERSP:      return btn_size(g_cfg.persp_text, g_cfg.persp_btn);
+        case E_DROP:  return btn_size(button_text(E_DROP),  g_cfg.drop_btn);
+        case E_ZOOM:  return btn_size(button_text(E_ZOOM),  g_cfg.zoom_btn);
+        case E_PERSP:      return btn_size(button_text(E_PERSP), g_cfg.persp_btn);
         case E_FAST_TOTEM: return btn_size("TOTEM", g_cfg.fast_totem_btn);
-        default:           return btn_size(g_cfg.n_text, g_cfg.n_btn);
+        default:           return btn_size(button_text(E_N), g_cfg.n_btn);
     }
 }
 
@@ -2232,11 +2338,11 @@ static void build_edit(float w, float h) {
             case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
             case E_COORDS: draw_coords(dl, pos); break;
             case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
-            case E_DROP:       draw_button(dl, pos, sz, g_cfg.drop_text,  g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col); break;
+            case E_DROP:       draw_button(dl, pos, sz, button_text(E_DROP),  g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col); break;
             case E_FAST_TOTEM: draw_button(dl, pos, sz, "TOTEM", g_cfg.fast_totem_alpha, g_cfg.fast_totem_text_alpha, false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col); break;
-            case E_ZOOM:       draw_button(dl, pos, sz, g_cfg.zoom_text,  g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_bg_col, g_cfg.zoom_col); break;
-            case E_PERSP:      draw_button(dl, pos, sz, g_cfg.persp_text, g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col); break;
-            default:           draw_button(dl, pos, sz, g_cfg.n_text,     g_cfg.n_alpha, g_cfg.n_text_alpha, true,  false, g_cfg.n_bg_col, g_cfg.n_col); break;
+            case E_ZOOM:       draw_button(dl, pos, sz, button_text(E_ZOOM),  g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_bg_col, g_cfg.zoom_col); break;
+            case E_PERSP:      draw_button(dl, pos, sz, button_text(E_PERSP), g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col); break;
+            default:           draw_button(dl, pos, sz, button_text(E_N),     g_cfg.n_alpha, g_cfg.n_text_alpha, true,  false, g_cfg.n_bg_col, g_cfg.n_col); break;
         }
         dl->AddRect(pos, vadd(pos, sz), IM_COL32(150, 130, 255, 255), 3.0f, 0, 2.0f);
         ImGui::SetCursorScreenPos(pos);
@@ -2720,19 +2826,19 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
 
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
-            if (button_at("##night_zoom", place(g_cfg.zoom_x, g_cfg.zoom_y, sz), sz, g_cfg.zoom_text,
+            if (button_at("##night_zoom", place(g_cfg.zoom_x, g_cfg.zoom_y, sz), sz, button_text(E_ZOOM),
                           g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, g_zoom_active != 0, g_cfg.zoom_bg_col, g_cfg.zoom_col, &hud[0]))
                 g_zoom_active = g_zoom_active ? 0 : 1;
         }
         if (persp_vis) {
             ImVec2 sz = elem_size(E_PERSP);
-            if (button_at("##night_persp", place(g_cfg.persp_x, g_cfg.persp_y, sz), sz, g_cfg.persp_text,
+            if (button_at("##night_persp", place(g_cfg.persp_x, g_cfg.persp_y, sz), sz, button_text(E_PERSP),
                           g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col, &hud[1]))
                 do_perspective();
         }
         if (drop_vis) {
             ImVec2 sz = elem_size(E_DROP);
-            if (button_at("##night_drop", place(g_cfg.drop_x, g_cfg.drop_y, sz), sz, g_cfg.drop_text,
+            if (button_at("##night_drop", place(g_cfg.drop_x, g_cfg.drop_y, sz), sz, button_text(E_DROP),
                           g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col, &hud[2]))
                 { if (g_cic && g_ci) cic_drop(g_cic, g_ci); else nclog("drop: game objects not captured yet"); }
         }
@@ -2751,7 +2857,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
             draw_combat_crosshair(fg, (float)w, (float)h);
         if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
-            if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, g_cfg.n_text,
+            if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, button_text(E_N),
                           g_cfg.n_alpha, g_cfg.n_text_alpha, true, false, g_cfg.n_bg_col, g_cfg.n_col, &nrect)) {
                 g_menu_open = true; nclog("menu opened");
             }
@@ -2832,7 +2938,12 @@ static void nc_init(void) {
     nc_touch_init(&g_touch);
     nc_cfg_defaults(&g_cfg);
     int had = nc_cfg_load(&g_cfg, NC_CFG);
-    if (!had) nc_cfg_save(&g_cfg, NC_CFG);
+    bool fixed_labels = false;
+    if (!g_cfg.zoom_text[0]) { strncpy(g_cfg.zoom_text, "Z", sizeof(g_cfg.zoom_text)-1); g_cfg.zoom_text[sizeof(g_cfg.zoom_text)-1]=0; fixed_labels=true; }
+    if (!g_cfg.persp_text[0]) { strncpy(g_cfg.persp_text, "F5", sizeof(g_cfg.persp_text)-1); g_cfg.persp_text[sizeof(g_cfg.persp_text)-1]=0; fixed_labels=true; }
+    if (!g_cfg.drop_text[0]) { strncpy(g_cfg.drop_text, "Q", sizeof(g_cfg.drop_text)-1); g_cfg.drop_text[sizeof(g_cfg.drop_text)-1]=0; fixed_labels=true; }
+    if (!g_cfg.n_text[0]) { strncpy(g_cfg.n_text, "N", sizeof(g_cfg.n_text)-1); g_cfg.n_text[sizeof(g_cfg.n_text)-1]=0; fixed_labels=true; }
+    if (!had || fixed_labels) nc_cfg_save(&g_cfg, NC_CFG);
     g_saved = g_cfg;
     nclog("config %s", had ? "loaded" : "created");
 
@@ -2849,7 +2960,7 @@ static void nc_init(void) {
     /* per mod: can be switched off in config.txt (hook_x=0) if one of them ever crashes the game */
     if (g_cfg.hook_hurt)  reg("no hurt cam", "_ZN19LevelRendererPlayer7bobHurtER6Matrixf", (void *)hook_bobhurt, (void **)&g_orig_bob);
     if (g_cfg.hook_fov)   reg("zoom", "_ZN19LevelRendererPlayer6getFovEfb", (void *)hook_fov, (void **)&g_orig_fov);
-    if (g_cfg.hook_persp) reg("perspective",
+    reg("input callback capture",
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
     if (g_cfg.hook_xp) {

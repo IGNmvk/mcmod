@@ -36,13 +36,13 @@ extern "C" {
   X(fast_totem_alpha, F, 0.90, 0.0, 1) X(fast_totem_text_alpha, F, 1.0, 0.0, 1) X(fast_totem_col, I, 0xF0F0FA, 0, 0xFFFFFF) X(fast_totem_bg_col, I, 0x38306E, 0, 0xFFFFFF) \
   X(combat_crosshair_on, I, 0, 0, 1) \
   X(controls_mode, I, 0, 0, 1) \
-  X(ctrl_joy_x, F, 0.16, 0, 1) X(ctrl_joy_y, F, 0.76, 0, 1) X(ctrl_joy_size, F, 1.0, 0.5, 2.0) X(ctrl_joy_alpha, F, 0.70, 0.10, 1.0) \
-  X(ctrl_attack_x, F, 0.80, 0, 1) X(ctrl_attack_y, F, 0.60, 0, 1) X(ctrl_attack_size, F, 1.0, 0.5, 2.0) X(ctrl_attack_alpha, F, 0.85, 0.10, 1.0) \
-  X(ctrl_interact_x, F, 0.92, 0, 1) X(ctrl_interact_y, F, 0.60, 0, 1) X(ctrl_interact_size, F, 1.0, 0.5, 2.0) X(ctrl_interact_alpha, F, 0.85, 0.10, 1.0) \
-  X(ctrl_jump_x, F, 0.90, 0, 1) X(ctrl_jump_y, F, 0.79, 0, 1) X(ctrl_jump_size, F, 1.0, 0.5, 2.0) X(ctrl_jump_alpha, F, 0.85, 0.10, 1.0) \
-  X(ctrl_sneak_x, F, 0.79, 0, 1) X(ctrl_sneak_y, F, 0.84, 0, 1) X(ctrl_sneak_size, F, 1.0, 0.5, 2.0) X(ctrl_sneak_alpha, F, 0.85, 0.10, 1.0) \
-  X(ctrl_up_x, F, 0.90, 0, 1) X(ctrl_up_y, F, 0.28, 0, 1) X(ctrl_up_size, F, 1.0, 0.5, 2.0) X(ctrl_up_alpha, F, 0.85, 0.10, 1.0) \
-  X(ctrl_down_x, F, 0.90, 0, 1) X(ctrl_down_y, F, 0.39, 0, 1) X(ctrl_down_size, F, 1.0, 0.5, 2.0) X(ctrl_down_alpha, F, 0.85, 0.10, 1.0) \
+  X(ctrl_joy_x, F, 0.16, 0, 1) X(ctrl_joy_y, F, 0.76, 0, 1) X(ctrl_joy_size, F, 1.0, 0.5, 4.0) X(ctrl_joy_alpha, F, 0.70, 0.10, 1.0) \
+  X(ctrl_attack_x, F, 0.80, 0, 1) X(ctrl_attack_y, F, 0.60, 0, 1) X(ctrl_attack_size, F, 1.0, 0.5, 4.0) X(ctrl_attack_alpha, F, 0.85, 0.10, 1.0) \
+  X(ctrl_interact_x, F, 0.92, 0, 1) X(ctrl_interact_y, F, 0.60, 0, 1) X(ctrl_interact_size, F, 1.0, 0.5, 4.0) X(ctrl_interact_alpha, F, 0.85, 0.10, 1.0) \
+  X(ctrl_jump_x, F, 0.90, 0, 1) X(ctrl_jump_y, F, 0.79, 0, 1) X(ctrl_jump_size, F, 1.0, 0.5, 4.0) X(ctrl_jump_alpha, F, 0.85, 0.10, 1.0) \
+  X(ctrl_sneak_x, F, 0.79, 0, 1) X(ctrl_sneak_y, F, 0.84, 0, 1) X(ctrl_sneak_size, F, 1.0, 0.5, 4.0) X(ctrl_sneak_alpha, F, 0.85, 0.10, 1.0) \
+  X(ctrl_up_x, F, 0.90, 0, 1) X(ctrl_up_y, F, 0.28, 0, 1) X(ctrl_up_size, F, 1.0, 0.5, 4.0) X(ctrl_up_alpha, F, 0.85, 0.10, 1.0) \
+  X(ctrl_down_x, F, 0.90, 0, 1) X(ctrl_down_y, F, 0.39, 0, 1) X(ctrl_down_size, F, 1.0, 0.5, 4.0) X(ctrl_down_alpha, F, 0.85, 0.10, 1.0) \
   X(perf_gfx,     I, 0,    0, 1) X(perf_light, I, 0, 0, 1) X(perf_skies, I, 0, 0, 1) X(perf_bob, I, 0, 0, 1) \
   X(perf_view_on, I, 0,    0, 1) X(perf_view, I, 6, 2, 16) \
   X(ui_font,      I, 0,    0, 6) \
