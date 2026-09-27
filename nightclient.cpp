@@ -1439,22 +1439,24 @@ static int  hook_view(void *s) {
 
 static void ctrl_init_textures() {
     if (g_ctrl_assets_ready) return;
-    g_ctrl_assets_ready = true;
     /* Android bitmap decoding requires a current GL context; nc_frame calls this after ImGui is initialized. */
-    ctrl_decode_png_texture(&nc_ctrl_png_attack, &g_ctrl_tex[NC_CTRL_ATTACK][0]);
-    ctrl_decode_png_texture(&nc_ctrl_png_attack_pressed, &g_ctrl_tex[NC_CTRL_ATTACK][1]);
-    ctrl_decode_png_texture(&nc_ctrl_png_interact, &g_ctrl_tex[NC_CTRL_INTERACT][0]);
-    ctrl_decode_png_texture(&nc_ctrl_png_interact_pressed, &g_ctrl_tex[NC_CTRL_INTERACT][1]);
-    ctrl_decode_png_texture(&nc_ctrl_png_jump, &g_ctrl_tex[NC_CTRL_JUMP][0]);
-    ctrl_decode_png_texture(&nc_ctrl_png_jump_pressed, &g_ctrl_tex[NC_CTRL_JUMP][1]);
-    ctrl_decode_png_texture(&nc_ctrl_png_sneak, &g_ctrl_tex[NC_CTRL_SNEAK][0]);
-    ctrl_decode_png_texture(&nc_ctrl_png_sneak_pressed, &g_ctrl_tex[NC_CTRL_SNEAK][1]);
-    ctrl_decode_png_texture(&nc_ctrl_png_flyingascend, &g_ctrl_tex[NC_CTRL_UP][0]);
-    ctrl_decode_png_texture(&nc_ctrl_png_flyingascend_pressed, &g_ctrl_tex[NC_CTRL_UP][1]);
-    ctrl_decode_png_texture(&nc_ctrl_png_flyingdescend, &g_ctrl_tex[NC_CTRL_DOWN][0]);
-    ctrl_decode_png_texture(&nc_ctrl_png_flyingdescend_pressed, &g_ctrl_tex[NC_CTRL_DOWN][1]);
-    ctrl_decode_png_texture(&nc_ctrl_png_joystick_frame, &g_ctrl_tex[NC_CTRL_JOY][0]);
-    ctrl_decode_png_texture(&nc_ctrl_png_joystick_knob, &g_ctrl_tex[NC_CTRL_JOY][1]);
+    bool ok = true;
+    if (!g_ctrl_tex[NC_CTRL_ATTACK][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_attack, &g_ctrl_tex[NC_CTRL_ATTACK][0]);
+    if (!g_ctrl_tex[NC_CTRL_ATTACK][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_attack_pressed, &g_ctrl_tex[NC_CTRL_ATTACK][1]);
+    if (!g_ctrl_tex[NC_CTRL_INTERACT][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_interact, &g_ctrl_tex[NC_CTRL_INTERACT][0]);
+    if (!g_ctrl_tex[NC_CTRL_INTERACT][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_interact_pressed, &g_ctrl_tex[NC_CTRL_INTERACT][1]);
+    if (!g_ctrl_tex[NC_CTRL_JUMP][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_jump, &g_ctrl_tex[NC_CTRL_JUMP][0]);
+    if (!g_ctrl_tex[NC_CTRL_JUMP][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_jump_pressed, &g_ctrl_tex[NC_CTRL_JUMP][1]);
+    if (!g_ctrl_tex[NC_CTRL_SNEAK][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_sneak, &g_ctrl_tex[NC_CTRL_SNEAK][0]);
+    if (!g_ctrl_tex[NC_CTRL_SNEAK][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_sneak_pressed, &g_ctrl_tex[NC_CTRL_SNEAK][1]);
+    if (!g_ctrl_tex[NC_CTRL_UP][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_flyingascend, &g_ctrl_tex[NC_CTRL_UP][0]);
+    if (!g_ctrl_tex[NC_CTRL_UP][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_flyingascend_pressed, &g_ctrl_tex[NC_CTRL_UP][1]);
+    if (!g_ctrl_tex[NC_CTRL_DOWN][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_flyingdescend, &g_ctrl_tex[NC_CTRL_DOWN][0]);
+    if (!g_ctrl_tex[NC_CTRL_DOWN][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_flyingdescend_pressed, &g_ctrl_tex[NC_CTRL_DOWN][1]);
+    if (!g_ctrl_tex[NC_CTRL_JOY][0]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_joystick_frame, &g_ctrl_tex[NC_CTRL_JOY][0]);
+    if (!g_ctrl_tex[NC_CTRL_JOY][1]) ok &= ctrl_decode_png_texture(&nc_ctrl_png_joystick_knob, &g_ctrl_tex[NC_CTRL_JOY][1]);
+    g_ctrl_assets_ready = ok;
+    if (!ok && (g_frames % 60 == 0)) nclog("controls: waiting for texture decode (GL/JNI context)");
 }
 
 static ImVec2 ctrl_size_px(int i) {
@@ -1475,21 +1477,35 @@ static ImVec2 ctrl_place(int i, float w, float h) {
 static void ctrl_draw_icon(ImDrawList *dl, int i, ImVec2 p, bool pressed) {
     const int tex_idx = pressed ? 1 : 0;
     GLuint tex = g_ctrl_tex[i][tex_idx];
-    if (!tex) return;
     ImVec2 sz = ctrl_size_px(i);
     float a = clampf(*ctrl_alpha(i), 0.05f, 1.0f);
-    dl->AddImage((ImTextureID)(uintptr_t)tex, p, vadd(p, sz), V(0,0), V(1,1),
-                 IM_COL32(255,255,255,(int)(a*255.0f)));
+    if (tex) {
+        dl->AddImage((ImTextureID)(uintptr_t)tex, p, vadd(p, sz), V(0,0), V(1,1),
+                     IM_COL32(255,255,255,(int)(a*255.0f)));
+    } else {
+        /* Diagnostic fallback: if Android PNG decoding fails, keep the control
+         * visible so the input/layout can still be tested. */
+        dl->AddRectFilled(p, vadd(p,sz), IM_COL32(40,35,70,(int)(a*210.0f)), sz.y*0.18f);
+        ImVec2 t = txt(ctrl_name(i), 1);
+        put_text(dl, V(p.x + (sz.x-t.x)*0.5f, p.y + (sz.y-t.y)*0.5f), 1,
+                 IM_COL32(255,255,255,(int)(a*255.0f)), ctrl_name(i));
+    }
 }
 
 static void ctrl_draw_joystick(ImDrawList *dl, ImVec2 p, bool editor_preview=false) {
     GLuint frame = g_ctrl_tex[NC_CTRL_JOY][0];
     GLuint knob  = g_ctrl_tex[NC_CTRL_JOY][1];
-    if (!frame || !knob) return;
     ImVec2 sz = ctrl_size_px(NC_CTRL_JOY);
     float a = clampf(*ctrl_alpha(NC_CTRL_JOY), 0.05f, 1.0f);
-    dl->AddImage((ImTextureID)(uintptr_t)frame, p, vadd(p,sz), V(0,0), V(1,1),
-                 IM_COL32(255,255,255,(int)(a*255.0f)));
+    if (frame) {
+        dl->AddImage((ImTextureID)(uintptr_t)frame, p, vadd(p,sz), V(0,0), V(1,1),
+                     IM_COL32(255,255,255,(int)(a*255.0f)));
+    } else {
+        dl->AddCircleFilled(V(p.x+sz.x*0.5f,p.y+sz.y*0.5f), sz.x*0.48f,
+                            IM_COL32(40,35,70,(int)(a*130.0f)));
+        dl->AddCircle(V(p.x+sz.x*0.5f,p.y+sz.y*0.5f), sz.x*0.48f,
+                      IM_COL32(255,255,255,(int)(a*180.0f)), 48, 2.0f);
+    }
     float kside = sz.x * 0.5f;
     float nx = clampf((float)g_ctrl_joy_x, -1.0f, 1.0f);
     float ny = clampf((float)g_ctrl_joy_y, -1.0f, 1.0f);
@@ -1497,8 +1513,13 @@ static void ctrl_draw_joystick(ImDrawList *dl, ImVec2 p, bool editor_preview=fal
     ImVec2 center = V(p.x + (sz.x - kside) * 0.5f, p.y + (sz.y - kside) * 0.5f);
     center.x += nx * (sz.x - kside) * 0.35f;
     center.y += ny * (sz.y - kside) * 0.35f;
-    dl->AddImage((ImTextureID)(uintptr_t)knob, center, V(center.x+kside, center.y+kside),
-                 V(0,0), V(1,1), IM_COL32(255,255,255,(int)(a*255.0f)));
+    if (knob) {
+        dl->AddImage((ImTextureID)(uintptr_t)knob, center, V(center.x+kside, center.y+kside),
+                     V(0,0), V(1,1), IM_COL32(255,255,255,(int)(a*255.0f)));
+    } else {
+        dl->AddCircleFilled(V(center.x+kside*0.5f,center.y+kside*0.5f), kside*0.48f,
+                            IM_COL32(255,255,255,(int)(a*180.0f)));
+    }
 }
 
 static void ctrl_build_rects(float w, float h) {
@@ -1510,8 +1531,23 @@ static void ctrl_build_rects(float w, float h) {
     }
 }
 
+/* True only when the gameplay screen is actually active.  The native
+ * Minecraft UI owns pause/inventory/chat, so our replacement controls must
+ * never feed movement/actions while one of those screens is on top. */
+static bool nc_gameplay_input_active() {
+    const double now = now_s();
+    const bool play = (now - g_play_time) < 0.35;
+    const bool pause = (g_pause_this != 0);
+    const bool settings = (g_settings_this != 0);
+    const bool inventory = (now - g_inventory_render_time) < 0.35;
+    return play && !pause && !settings && !inventory && !g_menu_open && !g_edit;
+}
+
 static void ctrl_apply_player_actions() {
-    if (!g_local_player || g_cfg.controls_mode != 1) return;
+    if (!g_local_player || g_cfg.controls_mode != 1 || !nc_gameplay_input_active()) {
+        if (!nc_gameplay_input_active()) ctrl_reset_states();
+        return;
+    }
 
     /* Jump/sneak: use the game's own methods. */
     static bool resolved = false;
@@ -1635,7 +1671,7 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                 m.x[i] = AMotionEvent_getX(ev, (size_t)i);
                 m.y[i] = AMotionEvent_getY(ev, (size_t)i);
             }
-            if (g_cfg.controls_mode == 1 && !g_menu_open && !g_edit) {
+            if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
                 int idx = m.idx;
                 if (idx >= 0 && idx < m.count) {
                     int evt = (m.action == 0 || m.action == 5) ? NC_EV_DOWN :
@@ -2572,22 +2608,24 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
 
     bool in_settings = (g_settings_this != 0) || g_cfg.n_always;
     bool in_pause    = (g_pause_this != 0);
+    bool inventory_open = (now - g_inventory_render_time) < 0.35;
     bool menu_reach  = in_settings || in_pause;                 /* N button appears in either */
     bool in_world = (now - g_tick_time) < 0.6;
-    bool play_hud = (now - g_play_time) < 0.3;
+    bool play_hud = (now - g_play_time) < 0.35;
+    bool gameplay_hud = play_hud && !in_settings && !in_pause && !inventory_open;
     if (!menu_reach) { g_menu_open = false; g_edit = false; g_edit_target = -1; kb_stop(); }
-    if (g_cfg.controls_mode != 1 || !in_world) ctrl_reset_states();
+    if (g_cfg.controls_mode != 1 || !gameplay_hud) ctrl_reset_states();
 
     bool any_armor = g_snap.present[0] || g_snap.present[1] || g_snap.present[2] || g_snap.present[3] ||
                       g_snap.held_present || g_snap.offhand_present;
     bool fps_vis    = g_cfg.fps_on && (g_cfg.fps_menus || in_world);
-    bool armor_vis  = g_cfg.armor_on && in_world && any_armor && !g_menu_open && !g_edit;
-    bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
-    bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.holding_bow && g_snap.arrow_count > 0 && !g_menu_open && !g_edit;
-    bool speed_vis  = g_cfg.speed_on && in_world && !g_menu_open && !g_edit;
-    bool coords_vis = g_cfg.coords_on && in_world && !g_menu_open && !g_edit;
-    bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && g_snap.elytra_angle_valid && !g_menu_open && !g_edit;
-    bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;         /* the world itself */
+    bool armor_vis  = g_cfg.armor_on && gameplay_hud && in_world && any_armor && !g_menu_open && !g_edit;
+    bool elytra_vis = g_cfg.elytra_on && gameplay_hud && in_world && g_snap.gliding && !g_menu_open && !g_edit;
+    bool arrow_vis  = g_cfg.arrow_on && gameplay_hud && in_world && g_snap.holding_bow && g_snap.arrow_count > 0 && !g_menu_open && !g_edit;
+    bool speed_vis  = g_cfg.speed_on && gameplay_hud && in_world && !g_menu_open && !g_edit;
+    bool coords_vis = g_cfg.coords_on && gameplay_hud && in_world && !g_menu_open && !g_edit;
+    bool elytra_angle_vis = g_cfg.elytra_angle_on && gameplay_hud && in_world && g_snap.gliding && g_snap.elytra_angle_valid && !g_menu_open && !g_edit;
+    bool hud_btns   = gameplay_hud && !g_menu_open && !g_edit;         /* active gameplay only */
     bool zoom_vis   = g_cfg.controls_mode == 0 && g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
     bool persp_vis  = g_cfg.controls_mode == 0 && g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
     bool drop_vis   = g_cfg.controls_mode == 0 && g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
@@ -2597,7 +2635,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     if (!zoom_vis) g_zoom_active = 0;
 
     bool combat_vis = g_cfg.combat_crosshair_on && in_world && !g_menu_open && !g_edit;
-    bool controls_vis = g_cfg.controls_mode == 1 && in_world && !g_menu_open && !g_edit;
+    bool controls_vis = g_cfg.controls_mode == 1 && gameplay_hud && in_world && !g_menu_open && !g_edit;
     bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || combat_vis || controls_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
