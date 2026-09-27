@@ -1,0 +1,72 @@
+name: build
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get Dear ImGui
+        run: git clone --depth 1 --branch v1.90.4 https://github.com/ocornut/imgui.git imgui
+
+      - name: Build Night Client (32-bit ARM, same as MCPE 1.1.5)
+        run: |
+          set -e
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="$BIN/armv7a-linux-androideabi21-clang"
+          CXX="$BIN/armv7a-linux-androideabi21-clang++"
+
+          # stand-ins for the game and mod-loader libraries, made from the __asm__ labels in the source
+          mkdir -p stub build
+          grep -ho '__asm__("_Z[A-Za-z0-9_]*")' nightclient.cpp | sed 's/__asm__("//; s/")//' | sort -u > labels.txt
+          : > stub/game.c
+          : > stub/tml.c
+          i=0
+          while read -r label; do
+            case "$label" in
+              _ZN3tml*) out=stub/tml.c ;;
+              *)        out=stub/game.c ;;
+            esac
+            echo "void stub_$i(void) __asm__(\"$label\"); void stub_$i(void) {}" >> "$out"
+            i=$((i+1))
+          done < labels.txt
+          echo "int stub_game_marker;" >> stub/game.c
+          echo "int stub_tml_marker;" >> stub/tml.c
+          "$CC" -shared -fPIC -Wl,-soname,libminecraftpe.so -o stub/libminecraftpe.so stub/game.c
+          "$CC" -shared -fPIC -Wl,-soname,libmodloader.so   -o stub/libmodloader.so   stub/tml.c
+
+          CF="-O2 -fPIC -fvisibility=hidden -Wall"
+          CXXF="$CF -std=c++17 -fno-exceptions -fno-rtti -DIMGUI_IMPL_OPENGL_ES2 -DIMGUI_DISABLE_DEMO_WINDOWS -DIMGUI_DISABLE_DEBUG_TOOLS -Iimgui -Iimgui/backends"
+
+          "$CC"  $CF   -c nc_core.c        -o build/nc_core.o
+          "$CC"  $CF   -c gothook.c        -o build/gothook.o
+          "$CXX" $CXXF -c nightclient.cpp  -o build/nightclient.o
+          for f in imgui imgui_draw imgui_tables imgui_widgets; do
+            "$CXX" $CXXF -c imgui/$f.cpp -o build/$f.o
+          done
+          "$CXX" $CXXF -c imgui/backends/imgui_impl_opengl3.cpp -o build/imgui_impl_opengl3.o
+
+          OUT=out/assets/1.1.3/mods/nightclient
+          mkdir -p $OUT/native/armeabi-v7a
+          "$CXX" -shared -o $OUT/native/armeabi-v7a/libnightclient.so build/*.o \
+              -static-libstdc++ -Wl,--exclude-libs,ALL -Wl,--no-undefined \
+              -Wl,--no-as-needed -Lstub -lminecraftpe -lmodloader -lGLESv2 -lEGL -landroid -llog
+
+          cp package.yaml $OUT/package.yaml
+          cp config.json  out/assets/1.1.3/config.json
+
+          echo "--- result ---"
+          SO=$OUT/native/armeabi-v7a/libnightclient.so
+          ls -la $SO
+          readelf -h $SO | grep -E "Class|Machine"
+          echo "NEEDED:"; readelf -d $SO | grep NEEDED
+          echo "exported:"; readelf -Ws --dyn-syms $SO | awk '$7!="UND" && $8!=""{print $8}' | head
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: night-client
+          path: out
