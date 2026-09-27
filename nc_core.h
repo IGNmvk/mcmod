@@ -32,16 +32,18 @@ extern "C" {
   X(persp_col,    I, 0x38306E, 0, 0xFFFFFF) X(persp_pause, I, 0, 0, 1) \
   X(drop_on,      I, 0,    0, 1) X(drop_x, F, 0.90, 0, 1) X(drop_y, F, 0.62, 0, 1) X(drop_btn, F, 3.0, 1.0, 8.0) \
   X(drop_alpha,   F, 0.85, 0.0, 1) X(drop_text_alpha, F, 1.0, 0.0, 1) X(drop_bg_col, I, 0x38306E, 0, 0xFFFFFF) X(drop_label, I, 0, 0, 7) X(drop_col, I, 0x38306E, 0, 0xFFFFFF) X(drop_pause, I, 0, 0, 1) \
-  X(fast_totem_on, I, 1, 0, 1) X(fast_totem_x, F, 0.78, 0, 1) X(fast_totem_y, F, 0.86, 0, 1) X(fast_totem_btn, F, 3.0, 1.0, 12.0) \
-  X(fast_totem_alpha, F, 0.90, 0.0, 1) X(fast_totem_text_alpha, F, 1.0, 0.0, 1) \
-  X(fast_totem_col, I, 0xF0F0FA, 0, 0xFFFFFF) X(fast_totem_bg_col, I, 0x38306E, 0, 0xFFFFFF) \
+  X(fast_totem_on, I, 1, 0, 1) X(fast_totem_x, F, 0.78, 0, 1) X(fast_totem_y, F, 0.86, 0, 1) X(fast_totem_btn, F, 3.0, 0.5, 12.0) \
+  X(fast_totem_alpha, F, 0.90, 0.0, 1) X(fast_totem_text_alpha, F, 1.0, 0.0, 1) X(fast_totem_col, I, 0xF0F0FA, 0, 0xFFFFFF) X(fast_totem_bg_col, I, 0x38306E, 0, 0xFFFFFF) \
   X(perf_gfx,     I, 0,    0, 1) X(perf_light, I, 0, 0, 1) X(perf_skies, I, 0, 0, 1) X(perf_bob, I, 0, 0, 1) \
   X(perf_view_on, I, 0,    0, 1) X(perf_view, I, 6, 2, 16) \
   X(ui_font,      I, 0,    0, 6) \
   X(n_x,          F, 0.92, 0, 1) X(n_y, F, 0.80, 0, 1) X(n_btn, F, 3.0, 1.0, 8.0) X(n_alpha, F, 1.0, 0.0, 1) X(n_text_alpha, F, 1.0, 0.0, 1) X(n_col, I, 0xF0F0FA, 0, 0xFFFFFF) X(n_bg_col, I, 0x38306E, 0, 0xFFFFFF) \
   X(n_always,     I, 0,    0, 1) X(n_label, I, 0, 0, 7) \
   X(hitbox_on,    I, 0,    0, 1) X(hook_hitbox, I, 1, 0, 1) \
-  X(hook_hurt,    I, 1,    0, 1) X(hook_fov, I, 1, 0, 1) X(hook_persp, I, 1, 0, 1) X(hook_perf, I, 1, 0, 1)
+  X(xp_opt_on, I, 0, 0, 1) X(xp_opt_speed, F, 4.0, 1.0, 8.0) X(xp_opt_hide_near, F, 1.25, 0.25, 4.0) \
+  X(crystal_opt_on, I, 0, 0, 1) X(crystal_opt_anim, I, 1, 0, 1) X(crystal_opt_effects, I, 1, 0, 1) \
+  X(coords_on,     I, 0,    0, 1) X(coords_x, F, 0.02, 0, 1) X(coords_y, F, 0.08, 0, 1) X(coords_size, F, 2.5, 1.0, 8.0) X(coords_alpha, F, 1.0, 0.0, 1) X(coords_bg_alpha, F, 0.75, 0.0, 1) X(coords_col, I, 0xEBEBF5, 0, 0xFFFFFF) X(coords_bg_col, I, 0x08080E, 0, 0xFFFFFF) X(coords_bg, I, 1, 0, 1) X(coords_precision, I, 1, 1, 4) \
+  X(hook_hurt,    I, 1,    0, 1) X(hook_fov, I, 1, 0, 1) X(hook_persp, I, 1, 0, 1) X(hook_perf, I, 1, 0, 1) X(hook_xp, I, 1, 0, 1) X(hook_crystal, I, 1, 0, 1)
 
 #define NC_TYPE_I int
 #define NC_TYPE_F float

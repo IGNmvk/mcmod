@@ -108,8 +108,7 @@ static int g_qn = 0;
 
 static void *volatile g_settings_this = 0;   /* the open SettingsScreenController, if any */
 static void *volatile g_pause_this = 0;      /* the open PauseScreenController, if any */
-static void *volatile g_inventory_this = 0;  /* the open InventoryScreen, if any */
-static void *volatile g_player = 0;           /* current LocalPlayer captured by tick */
+static volatile double g_inventory_render_time = 0; /* last InventoryScreen render */
 static void *volatile g_cic = 0;             /* ClientInputCallbacks* (captured) */
 static void *volatile g_ci = 0;              /* ClientInstance* (captured) */
 static void *g_apply_self = 0;               /* which gameplay screen instance g_ci was captured for */
@@ -117,7 +116,7 @@ static volatile double g_play_time = 0;      /* last time the gameplay screen wa
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
 static float           g_zoom_cur = 1.0f;
-static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; int arrow_count; float elytra_angle; int elytra_angle_valid; } g_snap;
+static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; int arrow_count; float elytra_angle; int elytra_angle_valid; float x, y, z; } g_snap;
 static float g_last_px = 0.0f, g_last_py = 0.0f, g_last_pz = 0.0f;
 static double g_last_pos_time = 0.0;
 static bool g_have_last_pos = false;
@@ -134,10 +133,13 @@ static bool  g_drawing_logged = false, g_gl_err_logged = false;
 static GLuint g_icon_tex[NC_ICON_COUNT];
 static JavaVM *g_jvm = 0;
 static jobject g_kb_activity = 0;
-static jobject g_kb_edit = 0;
 static bool g_kb_open = false;
+static int g_kb_status = -1;
 static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N */
 static char *g_kb_text = 0;
+
+/* Forward declaration: the keyboard bridge is above the logger definition. */
+static void nclog(const char *fmt, ...);
 
 typedef jint (*fn_JNI_GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
 
@@ -171,140 +173,173 @@ static void kb_release(JNIEnv *env, bool attached) { if (attached && g_jvm) g_jv
  * if the old MCPE build exposes no Java VM/activity, the text field still works as an
  * ImGui field but no soft keyboard is requested. */
 static jobject kb_find_activity(JNIEnv *env) {
+    /* Native code executing on a thread attached directly through JavaVM may have
+     * no application ClassLoader, so FindClass("com/mojang/...") can fail even
+     * though MCPE itself is running.  Resolve MainActivity through the app's
+     * actual ClassLoader and then read its mInstance singleton. */
     jclass at = env->FindClass("android/app/ActivityThread");
     if (!at) return 0;
-    jmethodID cur = env->GetStaticMethodID(at, "currentActivityThread", "()Landroid/app/ActivityThread;");
-    if (!cur) { env->DeleteLocalRef(at); return 0; }
-    jobject thread = env->CallStaticObjectMethod(at, cur);
-    if (!thread) { env->DeleteLocalRef(at); return 0; }
-    jfieldID af = env->GetFieldID(at, "mActivities", "Landroid/util/ArrayMap;");
-    if (!af) { env->DeleteLocalRef(thread); env->DeleteLocalRef(at); return 0; }
-    jobject map = env->GetObjectField(thread, af);
-    env->DeleteLocalRef(thread); env->DeleteLocalRef(at);
-    if (!map) return 0;
-    jclass mc = env->FindClass("android/util/ArrayMap");
-    if (!mc) { env->DeleteLocalRef(map); return 0; }
-    jmethodID vals = env->GetMethodID(mc, "values", "()Ljava/util/Collection;");
-    env->DeleteLocalRef(mc);
-    if (!vals) { env->DeleteLocalRef(map); return 0; }
-    jobject col = env->CallObjectMethod(map, vals);
-    env->DeleteLocalRef(map);
-    if (!col) return 0;
-    jclass cc = env->FindClass("java/util/Collection");
-    jmethodID itid = cc ? env->GetMethodID(cc, "iterator", "()Ljava/util/Iterator;") : 0;
-    if (!itid) { if (cc) env->DeleteLocalRef(cc); env->DeleteLocalRef(col); return 0; }
-    jobject it = env->CallObjectMethod(col, itid);
-    env->DeleteLocalRef(cc);
-    env->DeleteLocalRef(col);
-    if (!it) return 0;
-    jclass ic = env->FindClass("java/util/Iterator");
-    jmethodID has = ic ? env->GetMethodID(ic, "hasNext", "()Z") : 0;
-    jmethodID next = ic ? env->GetMethodID(ic, "next", "()Ljava/lang/Object;") : 0;
-    if (!has || !next) { if (ic) env->DeleteLocalRef(ic); env->DeleteLocalRef(it); return 0; }
-    jobject activity = 0;
-    while (env->CallBooleanMethod(it, has)) {
-        jobject rec = env->CallObjectMethod(it, next);
-        if (!rec) continue;
-        jclass rc = env->GetObjectClass(rec);
-        jfieldID actf = env->GetFieldID(rc, "activity", "Landroid/app/Activity;");
-        if (actf) { activity = env->GetObjectField(rec, actf); env->DeleteLocalRef(rc); env->DeleteLocalRef(rec); break; }
-        env->DeleteLocalRef(rc); env->DeleteLocalRef(rec);
-    }
-    env->DeleteLocalRef(ic); env->DeleteLocalRef(it);
-    return activity;
-}
+    jmethodID currentApp = env->GetStaticMethodID(at, "currentApplication", "()Landroid/app/Application;");
+    if (!currentApp) { env->DeleteLocalRef(at); return 0; }
+    jobject app = env->CallStaticObjectMethod(at, currentApp);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); app = 0; }
+    if (!app) { env->DeleteLocalRef(at); return 0; }
 
-static bool kb_show(JNIEnv *env) {
-    if (!g_kb_edit) return false;
-    jclass editc = env->FindClass("android/widget/EditText");
-    jclass viewc = env->FindClass("android/view/View");
-    jclass immc = env->FindClass("android/view/inputmethod/InputMethodManager");
-    if (!editc || !viewc || !immc) return false;
-    jmethodID request = env->GetMethodID(viewc, "requestFocus", "()Z");
-    jmethodID ctx = env->GetMethodID(viewc, "getContext", "()Landroid/content/Context;");
-    jmethodID getsvc = env->GetMethodID(env->FindClass("android/content/Context"), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-    jfieldID svcfield = env->GetStaticFieldID(env->FindClass("android/content/Context"), "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
-    if (!request || !ctx || !getsvc || !svcfield) return false;
-    env->CallBooleanMethod(g_kb_edit, request);
-    jobject context = env->CallObjectMethod(g_kb_edit, ctx);
-    jstring svcname = (jstring)env->GetStaticObjectField(env->FindClass("android/content/Context"), svcfield);
-    jobject imm = env->CallObjectMethod(context, getsvc, svcname);
-    jmethodID show = env->GetMethodID(immc, "showSoftInput", "(Landroid/view/View;I)Z");
-    jboolean ok = show && imm ? env->CallBooleanMethod(imm, show, g_kb_edit, 0) : JNI_FALSE;
-    if (imm) env->DeleteLocalRef(imm); if (context) env->DeleteLocalRef(context); if (svcname) env->DeleteLocalRef(svcname);
-    return ok == JNI_TRUE;
+    jclass appCls = env->GetObjectClass(app);
+    jmethodID getCl = appCls ? env->GetMethodID(appCls, "getClassLoader", "()Ljava/lang/ClassLoader;") : 0;
+    jobject loader = getCl ? env->CallObjectMethod(app, getCl) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); loader = 0; }
+
+    jobject result = 0;
+    if (loader) {
+        jclass clCls = env->FindClass("java/lang/ClassLoader");
+        jmethodID load = clCls ? env->GetMethodID(clCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") : 0;
+        jstring name = env->NewStringUTF("com.mojang.minecraftpe.MainActivity");
+        jobject mc = load ? env->CallObjectMethod(loader, load, name) : 0;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); mc = 0; }
+        if (mc) {
+            jclass mcCls = (jclass)mc;
+            jfieldID inst = env->GetStaticFieldID(mcCls, "mInstance", "Lcom/mojang/minecraftpe/MainActivity;");
+            if (inst) {
+                jobject obj = env->GetStaticObjectField(mcCls, inst);
+                if (obj) result = env->NewGlobalRef(obj);
+                if (obj) env->DeleteLocalRef(obj);
+            }
+            env->DeleteLocalRef(mcCls);
+        }
+        if (name) env->DeleteLocalRef(name);
+        if (clCls) env->DeleteLocalRef(clCls);
+    }
+
+    if (loader) env->DeleteLocalRef(loader);
+    if (appCls) env->DeleteLocalRef(appCls);
+    env->DeleteLocalRef(app);
+    env->DeleteLocalRef(at);
+    return result;
 }
 
 static bool kb_start(int target, char *text) {
-    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return false;
-    if (!g_kb_activity) g_kb_activity = kb_find_activity(env);
-    if (!g_kb_activity) { kb_release(env, attached); return false; }
-    jclass ec = env->FindClass("android/widget/EditText");
-    if (!ec) { kb_release(env, attached); return false; }
-    jmethodID ctor = env->GetMethodID(ec, "<init>", "(Landroid/content/Context;)V");
-    if (!ctor) { kb_release(env, attached); return false; }
-    g_kb_edit = env->NewGlobalRef(env->NewObject(ec, ctor, g_kb_activity));
-    if (!g_kb_edit) { kb_release(env, attached); return false; }
-    jmethodID setText = env->GetMethodID(ec, "setText", "(Ljava/lang/CharSequence;)V");
-    jmethodID setAlpha = env->GetMethodID(ec, "setAlpha", "(F)V");
-    jmethodID setInput = env->GetMethodID(ec, "setInputType", "(I)V");
-    jstring js = env->NewStringUTF(text ? text : "");
-    if (setText) env->CallVoidMethod(g_kb_edit, setText, js);
-    if (setAlpha) env->CallVoidMethod(g_kb_edit, setAlpha, 0.0f);
-    if (setInput) env->CallVoidMethod(g_kb_edit, setInput, 1); /* TYPE_CLASS_TEXT */
-    if (js) env->DeleteLocalRef(js);
-    /* addContentView is normally expected on the UI thread; old MCPE often renders on the
-     * main thread, so try it directly and fall back gracefully if Android rejects it. */
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return false;
+
+    /* Refresh the Activity reference on every edit start. MainActivity can be
+     * recreated after returning from the launcher/settings. */
+    if (g_kb_activity) {
+        env->DeleteGlobalRef(g_kb_activity);
+        g_kb_activity = 0;
+    }
+    g_kb_activity = kb_find_activity(env);
+    if (!g_kb_activity) {
+        nclog("keyboard: MainActivity.mInstance unavailable");
+        kb_release(env, attached);
+        return false;
+    }
+
     jclass ac = env->GetObjectClass(g_kb_activity);
-    jmethodID add = env->GetMethodID(ac, "addContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
-    jclass lpc = env->FindClass("android/view/ViewGroup$LayoutParams");
-    jmethodID lpctor = lpc ? env->GetMethodID(lpc, "<init>", "(II)V") : 0;
-    jobject lp = lpctor ? env->NewObject(lpc, lpctor, 1, 1) : 0;
-    if (!add || !lp) { kb_release(env, attached); return false; }
-    env->CallVoidMethod(g_kb_activity, add, g_kb_edit, lp);
-    if (env->ExceptionCheck()) { env->ExceptionClear(); kb_release(env, attached); return false; }
-    g_kb_target = target; g_kb_text = text; g_kb_open = kb_show(env);
+    jmethodID init = ac ? env->GetMethodID(ac, "initiateUserInput", "(I)V") : 0;
+    jmethodID show = ac ? env->GetMethodID(ac, "showKeyboard", "(Ljava/lang/String;IZZ)V") : 0;
+    if (!show) {
+        nclog("keyboard: showKeyboard method unavailable");
+        if (ac) env->DeleteLocalRef(ac);
+        kb_release(env, attached);
+        return false;
+    }
+
+    jstring js = env->NewStringUTF(text ? text : "");
+    g_kb_target = target;
+    g_kb_text = text;
+    g_kb_status = -1;
+    g_kb_open = false;
+
+    /* Initialize MCPE's native input state first.  The stock game does this
+     * before asking MainActivity to show the IME; calling showKeyboard alone
+     * leaves the proxy textbox in an uninitialized input session.  1 is the
+     * ordinary text input type used for these button labels. */
+    if (init) env->CallVoidMethod(g_kb_activity, init, 1);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        nclog("keyboard: initiateUserInput threw");
+    }
+
+    /* MainActivity.showKeyboard() is MCPE's own input bridge.  It creates and
+     * focuses TextInputProxyEditTextbox on the UI thread internally, so do not
+     * create another EditText or call InputMethodManager ourselves. */
+    env->CallVoidMethod(g_kb_activity, show, js, 1, JNI_FALSE, JNI_FALSE);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        nclog("keyboard: showKeyboard threw");
+    } else {
+        g_kb_open = true;
+        nclog("keyboard: showKeyboard requested");
+    }
+
+    if (js) env->DeleteLocalRef(js);
+    if (ac) env->DeleteLocalRef(ac);
     kb_release(env, attached);
     return g_kb_open;
 }
 
 static void kb_poll() {
-    if (!g_kb_open || !g_kb_edit || !g_kb_text) return;
-    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return;
-    jclass ec = env->FindClass("android/widget/EditText");
-    jmethodID get = ec ? env->GetMethodID(ec, "getText", "()Landroid/text/Editable;") : 0;
-    jobject ed = get ? env->CallObjectMethod(g_kb_edit, get) : 0;
-    if (ed) {
-        jclass oc = env->FindClass("java/lang/Object");
-        jmethodID ts = oc ? env->GetMethodID(oc, "toString", "()Ljava/lang/String;") : 0;
-        jstring js = ts ? (jstring)env->CallObjectMethod(ed, ts) : 0;
-        if (js) { const char *u = env->GetStringUTFChars(js, 0); if (u) { strncpy(g_kb_text, u, 16); g_kb_text[16] = 0; env->ReleaseStringUTFChars(js, u); } env->DeleteLocalRef(js); }
-        env->DeleteLocalRef(ed);
+    if (!g_kb_open || !g_kb_text || !g_kb_activity) return;
+
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return;
+
+    jclass ac = env->GetObjectClass(g_kb_activity);
+    jmethodID get = ac ? env->GetMethodID(ac, "getUserInputString", "()[Ljava/lang/String;") : 0;
+    if (get) {
+        jobjectArray arr = (jobjectArray)env->CallObjectMethod(g_kb_activity, get);
+        if (!env->ExceptionCheck() && arr) {
+            jsize n = env->GetArrayLength(arr);
+            if (n > 0) {
+                jstring js = (jstring)env->GetObjectArrayElement(arr, 0);
+                if (js) {
+                    const char *u = env->GetStringUTFChars(js, 0);
+                    if (u) {
+                        strncpy(g_kb_text, u, 16);
+                        g_kb_text[16] = 0;
+                        env->ReleaseStringUTFChars(js, u);
+                    }
+                    env->DeleteLocalRef(js);
+                }
+            }
+            env->DeleteLocalRef(arr);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
     }
+
+    /* IMPORTANT: getUserInputStatus() is not a visibility flag.  On this old
+     * build it is initialized by the native input pipeline and may be 0 before
+     * the UI-thread showKeyboard() runnable has even executed.  Using it to
+     * auto-hide here makes the keyboard disappear before Android can display it.
+     * Keep the IME open until ImGui deactivates the field and kb_stop() is called. */
+    if (ac) env->DeleteLocalRef(ac);
     kb_release(env, attached);
 }
 
 static void kb_stop() {
-    if (!g_kb_open) return;
-    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return;
-    jclass viewc = env->FindClass("android/view/View");
-    jclass immc = env->FindClass("android/view/inputmethod/InputMethodManager");
-    if (viewc && immc && g_kb_edit) {
-        jmethodID ctx = env->GetMethodID(viewc, "getContext", "()Landroid/content/Context;");
-        jobject context = ctx ? env->CallObjectMethod(g_kb_edit, ctx) : 0;
-        jclass cc = env->FindClass("android/content/Context");
-        jmethodID getsvc = cc ? env->GetMethodID(cc, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") : 0;
-        jfieldID sf = cc ? env->GetStaticFieldID(cc, "INPUT_METHOD_SERVICE", "Ljava/lang/String;") : 0;
-        jstring name = (sf && cc) ? (jstring)env->GetStaticObjectField(cc, sf) : 0;
-        jobject imm = (getsvc && context) ? env->CallObjectMethod(context, getsvc, name) : 0;
-        jmethodID hide = imm ? env->GetMethodID(immc, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z") : 0;
-        jmethodID token = viewc ? env->GetMethodID(viewc, "getWindowToken", "()Landroid/os/IBinder;") : 0;
-        jobject tok = token ? env->CallObjectMethod(g_kb_edit, token) : 0;
-        if (hide && tok) env->CallBooleanMethod(imm, hide, tok, 0);
-        if (tok) env->DeleteLocalRef(tok); if (imm) env->DeleteLocalRef(imm); if (name) env->DeleteLocalRef(name); if (context) env->DeleteLocalRef(context);
+    if (!g_kb_open || !g_kb_activity) {
+        g_kb_open = false;
+        g_kb_status = -1;
+        g_kb_target = 0;
+        g_kb_text = 0;
+        return;
     }
-    if (g_kb_edit) { env->DeleteGlobalRef(g_kb_edit); g_kb_edit = 0; }
-    g_kb_open = false; g_kb_target = 0; g_kb_text = 0;
+
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return;
+    jclass ac = env->GetObjectClass(g_kb_activity);
+    jmethodID hide = ac ? env->GetMethodID(ac, "hideKeyboard", "()V") : 0;
+    if (hide) env->CallVoidMethod(g_kb_activity, hide);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (ac) env->DeleteLocalRef(ac);
+    g_kb_open = false;
+    g_kb_target = 0;
+    g_kb_text = 0;
     kb_release(env, attached);
 }
 
@@ -355,6 +390,10 @@ static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0;
 static fn_geti  g_orig_view = 0;
 static fn_entity_render g_orig_entity_render = 0;
+static fn_entity_render g_orig_xp_render = 0;
+static fn_entity_render g_orig_crystal_render = 0;
+static fn_entity_render g_orig_crystal_effects = 0;
+static void *g_local_player = 0;
 
 /* Exact 1.1.5 Entity::bb layout: Entity + 0x104 contains
  * six floats in AABB order: minX,minY,minZ,maxX,maxY,maxZ.
@@ -372,24 +411,34 @@ static GLint g_hit_mvp = -1, g_hit_col = -1;
 static bool g_hit_gl_ready = false;
 static bool g_hit_symbols_ready = false;
 static bool g_hit_logged_symbols = false;
+static uintptr_t g_hit_dragon_vtable = 0;
+static bool g_hit_dragon_ready = false;
+static void *g_hit_seen[256];
+static int g_hit_seen_n = 0;
 
 static int snapshot_arrow_count(void *player) {
     if (!player) return -1;
     void *supplies = player_getSupplies(player);
     if (!supplies) return -1;
+
+    /* PlayerInventoryProxy is also used by Fast Totem. */
+    int size = supplies_getContainerSize(supplies, 0);
+    if (size <= 0 || size > 128) return -1;
+
     int n = supplies_getItemCount(supplies, 262, 0); /* 262 = arrow */
-    return n < 0 ? -1 : n;
+    if (n < 0 || n > 4096) return -1;
+    return n;
 }
 
-/* Inventory-screen fast totem: swap the first totem in the normal player
- * inventory into the offhand, preserving whatever was already there. */
+/* Move the first Totem of Undying in the normal player inventory into offhand.
+ * If offhand already contains a totem, this is intentionally a no-op. */
 static bool fast_totem_move() {
-    void *player = (void *)g_player;
+    void *player = (void *)g_local_player;
     if (!player) return false;
 
     const void *offhand = mob_getOffhandSlot(player);
-    if (offhand && !ii_isNull(offhand) && ii_getId(offhand) == 449) /* 449 = totem */
-        return false;
+    if (offhand && !ii_isNull(offhand) && ii_getId(offhand) == 450)
+        return false; /* 450 = totem in this 1.1.x Bedrock item table */
 
     void *supplies = player_getSupplies(player);
     if (!supplies) return false;
@@ -402,7 +451,7 @@ static bool fast_totem_move() {
     const void *source = 0;
     for (int i = 0; i < size; ++i) {
         const void *it = supplies_getItem(supplies, i, inventory_container);
-        if (it && !ii_isNull(it) && ii_getId(it) == 449) {
+        if (it && !ii_isNull(it) && ii_getId(it) == 450) {
             source_slot = i;
             source = it;
             break;
@@ -410,8 +459,6 @@ static bool fast_totem_move() {
     }
     if (source_slot < 0 || !source) return false;
 
-    /* ItemInstance is a non-trivial object, so use its real copy constructor
-     * before changing either the inventory slot or the offhand storage. */
     alignas(8) unsigned long long storage[6];
     void *totem_copy = (void *)storage;
     item_copy_ctor(totem_copy, source);
@@ -426,6 +473,21 @@ static bool fast_totem_move() {
 
     nclog("fast totem: moved source slot %d to offhand", source_slot);
     return true;
+}
+
+/* InventoryScreen::tick is not present/emitted on every 1.1.5 build.
+ * Render is a much more reliable "inventory is currently visible" signal. */
+typedef void (*fn_inv_render)(void *, int, int, float);
+static fn_inv_render g_orig_inv_render = 0;
+static void hook_inventory_render(void *self, int xm, int ym, float partial) {
+    g_inventory_render_time = now_s();
+    if (g_orig_inv_render) g_orig_inv_render(self, xm, ym, partial);
+}
+typedef void (*fn_inv_tick)(void *);
+static fn_inv_tick g_orig_inv_tick = 0;
+static void hook_inventory_tick(void *self) {
+    g_inventory_render_time = now_s();
+    if (g_orig_inv_tick) g_orig_inv_tick(self);
 }
 
 static void hook_settings_open(void *self) {
@@ -443,8 +505,6 @@ static void hook_settings_dtor(void *self) {
 typedef void (*fn_pausetick)(void *);
 static fn_pausetick g_orig_pausetick = 0;
 static fn_this g_orig_pausedtor = 0;
-static fn_pausetick g_orig_inventory_tick = 0;
-static fn_this g_orig_inventory_dtor = 0;
 static void hook_pause_tick(void *self) {
     if (g_pause_this != self) { g_pause_this = self; nclog("pause screen opened"); }
     if (g_orig_pausetick) g_orig_pausetick(self);
@@ -452,15 +512,6 @@ static void hook_pause_tick(void *self) {
 static void hook_pause_dtor(void *self) {
     if (self == g_pause_this) { g_pause_this = 0; nclog("pause screen closed"); }
     if (g_orig_pausedtor) g_orig_pausedtor(self);
-}
-
-static void hook_inventory_tick(void *self) {
-    g_inventory_this = self;
-    if (g_orig_inventory_tick) g_orig_inventory_tick(self);
-}
-static void hook_inventory_dtor(void *self) {
-    if (self == g_inventory_this) { g_inventory_this = 0; nclog("inventory screen closed"); }
-    if (g_orig_inventory_dtor) g_orig_inventory_dtor(self);
 }
 
 /* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
@@ -478,10 +529,13 @@ static void hook_apply(void *self, float dt) {
 static void hook_tick(void *self, void *player) {
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
-    g_player = player;
+    g_local_player = player;
     g_tick_time = now_s();
+    const float *pos = entity_getPos(player);
+    if (pos) {
+        g_snap.x = pos[0]; g_snap.y = pos[1]; g_snap.z = pos[2];
+    }
     if (g_cfg.speed_on) {
-        const float *pos = entity_getPos(player);
         double t = g_tick_time;
         if (pos) {
             float px = pos[0], py = pos[1], pz = pos[2];
@@ -512,12 +566,15 @@ static void hook_tick(void *self, void *player) {
     } else {
         g_snap.elytra_angle_valid = 0;
     }
-    if (g_cfg.arrow_on) g_snap.arrow_count = snapshot_arrow_count(player);
     else g_snap.arrow_count = -1;
     if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
     if (g_cfg.arrow_on) {
         const void *held = player_getSelectedItem(player);
         g_snap.holding_bow = (held && !ii_isNull(held) && ii_getId(held) == 261) ? 1 : 0;   /* 261 = bow */
+        g_snap.arrow_count = g_snap.holding_bow ? snapshot_arrow_count(player) : -1;
+    } else {
+        g_snap.holding_bow = 0;
+        g_snap.arrow_count = -1;
     }
     if (g_cfg.armor_on) {
         for (int i = 0; i < 4; i++) {
@@ -579,6 +636,11 @@ static void *hit_dlsym(const char *name) {
 
 static bool hit_resolve_symbols() {
     if (g_hit_symbols_ready) return true;
+    if (!g_hit_dragon_ready) {
+        void *vt = hit_dlsym("_ZTV11EnderDragon");
+        if (vt) g_hit_dragon_vtable = (uintptr_t)vt + sizeof(void*) * 2;
+        g_hit_dragon_ready = true;
+    }
     g_projection_slot = (void **)hit_dlsym("_ZN11MatrixStack10ProjectionE");
     g_view_slot       = (void **)hit_dlsym("_ZN11MatrixStack4ViewE");
     g_matrix_get_top  = (fn_matrix_get_top)hit_dlsym("_ZN11MatrixStack6getTopEv");
@@ -755,8 +817,121 @@ static void hit_look_line(float *v, int *n, const NcAabb6 &b, float pitch, float
              sx + dx * len, sy0 + dy * len, sz + dz * len);
 }
 
+static bool hit_is_dragon(void *entity) {
+    if (!entity || !g_hit_dragon_vtable) return false;
+    uintptr_t vt = *(const uintptr_t *)entity;
+    return vt == g_hit_dragon_vtable;
+}
+
+static bool hit_seen_entity(void *entity) {
+    for (int i = 0; i < g_hit_seen_n; ++i)
+        if (g_hit_seen[i] == entity) return true;
+    if (g_hit_seen_n < (int)(sizeof(g_hit_seen) / sizeof(g_hit_seen[0])))
+        g_hit_seen[g_hit_seen_n++] = entity;
+    return false;
+}
+
+static void hit_add_box(float *v, int *n, const NcAabb6 &b) {
+    hit_aabb_edges(v, n, b);
+}
+
+static void hit_box_center(float *v, int *n, float cx, float cy, float cz,
+                          float hx, float hy, float hz) {
+    NcAabb6 b;
+    b.minx = cx - hx; b.miny = cy - hy; b.minz = cz - hz;
+    b.maxx = cx + hx; b.maxy = cy + hy; b.maxz = cz + hz;
+    hit_aabb_edges(v, n, b);
+}
+
+/*
+ * EnderDragon is a multipart entity in the old PE renderer.  Its single Entity::bb
+ * is the coarse overall bounds; drawing that alone looks wrong because the dragon
+ * is made from a body plus head/neck/tail/wing parts.  The legacy renderer uses the
+ * classic part sizes: body 8x8, head 6x6, and 4x4 tail/wing sections.  Build stable
+ * local-space component boxes from those dimensions and the entity's current yaw.
+ * This intentionally avoids getLatencyPos(): in this binary that method returns
+ * cached movement offsets, not world-space XYZ coordinates.
+ */
+static void hit_add_dragon_boxes(float *v, int *n, void *entity,
+                                 const NcAabb6 &main_box, const float *entity_pos,
+                                 float yaw) {
+    if (!hit_is_dragon(entity) || !entity_pos) return;
+
+    const float pi = 3.14159265358979323846f;
+    const float rad = yaw * (pi / 180.0f);
+    const float sy = sinf(rad);
+    const float cy = cosf(rad);
+
+    /* Same forward convention as the blue facing line: yaw 0 -> -Z. */
+    const float fx = -sy, fz = cy;
+    const float rx = cy,  rz = sy;
+
+    const float world_w = fmaxf(main_box.maxx - main_box.minx,
+                                main_box.maxz - main_box.minz);
+    const float scale = clampf(world_w / 16.0f, 0.60f, 1.40f);
+
+    /* Entity::bb is world-space. Convert its center into this entity's local space. */
+    const float center_x = ((main_box.minx + main_box.maxx) * 0.5f) - entity_pos[0];
+    const float center_y = ((main_box.miny + main_box.maxy) * 0.5f) - entity_pos[1];
+    const float center_z = ((main_box.minz + main_box.maxz) * 0.5f) - entity_pos[2];
+
+    const float body_h = 4.0f * scale;
+    const float head_h = 3.0f * scale;
+    const float part_h = 2.0f * scale;
+
+    /* Main body. */
+    hit_box_center(v, n, center_x, center_y, center_z,
+                   4.0f * scale, body_h, 4.0f * scale);
+
+    /* Neck + head toward the dragon's facing direction. */
+    float x = center_x + fx * (2.0f * scale);
+    float z = center_z + fz * (2.0f * scale);
+    hit_box_center(v, n, x, center_y + 1.0f * scale, z,
+                   2.0f * scale, 2.0f * scale, 2.0f * scale);
+
+    x = center_x + fx * (5.5f * scale);
+    z = center_z + fz * (5.5f * scale);
+    hit_box_center(v, n, x, center_y + 1.5f * scale, z,
+                   head_h, head_h, head_h);
+
+    /* Three tail sections in the opposite direction. */
+    const float tail_off[3] = { 4.5f, 7.5f, 10.0f };
+    const float tail_half[3] = { 2.0f, 1.8f, 1.6f };
+    for (int i = 0; i < 3; ++i) {
+        x = center_x - fx * (tail_off[i] * scale);
+        z = center_z - fz * (tail_off[i] * scale);
+        hit_box_center(v, n, x, center_y, z,
+                       tail_half[i] * scale, tail_half[i] * scale,
+                       tail_half[i] * scale);
+    }
+
+    /* Two wings, one on each side of the body. */
+    const float wing_side = 5.0f * scale;
+    const float wing_forward = 0.5f * scale;
+    x = center_x + rx * wing_side + fx * wing_forward;
+    z = center_z + rz * wing_side + fz * wing_forward;
+    hit_box_center(v, n, x, center_y + 1.0f * scale, z,
+                   part_h, part_h, part_h);
+
+    x = center_x - rx * wing_side + fx * wing_forward;
+    z = center_z - rz * wing_side + fz * wing_forward;
+    hit_box_center(v, n, x, center_y + 1.0f * scale, z,
+                   part_h, part_h, part_h);
+}
+
+static void hit_draw_lines(float *verts, int n, const float *mvp) {
+    glUniformMatrix4fv(g_hit_mvp, 1, GL_FALSE, mvp);
+    glBindBuffer(GL_ARRAY_BUFFER, g_hit_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(float) * n * 3), verts, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (const void *)0);
+    glUniform4f(g_hit_col, 1.0f, 1.0f, 1.0f, 1.0f);
+    glDrawArrays(GL_LINES, 0, n - 2);
+}
+
 static void hit_draw_entity(void *entity, const float *render_pos, float partial) {
     if (!g_cfg.hitbox_on || !entity || !render_pos) return;
+    if (hit_seen_entity(entity)) return;
     if (!hit_resolve_symbols() || !hit_init_gl()) return;
 
     GLint depth_bits = 0;
@@ -767,45 +942,39 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     const NcAabb6 *aw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
     NcAabb6 b = *aw;
 
-    /* The entity renderer receives interpolated position. The AABB tracks the
-     * actual entity position, so interpolate the box by the same delta. */
-    NcVec3 cur = {0,0,0};
-    NcVec3 interp = {0,0,0};
+    /* Keep the AABB in the same local coordinate space used by the entity
+     * renderer.  Entity::bb is stored in world coordinates; subtract the
+     * entity's current origin, then apply the exact interpolated render_pos
+     * supplied to EntityRenderDispatcher::render().  This avoids the old
+     * interp/camera-offset cancellation that could produce a second, floating
+     * hitbox on moving entities. */
     const float *cp = entity_getPos(entity);
-    if (cp) { cur.x = cp[0]; cur.y = cp[1]; cur.z = cp[2]; }
-    entity_getInterpolatedPosition(&interp, entity, partial);
-    float dx = interp.x - cur.x;
-    float dy = interp.y - cur.y;
-    float dz = interp.z - cur.z;
-    b.minx += dx; b.maxx += dx;
-    b.miny += dy; b.maxy += dy;
-    b.minz += dz; b.maxz += dz;
-
-    /* Convert world AABB to the coordinate system used by the entity render
-     * call: relative to the game's render/player offset.  render_pos =
-     * interpolated world position - dispatcher offset, therefore offset is
-     * interp - render_pos. */
-    float offx = interp.x - render_pos[0];
-    float offy = interp.y - render_pos[1];
-    float offz = interp.z - render_pos[2];
-    b.minx -= offx; b.maxx -= offx;
-    b.miny -= offy; b.maxy -= offy;
-    b.minz -= offz; b.maxz -= offz;
+    if (!cp) return;
+    b.minx -= cp[0]; b.maxx -= cp[0];
+    b.miny -= cp[1]; b.maxy -= cp[1];
+    b.minz -= cp[2]; b.maxz -= cp[2];
 
     NcVec2 rot = {0,0};
     entity_getInterpolatedRotation(&rot, entity, partial);
 
-    float verts[78]; /* 26 line segments' endpoints = 52? + line => 26 vertices actually 78 floats. */
+    float verts[1800];
     int n = 0;
-    hit_aabb_edges(verts, &n, b);      /* 24 vertices */
-    hit_look_line(verts, &n, b, rot.x, rot.y); /* +2 */
-    if (n != 26) return;
+    bool dragon = hit_is_dragon(entity);
+    if (dragon) {
+        /* The dragon uses its multipart boxes instead of the coarse overall AABB. */
+        hit_add_dragon_boxes(verts, &n, entity, *(const NcAabb6 *)aw, cp, rot.y);
+    } else {
+        hit_aabb_edges(verts, &n, b);      /* 24 vertices */
+    }
+    int box_vertex_count = n;
+    hit_look_line(verts, &n, b, rot.x, rot.y);
+    if (n < box_vertex_count + 2) return;
 
     if (*g_projection_slot == 0 || *g_view_slot == 0) return;
     float proj[16], view[16], model[16], vm[16], mvp[16];
     hit_copy_matrix(*g_projection_slot, proj);
     hit_copy_matrix(*g_view_slot, view);
-    hit_translate(model, 0.0f, 0.0f, 0.0f);
+    hit_translate(model, render_pos[0], render_pos[1], render_pos[2]);
     hit_mul(vm, view, model);
     hit_mul(mvp, proj, vm);
 
@@ -867,10 +1036,11 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
 
+    int line_start = n - 2;
     glUniform4f(g_hit_col, 1.0f, 1.0f, 1.0f, 1.0f);
-    glDrawArrays(GL_LINES, 0, 24);
-    glUniform4f(g_hit_col, 1.0f, 0.10f, 0.10f, 1.0f);
-    glDrawArrays(GL_LINES, 24, 2);
+    glDrawArrays(GL_LINES, 0, line_start);
+    glUniform4f(g_hit_col, 0.15f, 0.55f, 1.0f, 1.0f);
+    glDrawArrays(GL_LINES, line_start, 2);
 
     /* Restore EVERYTHING we touched. */
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_attr_buf);
@@ -902,6 +1072,53 @@ static void hook_entity_render(void *self, void *entity, const void *pos, float 
         g_orig_entity_render(self, entity, pos, yaw, partial);
     if (g_cfg.hitbox_on && entity && pos)
         hit_draw_entity(entity, (const float *)pos, partial);
+}
+
+/* ------------------------------------------------------------------ local entity render optimizers
+ * These are deliberately render-only: they never change entity state, inventory,
+ * placement, packets, or combat input. They only avoid expensive local rendering.
+ */
+static bool opt_in_range(void *entity, float max_dist) {
+    if (!entity || !g_local_player || max_dist <= 0.0f) return true;
+    const float *p = entity_getPos(entity);
+    if (!p) return true;
+    float dx = p[0] - g_snap.x;
+    float dy = p[1] - g_snap.y;
+    float dz = p[2] - g_snap.z;
+    return (dx * dx + dy * dy + dz * dz) <= max_dist * max_dist;
+}
+
+static void hook_xp_render(void *self, void *entity, const void *pos, float yaw, float partial) {
+    if (!g_orig_xp_render) return;
+    if (g_cfg.xp_opt_on) {
+        /* Render-only optimizer: reduce the interpolation window so an orb appears
+         * to advance toward its current tick position much sooner.  This never
+         * changes the orb entity, pickup radius, XP amount, packets, or tick rate. */
+        float p = clampf(partial * g_cfg.xp_opt_speed, 0.0f, 1.0f);
+        if (opt_in_range(entity, g_cfg.xp_opt_hide_near)) {
+            /* Near the player the real game will pick the orb up independently;
+             * locally hiding it avoids the last-frame visual linger. */
+            return;
+        }
+        g_orig_xp_render(self, entity, pos, yaw, p);
+        return;
+    }
+    g_orig_xp_render(self, entity, pos, yaw, partial);
+}
+
+static void hook_crystal_render(void *self, void *entity, const void *pos, float yaw, float partial) {
+    if (!g_orig_crystal_render) return;
+    if (g_cfg.crystal_opt_on && g_cfg.crystal_opt_anim) {
+        /* Feed a fixed interpolation point so the floating crystal model doesn't
+         * interpolate its extra frame-to-frame animation. */
+        partial = 0.0f;
+    }
+    g_orig_crystal_render(self, entity, pos, yaw, partial);
+}
+
+static void hook_crystal_effects(void *self, void *entity, const void *pos, float yaw, float partial) {
+    if (g_cfg.crystal_opt_on && g_cfg.crystal_opt_effects) return;
+    if (g_orig_crystal_effects) g_orig_crystal_effects(self, entity, pos, yaw, partial);
 }
 
 /* FPS optimizer: change what the game's option getters answer */
@@ -1040,7 +1257,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_COORDS, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
 
 static float fpx(float size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, float size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -1189,18 +1406,47 @@ static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
 }
 
 
+/* ---- Coordinates HUD ---- */
+static ImVec2 size_coords() {
+    int dec = g_cfg.coords_precision - 1;
+    char b[96];
+    snprintf(b, sizeof b, "%.*f %.*f %.*f", dec, g_snap.x, dec, g_snap.y, dec, g_snap.z);
+    float s = g_cfg.coords_size, pad = 2.0f * s;
+    ImVec2 t = txt(b, s);
+    return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
+}
+static void draw_coords(ImDrawList *dl, ImVec2 p) {
+    int dec = g_cfg.coords_precision - 1;
+    char b[96];
+    snprintf(b, sizeof b, "%.*f %.*f %.*f", dec, g_snap.x, dec, g_snap.y, dec, g_snap.z);
+    float s = g_cfg.coords_size, pad = 2.0f * s;
+    ImVec2 sz = size_coords();
+    if (g_cfg.coords_bg) box_col(dl, p, sz, g_cfg.coords_bg_alpha, s, g_cfg.coords_bg_col);
+    put_text_sh(dl, V(p.x + pad, p.y + pad), s, packed(g_cfg.coords_col, g_cfg.coords_alpha), b, !g_cfg.coords_bg);
+}
+
 /* ---- Elytra angle: actual Entity rotation X (pitch) from the 1.1.5 game object ---- */
 static ImVec2 size_elytra_angle() {
     float s = g_cfg.elytra_angle_size; float pad = 2.0f * s;
-    ImVec2 t = txt("Angle: -90.0 deg", s);
-    return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
+    ImVec2 t = txt("-90", s);
+    return V(t.x + 2.0f * pad + s * 1.1f, t.y + 2.0f * pad);
 }
 static void draw_elytra_angle(ImDrawList *dl, ImVec2 p) {
     float s = g_cfg.elytra_angle_size; float a = g_cfg.elytra_angle_alpha, pad = 2.0f * s;
     ImVec2 sz = size_elytra_angle();
     if (g_cfg.elytra_angle_bg) box_col(dl, p, sz, g_cfg.elytra_angle_bg_alpha, s, g_cfg.elytra_angle_bg_col);
-    char b[32]; snprintf(b, sizeof b, "Angle: %.1f deg", g_snap.elytra_angle);
-    put_text_sh(dl, V(p.x + pad, p.y + pad), s, packed(g_cfg.elytra_angle_col, a), b, !g_cfg.elytra_angle_bg);
+
+    char b[32]; snprintf(b, sizeof b, "%.0f", g_snap.elytra_angle);
+    ImVec2 tp = V(p.x + pad, p.y + pad);
+    put_text_sh(dl, tp, s, packed(g_cfg.elytra_angle_col, a), b, !g_cfg.elytra_angle_bg);
+
+    /* nc_font is ASCII-only, so drawing UTF-8 '°' would become '?'.  Draw the
+     * degree mark as a tiny circle instead; visually it is the same glyph and
+     * works on every device/font shipped with Night Client 1.1.5. */
+    ImVec2 tw = txt(b, s);
+    float r = fpx(s) * 0.11f;
+    ImVec2 c = V(tp.x + tw.x + r * 1.45f, tp.y + r * 0.95f);
+    dl->AddCircle(c, r, packed(g_cfg.elytra_angle_col, a), 12, fmaxf(1.0f, s * 0.22f));
 }
 
 /* ---- Speed HUD: horizontal blocks per real second ---- */
@@ -1275,17 +1521,17 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 /* ---- per-element accessors used by "Move on screen" ---- */
 static int *elem_on(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
-                 case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
+                 case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_COORDS: return &g_cfg.coords_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
                  case E_DROP: return &g_cfg.drop_on; default: return 0; }
 }
 static float *elem_x(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
-                 case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
+                 case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_COORDS: return &g_cfg.coords_x; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
                  case E_DROP: return &g_cfg.drop_x; default: return &g_cfg.n_x; }
 }
 static float *elem_y(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
-                 case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
+                 case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_COORDS: return &g_cfg.coords_y; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
                  case E_DROP: return &g_cfg.drop_y; default: return &g_cfg.n_y; }
 }
 static ImVec2 elem_size(int e) {
@@ -1295,6 +1541,7 @@ static ImVec2 elem_size(int e) {
         case E_ELYTRA: return size_elytra();
         case E_ARROW: return size_arrow();
         case E_SPEED: return size_speed();
+        case E_COORDS: return size_coords();
         case E_ELYTRA_ANGLE: return size_elytra_angle();
         case E_DROP:  return btn_size(g_cfg.drop_text,  g_cfg.drop_btn);
         case E_ZOOM:  return btn_size(g_cfg.zoom_text,  g_cfg.zoom_btn);
@@ -1316,7 +1563,7 @@ static void build_edit(float w, float h) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
-    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "elytra_angle", "zoom", "persp", "drop", "n" };
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "coords", "elytra_angle", "zoom", "persp", "drop", "n" };
 
     for (int e = 0; e < E_COUNT; e++) {
         int *on = elem_on(e);
@@ -1455,6 +1702,27 @@ static void panel_speed() {
     hud_look(&g_cfg.speed_size, &g_cfg.speed_alpha, &g_cfg.speed_bg_alpha);
     hud_pos(&g_cfg.speed_x, &g_cfg.speed_y);
 }
+static void panel_xp_optimizer() {
+    head("XP optimizer", &g_cfg.xp_opt_on, "Local-only XP orb visual optimization. It does not change XP pickup or gameplay.");
+    sl_f("Visual speed", &g_cfg.xp_opt_speed, 1.0f, 8.0f);
+    sl_f("Hide radius", &g_cfg.xp_opt_hide_near, 0.25f, 4.0f);
+    ImGui::TextDisabled("Makes XP orbs visually advance sooner and removes the last-frame linger near you.");
+}
+static void panel_crystal_optimizer() {
+    head("Crystal optimizer", &g_cfg.crystal_opt_on, "Local-only End Crystal visual optimization. It does not place, aim, or attack.");
+    chk("Disable crystal animation", &g_cfg.crystal_opt_anim);
+    chk("Disable crystal beam/effects", &g_cfg.crystal_opt_effects);
+    ImGui::TextDisabled("Only the local crystal renderer/effects are changed.");
+}
+static void panel_coords() {
+    head("Coordinates", &g_cfg.coords_on, "Shows your XYZ position in the HUD.");
+    chk("Dark background", &g_cfg.coords_bg);
+    color_picker("Text color", &g_cfg.coords_col);
+    color_picker("Background color", &g_cfg.coords_bg_col);
+    hud_look(&g_cfg.coords_size, &g_cfg.coords_alpha, &g_cfg.coords_bg_alpha);
+    sl_i("Precision", &g_cfg.coords_precision, 1, 4);
+    hud_pos(&g_cfg.coords_x, &g_cfg.coords_y);
+}
 static void panel_elytra_angle() {
     head("Elytra angle", &g_cfg.elytra_angle_on, "Shows your actual flight pitch while gliding.");
     chk("Dark background", &g_cfg.elytra_angle_bg);
@@ -1521,14 +1789,13 @@ static void panel_drop() {
 }
 static void panel_fast_totem() {
     head("Fast Totem", &g_cfg.fast_totem_on,
-         "Shows only in the inventory. Tap it to move the first totem in your inventory into the offhand.");
+         "Shows only in the inventory. Tap it to move a totem into your offhand.");
     color_picker("Text color", &g_cfg.fast_totem_col);
     color_picker("Background color", &g_cfg.fast_totem_bg_col);
     sl_f("Button size", &g_cfg.fast_totem_btn, 0.5f, 12.0f);
     sl_f("Background opacity", &g_cfg.fast_totem_alpha, 0.0f, 1.0f);
     sl_f("Text opacity", &g_cfg.fast_totem_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.fast_totem_x, &g_cfg.fast_totem_y);
-    ImGui::TextDisabled("If a totem is already in the offhand, the button does nothing.");
 }
 static void panel_client() {
     head("Client", 0, "Menu and N button.");
@@ -1558,9 +1825,12 @@ static const Mod g_mods[] = {
     { "Elytra indicator",   &g_cfg.elytra_on,  panel_elytra },
     { "Arrow HUD",          &g_cfg.arrow_on,   panel_arrow },
     { "Speed indicator",    &g_cfg.speed_on,   panel_speed },
+    { "Coordinates",        &g_cfg.coords_on,  panel_coords },
+    { "XP optimizer",        &g_cfg.xp_opt_on, panel_xp_optimizer },
+    { "Crystal optimizer",   &g_cfg.crystal_opt_on, panel_crystal_optimizer },
     { "Elytra angle",       &g_cfg.elytra_angle_on, panel_elytra_angle },
     { "Quick drop",         &g_cfg.drop_on,    panel_drop },
-    { "Fast Totem",          &g_cfg.fast_totem_on, panel_fast_totem },
+    { "Fast Totem",         &g_cfg.fast_totem_on, panel_fast_totem },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
     { "Perspective button", &g_cfg.persp_on,   panel_persp },
@@ -1651,16 +1921,17 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
     bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.holding_bow && !g_menu_open && !g_edit;
     bool speed_vis  = g_cfg.speed_on && in_world && !g_menu_open && !g_edit;
+    bool coords_vis = g_cfg.coords_on && in_world && !g_menu_open && !g_edit;
     bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && g_snap.elytra_angle_valid && !g_menu_open && !g_edit;
     bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;         /* the world itself */
     bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
     bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
     bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
-    bool inventory_open = (g_inventory_this != 0);
+    bool inventory_open = (now - g_inventory_render_time) < 0.30;
     bool fast_totem_vis = g_cfg.fast_totem_on && inventory_open && !g_menu_open && !g_edit;
     if (!zoom_vis) g_zoom_active = 0;
 
-    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || menu_reach || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -1730,6 +2001,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         if (elytra_vis) draw_elytra(fg, place(g_cfg.elytra_x, g_cfg.elytra_y, size_elytra()));
         if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), g_snap.arrow_count);
         if (speed_vis)  draw_speed(fg, place(g_cfg.speed_x, g_cfg.speed_y, size_speed()), g_snap.speed_bps);
+        if (coords_vis) draw_coords(fg, place(g_cfg.coords_x, g_cfg.coords_y, size_coords()));
         if (elytra_angle_vis) draw_elytra_angle(fg, place(g_cfg.elytra_angle_x, g_cfg.elytra_angle_y, size_elytra_angle()));
 
         if (zoom_vis) {
@@ -1751,11 +2023,12 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
                 { if (g_cic && g_ci) cic_drop(g_cic, g_ci); else nclog("drop: game objects not captured yet"); }
         }
         if (fast_totem_vis) {
-            int level = (int)floorf(g_cfg.fast_totem_btn + 0.5f);
-            if (level < 1) level = 1;
-            if (level > 12) level = 12;
+            float level = g_cfg.fast_totem_btn;
+            if (level < 1.0f) level = 1.0f;
+            if (level > 12.0f) level = 12.0f;
             ImVec2 sz = btn_size("TOTEM", level);
-            if (button_at("##night_fast_totem", place(g_cfg.fast_totem_x, g_cfg.fast_totem_y, sz), sz,
+            if (button_at("##night_fast_totem",
+                          place(g_cfg.fast_totem_x, g_cfg.fast_totem_y, sz), sz,
                           "TOTEM", g_cfg.fast_totem_alpha, g_cfg.fast_totem_text_alpha,
                           false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col, &hud[3]))
                 fast_totem_move();
@@ -1798,6 +2071,7 @@ typedef EGLBoolean (*swap_fn)(EGLDisplay, EGLSurface);
 static swap_fn g_orig_swap = 0;
 static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     nc_frame(d, s);
+    g_hit_seen_n = 0;
     return g_orig_swap(d, s);
 }
 
@@ -1846,8 +2120,8 @@ static void nc_init(void) {
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
-    reg("inventory tick", "_ZN15InventoryScreen4tickEv", (void *)hook_inventory_tick, (void **)&g_orig_inventory_tick);
-    reg("inventory close", "_ZN15InventoryScreenD1Ev", (void *)hook_inventory_dtor, (void **)&g_orig_inventory_dtor);
+    reg("inventory render", "_ZN15InventoryScreen6renderEiif", (void *)hook_inventory_render, (void **)&g_orig_inv_render);
+    reg("inventory tick fallback", "_ZN15InventoryScreen4tickEv", (void *)hook_inventory_tick, (void **)&g_orig_inv_tick);
 
     /* per mod: can be switched off in config.txt (hook_x=0) if one of them ever crashes the game */
     if (g_cfg.hook_hurt)  reg("no hurt cam", "_ZN19LevelRendererPlayer7bobHurtER6Matrixf", (void *)hook_bobhurt, (void **)&g_orig_bob);
@@ -1855,6 +2129,13 @@ static void nc_init(void) {
     if (g_cfg.hook_persp) reg("perspective",
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
+    if (g_cfg.hook_xp) {
+        reg("XP orb render optimizer", "_ZN21ExperienceOrbRenderer6renderER6EntityRK4Vec3ff", (void *)hook_xp_render, (void **)&g_orig_xp_render);
+    }
+    if (g_cfg.hook_crystal) {
+        reg("End Crystal render optimizer", "_ZN20EnderCrystalRenderer6renderER6EntityRK4Vec3ff", (void *)hook_crystal_render, (void **)&g_orig_crystal_render);
+        reg("End Crystal effects optimizer", "_ZN20EnderCrystalRenderer13renderEffectsER6EntityRK4Vec3ff", (void *)hook_crystal_effects, (void **)&g_orig_crystal_effects);
+    }
     if (g_cfg.hook_hitbox) {
         reg("entity render hitboxes", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff", (void *)hook_entity_render, (void **)&g_orig_entity_render);
     }
