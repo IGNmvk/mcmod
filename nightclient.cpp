@@ -426,6 +426,8 @@ static void ctrl_reset_states() {
 #define NC_MI_RAW_Y   0x5c
 #define NC_MI_JUMP    0x43
 #define NC_MI_SNEAK   0x4e
+#define NC_MI_ASCEND  0x44   /* button.ascend  - fly up in Creative */
+#define NC_MI_DESCEND 0x4f   /* button.descend - fly down in Creative */
 #define NC_JOY_INVERT_X 1   /* set to 1 if left/right feel swapped */
 #define NC_JOY_INVERT_Y 0   /* set to 1 if forward/back feel swapped */
 
@@ -457,13 +459,23 @@ static void ctrl_prepare_input(void *h) {
 #endif
     *mi_f(h, NC_MI_RAW_X) = sx;
     *mi_f(h, NC_MI_RAW_Y) = sy;
-    *mi_b(h, NC_MI_SNEAK) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
+    /* While flying, Sneak drives fly-down instead of crouch; Jump (below) drives
+     * fly-up instead of jumping. On the ground they work as before. */
+    if (g_ctrl_flying) {
+        *mi_b(h, NC_MI_DESCEND) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
+        *mi_b(h, NC_MI_SNEAK)   = 0;
+    } else {
+        *mi_b(h, NC_MI_SNEAK)   = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
+        *mi_b(h, NC_MI_DESCEND) = 0;
+    }
 }
 
 /* After tick: the player consumes the jumping flag later in its own update. */
 static void ctrl_finish_input(void *h) {
     if (!h || !ctrl_input_live()) return;
-    if (g_ctrl_pressed[NC_CTRL_JUMP]) *mi_b(h, NC_MI_JUMP) = 1;
+    if (!g_ctrl_pressed[NC_CTRL_JUMP]) return;
+    if (g_ctrl_flying) *mi_b(h, NC_MI_ASCEND) = 1;
+    else                *mi_b(h, NC_MI_JUMP)   = 1;
 }
 
 static bool ctrl_point_in(const NcRect &r, float x, float y) {
