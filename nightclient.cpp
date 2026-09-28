@@ -60,16 +60,6 @@ extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12get
  * x/y are GUI units (screen pixels / gui scale). Because the game draws the item,
  * texture packs, custom models and enchant glint all apply. */
 extern "C" void *g_ItemRendererInstance __asm__("_ZN12ItemRenderer8instanceE");
-
-/* TouchControlSet::render draws every vanilla on-screen button (joystick,
- * jump, attack, hotbar taps, everything). In new-controls mode we skip it
- * outright and draw only our own controls instead. */
-typedef void (*fn_touch_render)(void *, void *);
-static fn_touch_render g_orig_touch_render = 0;
-static void hook_touch_render(void *self, void *ctx) {
-    if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
-    if (g_orig_touch_render) g_orig_touch_render(self, ctx);
-}
 extern "C" void ir_renderGuiItemNew(void *self, const void *item, int aux, float x, float y,
                                     float scale, float alpha, float extra, bool glint)
     __asm__("_ZN12ItemRenderer16renderGuiItemNewERK12ItemInstanceifffffb");
@@ -1656,6 +1646,16 @@ static bool nc_gameplay_input_active() {
     const bool chat = (g_chat_this != 0);
     const bool inventory = (now - g_inventory_render_time) < 0.35;
     return play && !pause && !chat && !settings && !inventory && !g_menu_open && !g_edit;
+}
+
+/* TouchControlSet::render draws every vanilla on-screen button (joystick,
+ * jump, attack, hotbar taps, everything). In new-controls mode we skip it
+ * outright and draw only our own controls instead. */
+typedef void (*fn_touch_render)(void *, void *);
+static fn_touch_render g_orig_touch_render = 0;
+static void hook_touch_render(void *self, void *ctx) {
+    if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
+    if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
 
 static void ctrl_apply_player_actions() {
