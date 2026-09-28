@@ -56,12 +56,12 @@ extern "C" int  ii_getId(const void *it)        __asm__("_ZNK12ItemInstance5getI
 extern "C" int  ii_getDamage(const void *it)    __asm__("_ZNK12ItemInstance14getDamageValueEv");
 extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12getMaxDamageEv");
 /* ---- the game's own item renderer (same call the Toolbox armor HUD makes) ----
- * renderGuiItemNew(this, item, aux, x, y, alpha, scale, extra, glint):
+ * renderGuiItemNew(this, item, aux, x, y, scale, alpha, extra, glint):
  * x/y are GUI units (screen pixels / gui scale). Because the game draws the item,
  * texture packs, custom models and enchant glint all apply. */
 extern "C" void *g_ItemRendererInstance __asm__("_ZN12ItemRenderer8instanceE");
 extern "C" void ir_renderGuiItemNew(void *self, const void *item, int aux, float x, float y,
-                                    float alpha, float scale, float extra, bool glint)
+                                    float scale, float alpha, float extra, bool glint)
     __asm__("_ZN12ItemRenderer16renderGuiItemNewERK12ItemInstanceifffffb");
 extern "C" bool ii_isEnchanted(const void *it) __asm__("_ZNK12ItemInstance11isEnchantedEv");
 extern "C" void *ci_getGuiData(void *ci)       __asm__("_ZN14ClientInstance10getGuiDataEv");
@@ -752,6 +752,7 @@ static ArmorItemDraw g_armor_draw[6];
 static volatile int  g_armor_draw_n = 0;
 static volatile int  g_armor_draw_stamp = -1000;   /* g_frames when draw_armor last recorded */
 static volatile int  g_item_hook_frame = -1000;    /* g_frames when the hook last ran */
+static volatile int  g_item_hook_ever = 0;         /* the hook has run at least once this session */
 static int           g_item_hook_last = -1;
 static int           g_item_log = 0;
 #define NC_ITEM_EXTRA 0.7f    /* 5th float Toolbox passes; leave as is */
@@ -770,6 +771,7 @@ static void armor_draw_items(void *ci) {
     if (g_item_hook_last == g_frames) return;            /* once per frame */
     g_item_hook_last = g_frames;
     g_item_hook_frame = g_frames;
+    g_item_hook_ever = 1;
     if (g_frames - g_armor_draw_stamp > 2) return;       /* HUD not showing armor right now */
     void *player = g_local_player;
     void *inst = g_ItemRendererInstance;
@@ -784,7 +786,7 @@ static void armor_draw_items(void *ci) {
         if (!it || ii_isNull(it)) continue;
         float scale = d.size_px / (16.0f * gs);
         if (g_item_log < 6) { g_item_log++; nclog("armor item slot=%d x=%.1f y=%.1f gs=%.2f scale=%.2f", d.slot, d.x_px / gs, d.y_px / gs, gs, scale); }
-        ir_renderGuiItemNew(inst, it, 0, d.x_px / gs, d.y_px / gs, d.alpha, scale, NC_ITEM_EXTRA, ii_isEnchanted(it));
+        ir_renderGuiItemNew(inst, it, 0, d.x_px / gs, d.y_px / gs, scale, d.alpha, NC_ITEM_EXTRA, ii_isEnchanted(it));
     }
 }
 static void hook_hud_vignette(void *self, void *ci, void *ctl, int a, void *area) {
@@ -2039,7 +2041,12 @@ static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
     float s = g_cfg.armor_size; float a = g_cfg.armor_alpha, pad = 2.0f * s, gap = 2.0f * s, icon = 16.0f * icon_k(s);
     /* Real HUD: the game draws the item icons itself (texture packs apply).
      * If its HUD hook hasn't run recently, fall back to the embedded icons. */
-    const bool game_icons = !preview && (g_frames - g_item_hook_frame) < 30;
+    /* Once the game hook has fired it stays in charge, so the old embedded icons
+     * never flash in between. Only if it never fires (after ~4 s of showing the
+     * HUD) do we fall back to them. */
+    static int wait_frames = 0;
+    if (!preview && !g_item_hook_ever && wait_frames < 100000) wait_frames++;
+    const bool game_icons = !preview && (g_item_hook_ever || wait_frames < 240);
     int rec_n = 0;
     if (g_cfg.armor_bg) {
         if (!game_icons) {
