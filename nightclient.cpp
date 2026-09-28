@@ -60,6 +60,16 @@ extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12get
  * x/y are GUI units (screen pixels / gui scale). Because the game draws the item,
  * texture packs, custom models and enchant glint all apply. */
 extern "C" void *g_ItemRendererInstance __asm__("_ZN12ItemRenderer8instanceE");
+
+/* TouchControlSet::render draws every vanilla on-screen button (joystick,
+ * jump, attack, hotbar taps, everything). In new-controls mode we skip it
+ * outright and draw only our own controls instead. */
+typedef void (*fn_touch_render)(void *, void *);
+static fn_touch_render g_orig_touch_render = 0;
+static void hook_touch_render(void *self, void *ctx) {
+    if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
+    if (g_orig_touch_render) g_orig_touch_render(self, ctx);
+}
 extern "C" void ir_renderGuiItemNew(void *self, const void *item, int aux, float x, float y,
                                     float scale, float alpha, float extra, bool glint)
     __asm__("_ZN12ItemRenderer16renderGuiItemNewERK12ItemInstanceifffffb");
@@ -426,8 +436,6 @@ static void ctrl_reset_states() {
 #define NC_MI_RAW_Y   0x5c
 #define NC_MI_JUMP    0x43
 #define NC_MI_SNEAK   0x4e
-#define NC_MI_ASCEND  0x44   /* button.ascend  - fly up in Creative */
-#define NC_MI_DESCEND 0x4f   /* button.descend - fly down in Creative */
 #define NC_JOY_INVERT_X 1   /* set to 1 if left/right feel swapped */
 #define NC_JOY_INVERT_Y 0   /* set to 1 if forward/back feel swapped */
 
@@ -459,23 +467,17 @@ static void ctrl_prepare_input(void *h) {
 #endif
     *mi_f(h, NC_MI_RAW_X) = sx;
     *mi_f(h, NC_MI_RAW_Y) = sy;
-    /* While flying, Sneak drives fly-down instead of crouch; Jump (below) drives
-     * fly-up instead of jumping. On the ground they work as before. */
-    if (g_ctrl_flying) {
-        *mi_b(h, NC_MI_DESCEND) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
-        *mi_b(h, NC_MI_SNEAK)   = 0;
-    } else {
-        *mi_b(h, NC_MI_SNEAK)   = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
-        *mi_b(h, NC_MI_DESCEND) = 0;
-    }
+    /* The game itself treats held Sneak as fly-down while flying (AiStep level),
+     * so we just keep sending the plain Sneak flag either way. */
+    *mi_b(h, NC_MI_SNEAK) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
 }
 
 /* After tick: the player consumes the jumping flag later in its own update. */
 static void ctrl_finish_input(void *h) {
     if (!h || !ctrl_input_live()) return;
-    if (!g_ctrl_pressed[NC_CTRL_JUMP]) return;
-    if (g_ctrl_flying) *mi_b(h, NC_MI_ASCEND) = 1;
-    else                *mi_b(h, NC_MI_JUMP)   = 1;
+    /* Same as Sneak: the game treats held Jump as fly-up while flying, using
+     * this same flag - no separate ascend field needed. */
+    if (g_ctrl_pressed[NC_CTRL_JUMP]) *mi_b(h, NC_MI_JUMP) = 1;
 }
 
 static bool ctrl_point_in(const NcRect &r, float x, float y) {
@@ -3072,6 +3074,7 @@ static void nc_init(void) {
     reg("settings open", "_ZN24SettingsScreenController6onOpenEv", (void *)hook_settings_open, (void **)&g_orig_onOpen);
     reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
+    reg("hide vanilla controls", "_ZNK14TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("armor items (vignette)", "_ZN19HudVignetteRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea", (void *)hook_hud_vignette, (void **)&g_orig_hud_vig);
     reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
