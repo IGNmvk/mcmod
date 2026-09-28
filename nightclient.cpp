@@ -48,6 +48,7 @@ extern "C" bool mob_isSneaking(void *self)      __asm__("_ZNK3Mob10isSneakingEv"
 extern "C" bool mob_isSprinting(void *self)     __asm__("_ZNK3Mob11isSprintingEv");
 extern "C" bool mob_isGliding(void *self)       __asm__("_ZNK3Mob9isGlidingEv");
 extern "C" bool player_isUsingItem(void *self)  __asm__("_ZNK6Player11isUsingItemEv");
+extern "C" bool lp_isFlying(void *self)      __asm__("_ZNK11LocalPlayer8isFlyingEv");
 extern "C" void lp_setSprinting(void *self, bool on) __asm__("_ZN11LocalPlayer12setSprintingEb");
 extern "C" const void *mob_getArmor(void *self, int slot) __asm__("_ZNK3Mob8getArmorE9ArmorSlot");
 extern "C" bool ii_isNull(const void *it)       __asm__("_ZNK12ItemInstance6isNullEv");
@@ -378,6 +379,8 @@ enum {
 };
 
 static volatile int g_ctrl_pressed[NC_CTRL_COUNT] = {0};
+static volatile int g_ctrl_flying = 0;      /* local player is flying (Creative): jump/sneak become fly up/down */
+static int g_ctrl_internal = 0;             /* >0 while WE call the game's attack/interact callbacks */
 static volatile int g_ctrl_touch_id = -1;
 static volatile int g_ctrl_joy_id = -1;
 static volatile int g_ctrl_ids[NC_CTRL_COUNT] = {-1,-1,-1,-1,-1,-1,-1};
@@ -412,7 +415,7 @@ static void ctrl_reset_states() {
 #define NC_MI_RAW_Y   0x5c
 #define NC_MI_JUMP    0x43
 #define NC_MI_SNEAK   0x4e
-#define NC_JOY_INVERT_X 0   /* set to 1 if left/right feel swapped */
+#define NC_JOY_INVERT_X 1   /* set to 1 if left/right feel swapped */
 #define NC_JOY_INVERT_Y 0   /* set to 1 if forward/back feel swapped */
 
 static inline float *mi_f(void *h, int off) { return (float *)((char *)h + off); }
@@ -729,6 +732,22 @@ static void hook_chat_dtor(void *self) {
     if (g_orig_chat_dtor) g_orig_chat_dtor(self);
 }
 
+/* ---- New-controls mode: plain screen taps must not attack/place/interact ----
+ * Touches on the world still reach the game (camera drag, hotbar), but the
+ * game's "build action" callbacks are ignored unless WE issued them from the
+ * Attack / Interact buttons (g_ctrl_internal). The first few blocked calls are
+ * logged so it is visible in log.txt whether the tap path was hit. */
+typedef void (*fn_build_action)(void *, void *, void *);
+static fn_build_action g_orig_build_action = 0;
+static int g_tap_block_logged = 0;
+static void hook_build_action(void *self, void *ci, void *intention) {
+    if (g_cfg.controls_mode == 1 && g_ctrl_internal == 0 && nc_gameplay_input_active()) {
+        if (g_tap_block_logged < 8) { g_tap_block_logged++; nclog("tap blocked (handleBuildAction)"); }
+        return;
+    }
+    if (g_orig_build_action) g_orig_build_action(self, ci, intention);
+}
+
 /* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
 static void hook_apply(void *self, float dt) {
     g_play_time = now_s();
@@ -785,6 +804,7 @@ static void hook_tick(void *self, void *player) {
     ctrl_finish_input(self);
     if (!player) return;
     g_local_player = player;
+    g_ctrl_flying = lp_isFlying(player) ? 1 : 0;
     g_tick_time = now_s();
     const float *pos = entity_getPos(player);
     if (pos) {
@@ -1479,7 +1499,14 @@ static ImVec2 ctrl_place(int i, float w, float h) {
 
 static void ctrl_draw_icon(ImDrawList *dl, int i, ImVec2 p, bool pressed) {
     const int tex_idx = pressed ? 1 : 0;
-    GLuint tex = g_ctrl_tex[i][tex_idx];
+    /* While flying (Creative) the Jump/Sneak buttons show the fly up/down art;
+     * they still drive the game's jump/sneak input, which is what flies. */
+    int slot = i;
+    if (g_ctrl_flying && !g_edit) {
+        if (i == NC_CTRL_JUMP) slot = NC_CTRL_UP;
+        else if (i == NC_CTRL_SNEAK) slot = NC_CTRL_DOWN;
+    }
+    GLuint tex = g_ctrl_tex[slot][tex_idx];
     ImVec2 sz = ctrl_size_px(i);
     float a = clampf(*ctrl_alpha(i), 0.05f, 1.0f);
     if (tex) {
@@ -1525,11 +1552,15 @@ static void ctrl_draw_joystick(ImDrawList *dl, ImVec2 p, bool editor_preview=fal
     }
 }
 
+/* Fly up / fly down have no buttons of their own: Jump and Sneak swap art and
+ * act as fly up/down while flying. Their slots stay only as texture storage. */
+static bool ctrl_slot_shown(int i) { return i != NC_CTRL_UP && i != NC_CTRL_DOWN; }
+
 static void ctrl_build_rects(float w, float h) {
     for (int i=0;i<NC_CTRL_COUNT;i++) {
         ImVec2 p = ctrl_place(i,w,h);
         ImVec2 s = ctrl_size_px(i);
-        g_ctrl_rects[i].visible = 1;
+        g_ctrl_rects[i].visible = ctrl_slot_shown(i) ? 1 : 0;
         g_ctrl_rects[i].x = p.x; g_ctrl_rects[i].y = p.y; g_ctrl_rects[i].w = s.x; g_ctrl_rects[i].h = s.y;
     }
 }
@@ -1577,10 +1608,12 @@ static void ctrl_apply_player_actions() {
     const int cur_attack = g_ctrl_pressed[NC_CTRL_ATTACK] ? 1 : 0;
     const int cur_interact = g_ctrl_pressed[NC_CTRL_INTERACT] ? 1 : 0;
     if (g_cic && g_ci) {
+        g_ctrl_internal++;            /* let our own calls through the tap blocker */
         if (cur_attack && !prev_attack && attack_press) attack_press(g_cic, g_ci);
         if (!cur_attack && prev_attack && attack_release) attack_release(g_cic, g_ci);
         if (cur_interact && !prev_interact && interact_press) interact_press(g_cic, g_ci);
         if (!cur_interact && prev_interact && interact_release) interact_release(g_cic, g_ci);
+        g_ctrl_internal--;
     }
     prev_attack = cur_attack;
     prev_interact = cur_interact;
@@ -1632,8 +1665,37 @@ static void push_ev(void *, int type, float x, float y) {
     if (g_qn < 256) { g_q[g_qn].type = type; g_q[g_qn].x = x; g_q[g_qn].y = y; g_qn++; }
 }
 
+/* ---- Multitouch: the game only ever sees the fingers that are NOT on our controls ----
+ * A finger that lands on the joystick / a button is owned by us. Instead of
+ * swallowing whole events (which froze the camera finger while the joystick
+ * moved), we hand the game a filtered view of each MotionEvent: owned pointers
+ * are removed and the action/index are remapped, by hooking the AMotionEvent_*
+ * functions the game imports. Our own code keeps reading the real event. */
+static AInputEvent *volatile g_filt_ev = 0;
+static int     g_filt_n = 0;
+static int     g_filt_map[NC_MAX_PTR];
+static int32_t g_filt_action = 0;
+
+static int32_t hk_m_getAction(const AInputEvent *e) { return e == g_filt_ev ? g_filt_action : AMotionEvent_getAction(e); }
+static size_t  hk_m_getPointerCount(const AInputEvent *e) { return e == g_filt_ev ? (size_t)g_filt_n : AMotionEvent_getPointerCount(e); }
+#define NC_FILT(e, i) ((e) == g_filt_ev && (int)(i) < g_filt_n ? (size_t)g_filt_map[i] : (i))
+static int32_t hk_m_getPointerId(const AInputEvent *e, size_t i) { return AMotionEvent_getPointerId(e, NC_FILT(e, i)); }
+static float   hk_m_getX(const AInputEvent *e, size_t i)    { return AMotionEvent_getX(e, NC_FILT(e, i)); }
+static float   hk_m_getY(const AInputEvent *e, size_t i)    { return AMotionEvent_getY(e, NC_FILT(e, i)); }
+static float   hk_m_getRawX(const AInputEvent *e, size_t i) { return AMotionEvent_getRawX(e, NC_FILT(e, i)); }
+static float   hk_m_getRawY(const AInputEvent *e, size_t i) { return AMotionEvent_getRawY(e, NC_FILT(e, i)); }
+static float   hk_m_getAxisValue(const AInputEvent *e, int32_t axis, size_t i) { return AMotionEvent_getAxisValue(e, axis, NC_FILT(e, i)); }
+
+static bool ctrl_owns_pointer(int id) {
+    if (id < 0) return false;
+    if (g_ctrl_joy_id == id) return true;
+    for (int k = 0; k < NC_CTRL_COUNT; ++k) if (g_ctrl_ids[k] == id) return true;
+    return false;
+}
+
 static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
     for (;;) {
+        g_filt_ev = 0;                                   /* previous event is finished */
         int32_t r = g_orig_getEvent(q, out);
         if (r < 0 || !out || !*out) return r;
         AInputEvent *ev = *out;
@@ -1650,40 +1712,64 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                 m.x[i] = AMotionEvent_getX(ev, (size_t)i);
                 m.y[i] = AMotionEvent_getY(ev, (size_t)i);
             }
+
+            NcMotion mv = m;                             /* what the game / mod buttons get to see */
             if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
-                bool claimed = false;
-                int idx = (m.idx >= 0 && m.idx < m.count) ? m.idx : 0;
-                int evt = (m.action == AMOTION_EVENT_ACTION_DOWN || m.action == AMOTION_EVENT_ACTION_POINTER_DOWN) ? NC_EV_DOWN :
-                          ((m.action == AMOTION_EVENT_ACTION_UP || m.action == AMOTION_EVENT_ACTION_POINTER_UP || m.action == AMOTION_EVENT_ACTION_CANCEL) ? NC_EV_UP : NC_EV_MOVE);
-                if (evt == NC_EV_DOWN) {
-                    for (int ci=0; ci<NC_CTRL_COUNT; ++ci) {
-                        if (ctrl_point_in(g_ctrl_rects[ci], m.x[idx], m.y[idx])) { claimed = true; break; }
-                    }
-                    if (claimed) ctrl_consume_touch(NC_EV_DOWN, m.id[idx], m.x[idx], m.y[idx]);
-                } else if (evt == NC_EV_MOVE) {
-                    for (int pi=0; pi<m.count; ++pi) {
-                        bool owned = false;
-                        for (int ci=0; ci<NC_CTRL_COUNT; ++ci) if (g_ctrl_ids[ci] == m.id[pi]) { owned = true; break; }
-                        if (owned || g_ctrl_joy_id == m.id[pi]) {
-                            ctrl_consume_touch(NC_EV_MOVE, m.id[pi], m.x[pi], m.y[pi]);
-                            claimed = true;
-                        }
-                    }
+                const int idx = (m.idx >= 0 && m.idx < m.count) ? m.idx : 0;
+                const bool is_down = (m.action == AMOTION_EVENT_ACTION_DOWN || m.action == AMOTION_EVENT_ACTION_POINTER_DOWN);
+                const bool is_up   = (m.action == AMOTION_EVENT_ACTION_UP || m.action == AMOTION_EVENT_ACTION_POINTER_UP);
+
+                if (m.action == AMOTION_EVENT_ACTION_CANCEL) {
+                    ctrl_reset_states();                 /* game gets the cancel untouched */
                 } else {
-                    if (idx >= 0 && idx < m.count) {
-                        for (int ci=0; ci<NC_CTRL_COUNT; ++ci) if (g_ctrl_ids[ci] == m.id[idx]) { claimed = true; break; }
-                        if (g_ctrl_joy_id == m.id[idx]) claimed = true;
-                        if (claimed) ctrl_consume_touch(NC_EV_UP, m.id[idx], m.x[idx], m.y[idx]);
+                    if (is_down) {
+                        ctrl_consume_touch(NC_EV_DOWN, m.id[idx], m.x[idx], m.y[idx]);   /* claims it if it hit a control */
+                    } else if (!is_up) {
+                        for (int pi = 0; pi < m.count; ++pi)
+                            if (ctrl_owns_pointer(m.id[pi])) ctrl_consume_touch(NC_EV_MOVE, m.id[pi], m.x[pi], m.y[pi]);
                     }
-                    if (m.action == AMOTION_EVENT_ACTION_CANCEL) ctrl_reset_states();
+
+                    bool hide[NC_MAX_PTR];
+                    int vis = 0, new_idx = -1, any_hidden = 0;
+                    int map[NC_MAX_PTR];
+                    for (int pi = 0; pi < m.count; ++pi) {
+                        hide[pi] = ctrl_owns_pointer(m.id[pi]);
+                        if (hide[pi]) { any_hidden = 1; continue; }
+                        if (pi == m.idx) new_idx = vis;
+                        map[vis++] = pi;
+                    }
+                    const bool acting_hidden = (is_down || is_up) && hide[idx];
+
+                    if (is_up && hide[idx])
+                        ctrl_consume_touch(NC_EV_UP, m.id[idx], m.x[idx], m.y[idx]);      /* release our control */
+
+                    if (acting_hidden || vis == 0) {     /* nothing in this event concerns the game */
+                        AInputQueue_finishEvent(q, ev, 1);
+                        continue;
+                    }
+                    if (any_hidden) {
+                        int32_t base = m.action;
+                        if (is_down) base = (vis == 1) ? AMOTION_EVENT_ACTION_DOWN : AMOTION_EVENT_ACTION_POINTER_DOWN;
+                        else if (is_up) base = (vis == 1) ? AMOTION_EVENT_ACTION_UP : AMOTION_EVENT_ACTION_POINTER_UP;
+                        g_filt_n = vis;
+                        for (int k = 0; k < vis; ++k) g_filt_map[k] = map[k];
+                        g_filt_action = base | ((base == AMOTION_EVENT_ACTION_POINTER_DOWN || base == AMOTION_EVENT_ACTION_POINTER_UP)
+                                                ? (new_idx << 8) : 0);
+                        g_filt_ev = ev;
+
+                        mv.action = base;
+                        mv.idx = (new_idx >= 0) ? new_idx : 0;
+                        mv.count = vis;
+                        for (int k = 0; k < vis; ++k) { mv.id[k] = m.id[map[k]]; mv.x[k] = m.x[map[k]]; mv.y[k] = m.y[map[k]]; }
+                    }
                 }
-                if (claimed) { AInputQueue_finishEvent(q, ev, 1); continue; }
             }
             pthread_mutex_lock(&g_mu);
-            int swallow = nc_touch_event(&g_touch, &m, push_ev, 0);
+            int swallow = nc_touch_event(&g_touch, &mv, push_ev, 0);
             pthread_mutex_unlock(&g_mu);
             if (swallow) {
                 if (g_touch_logged < 6) { g_touch_logged++; nclog("touch taken: action=%d", m.action); }
+                g_filt_ev = 0;
                 AInputQueue_finishEvent(q, ev, 1);
                 continue;
             }
@@ -2020,8 +2106,10 @@ static void draw_new_controls(ImDrawList *dl, float w, float h) {
     ctrl_init_textures();
     ctrl_build_rects(w,h);
     ctrl_draw_joystick(dl, ctrl_place(NC_CTRL_JOY,w,h));
-    for (int i=1;i<NC_CTRL_COUNT;i++)
+    for (int i=1;i<NC_CTRL_COUNT;i++) {
+        if (!ctrl_slot_shown(i)) continue;
         ctrl_draw_icon(dl, i, ctrl_place(i,w,h), g_ctrl_pressed[i] != 0);
+    }
 }
 
 static void panel_controls();
@@ -2045,6 +2133,7 @@ static void build_control_editor(float w, float h) {
 
     ctrl_init_textures();
     for (int i=0;i<NC_CTRL_COUNT;i++) {
+        if (!ctrl_slot_shown(i)) continue;
         ImVec2 p=ctrl_place(i,w,h), s=ctrl_size_px(i);
         if (i==NC_CTRL_JOY) ctrl_draw_joystick(dl,p,true);
         else ctrl_draw_icon(dl,i,p,false);
@@ -2613,12 +2702,12 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool coords_vis = g_cfg.coords_on && gameplay_hud && in_world && !g_menu_open && !g_edit;
     bool elytra_angle_vis = g_cfg.elytra_angle_on && gameplay_hud && in_world && g_snap.gliding && g_snap.elytra_angle_valid && !g_menu_open && !g_edit;
     bool hud_btns   = gameplay_hud && !g_menu_open && !g_edit;         /* active gameplay only */
-    bool zoom_vis   = g_cfg.controls_mode == 0 && g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
-    bool persp_vis  = g_cfg.controls_mode == 0 && g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
-    bool drop_vis   = g_cfg.controls_mode == 0 && g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
+    bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
+    bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
+    bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
     /* Fast Totem remains on the in-game HUD for this test build, but only while
      * at least one totem exists in the inventory or offhand. */
-    bool fast_totem_vis = g_cfg.controls_mode == 0 && g_cfg.fast_totem_on && hud_btns && g_snap.totem_present;
+    bool fast_totem_vis = g_cfg.fast_totem_on && hud_btns && g_snap.totem_present;
     if (!zoom_vis) g_zoom_active = 0;
 
     bool combat_vis = g_cfg.combat_crosshair_on && in_world && !g_menu_open && !g_edit;
@@ -2761,9 +2850,13 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     pthread_mutex_lock(&g_mu);
     g_touch.n = nrect; g_touch.win = wrect;
     for (int i = 0; i < NC_MAX_HUD; i++) g_touch.hud[i] = hud[i];
+    /* Control rects live in g_ctrl_rects and are hit-tested by the input hook
+     * itself. They must NOT be copied into g_touch.hud[]: slots 0-3 belong to the
+     * Zoom / Perspective / Drop / Totem mod buttons. */
     if (g_cfg.controls_mode == 1 && hud_btns && !g_edit && !g_menu_open) {
         ctrl_build_rects((float)w,(float)h);
-        for (int i=0;i<NC_CTRL_COUNT && i<NC_MAX_HUD;i++) g_touch.hud[i] = g_ctrl_rects[i];
+    } else {
+        for (int i=0;i<NC_CTRL_COUNT;i++) g_ctrl_rects[i].visible = 0;
     }
     pthread_mutex_unlock(&g_mu);
 }
@@ -2792,6 +2885,23 @@ static void *installer(void *) {
             int n = nc_got_hook("libminecraftpe.so", "AInputQueue_getEvent", (void *)hook_getEvent, (void **)&g_orig_getEvent);
             if (n > 0 || i == 0) nclog("hook AInputQueue_getEvent: %d slot(s)", n);
             input_done = n > 0;
+            if (input_done) {
+                static const struct { const char *sym; void *fn; } mh[] = {
+                    {"AMotionEvent_getAction",       (void *)hk_m_getAction},
+                    {"AMotionEvent_getPointerCount", (void *)hk_m_getPointerCount},
+                    {"AMotionEvent_getPointerId",    (void *)hk_m_getPointerId},
+                    {"AMotionEvent_getX",            (void *)hk_m_getX},
+                    {"AMotionEvent_getY",            (void *)hk_m_getY},
+                    {"AMotionEvent_getRawX",         (void *)hk_m_getRawX},
+                    {"AMotionEvent_getRawY",         (void *)hk_m_getRawY},
+                    {"AMotionEvent_getAxisValue",    (void *)hk_m_getAxisValue},
+                };
+                for (unsigned k = 0; k < sizeof(mh)/sizeof(mh[0]); ++k) {
+                    void *orig_unused = 0;
+                    int hn = nc_got_hook("libminecraftpe.so", mh[k].sym, mh[k].fn, &orig_unused);
+                    nclog("hook %s: %d slot(s)", mh[k].sym, hn);
+                }
+            }
         }
     }
     nclog("installer finished: draw=%d input=%d", swap_done, input_done);
@@ -2826,6 +2936,7 @@ static void nc_init(void) {
     reg("settings open", "_ZN24SettingsScreenController6onOpenEv", (void *)hook_settings_open, (void **)&g_orig_onOpen);
     reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
+    reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
     reg("inventory render", "_ZN15InventoryScreen6renderEiif", (void *)hook_inventory_render, (void **)&g_orig_inv_render);
