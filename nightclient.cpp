@@ -399,11 +399,57 @@ static void ctrl_reset_states() {
     g_ctrl_joy_y = 0.0f;
 }
 
-/* Called at the start of MoveInputHandler::tick. Movement is injected later
- * in ctrl_apply_player_actions(), so here we only make sure stale touch state
- * is cleared whenever the gameplay screen isn't the active one. */
-static void ctrl_prepare_input(void *) {
-    if (!nc_gameplay_input_active()) ctrl_reset_states();
+/* ---- Joystick -> the game's own movement pipeline (MCPE 1.1.5, armeabi-v7a) ----
+ * Offsets read from MoveInputHandler in libminecraftpe.so:
+ *   +0x58 / +0x5c : raw stick vector written by _updateMoveVector(x, y);
+ *                   tick() dead-zones/normalises it and stores the result in
+ *                   +0x04 (strafe) / +0x08 (forward), which the player reads.
+ *   +0x43          : jumping flag (MoveInput::setJumping)
+ *   +0x4e          : sneak button down (MoveInputHandler::setSneakDown)
+ * Feeding the raw vector means walking, sprinting, jump and air control behave
+ * exactly like vanilla - no velocity injection, so no more flying. */
+#define NC_MI_RAW_X   0x58
+#define NC_MI_RAW_Y   0x5c
+#define NC_MI_JUMP    0x43
+#define NC_MI_SNEAK   0x4e
+#define NC_JOY_INVERT_X 0   /* set to 1 if left/right feel swapped */
+#define NC_JOY_INVERT_Y 0   /* set to 1 if forward/back feel swapped */
+
+static inline float *mi_f(void *h, int off) { return (float *)((char *)h + off); }
+static inline unsigned char *mi_b(void *h, int off) { return (unsigned char *)h + off; }
+
+static bool ctrl_input_live() {
+    return g_cfg.controls_mode == 1 && nc_gameplay_input_active();
+}
+
+/* Before MoveInputHandler::tick: overwrite the raw stick so the old touch
+ * controls can't drive movement while the new controls are active. */
+static void ctrl_prepare_input(void *h) {
+    if (!h) return;
+    if (g_cfg.controls_mode != 1) return;
+    if (!ctrl_input_live()) { ctrl_reset_states(); return; }
+    float sx = 0.0f, sy = 0.0f;
+    if (g_ctrl_joy_id >= 0) {
+        sx = (float)g_ctrl_joy_x;
+        sy = -(float)g_ctrl_joy_y;                      /* screen-down -> forward is up */
+        sx = sx < -1.0f ? -1.0f : (sx > 1.0f ? 1.0f : sx);
+        sy = sy < -1.0f ? -1.0f : (sy > 1.0f ? 1.0f : sy);
+    }
+#if NC_JOY_INVERT_X
+    sx = -sx;
+#endif
+#if NC_JOY_INVERT_Y
+    sy = -sy;
+#endif
+    *mi_f(h, NC_MI_RAW_X) = sx;
+    *mi_f(h, NC_MI_RAW_Y) = sy;
+    *mi_b(h, NC_MI_SNEAK) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
+}
+
+/* After tick: the player consumes the jumping flag later in its own update. */
+static void ctrl_finish_input(void *h) {
+    if (!h || !ctrl_input_live()) return;
+    if (g_ctrl_pressed[NC_CTRL_JUMP]) *mi_b(h, NC_MI_JUMP) = 1;
 }
 
 static bool ctrl_point_in(const NcRect &r, float x, float y) {
@@ -736,6 +782,7 @@ static void snapshot_totem_state(void *player) {
 static void hook_tick(void *self, void *player) {
     ctrl_prepare_input(self);
     if (g_orig_tick) g_orig_tick(self, player);
+    ctrl_finish_input(self);
     if (!player) return;
     g_local_player = player;
     g_tick_time = now_s();
@@ -1506,77 +1553,37 @@ static void ctrl_apply_player_actions() {
         return;
     }
 
-    /* Jump/sneak: use the game's own methods. */
+    /* Attack/Interact: the game's own press/release callbacks (names verified
+     * against libminecraftpe.so 1.1.5; note the game's own "Destory" typo).
+     * Press on the rising edge, release on the falling edge - exactly how the
+     * vanilla buttons drive them, so holding attack keeps mining. */
+    typedef void (*fn_cic_ci)(void *, void *);
     static bool resolved = false;
-    static void (*jump_fn)(void*) = 0;
-    static void (*sneak_fn)(void*, bool) = 0;
-    static void (*attack_fn)(void*, void*) = 0;
-    static void (*interact_fn)(void*, void*) = 0;
-    static void (*move_fn)(void*, const NcVec3*) = 0;
-    static bool (*ground_fn)(void*) = 0;
-    static double last_jump = 0.0;
+    static fn_cic_ci attack_press = 0, attack_release = 0, interact_press = 0, interact_release = 0;
+    static int prev_attack = 0, prev_interact = 0;
 
     if (!resolved) {
         resolved = true;
-        jump_fn = (void(*)(void*))dlsym(RTLD_DEFAULT, "_ZN11LocalPlayer14jumpFromGroundEv");
-        if (!jump_fn) jump_fn = (void(*)(void*))dlsym(RTLD_DEFAULT, "_ZN3Mob14jumpFromGroundEv");
-        ground_fn = (bool(*)(void*))dlsym(RTLD_DEFAULT, "_ZNK6Entity11isOnGroundEv");
-        sneak_fn = (void(*)(void*, bool))dlsym(RTLD_DEFAULT, "_ZN3Mob11setSneakingEb");
-
-        /* Best-effort movement/action bridges. These are looked up dynamically so
-         * an unavailable overload does not make the client fail to load. */
-        attack_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks23handleAttackButtonPressER14ClientInstance");
-        if (!attack_fn) attack_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks24handleAttackButtonPressER14ClientInstance");
-        interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks25handleInteractButtonPressER14ClientInstance");
-        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks26handleInteractButtonPressER14ClientInstance");
-        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks22handleBuildButtonPressER14ClientInstance");
-        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks23handleBuildButtonPressER14ClientInstance");
-        nclog("new controls symbols: jump=%p ground=%p sneak=%p attack=%p interact=%p move=%p",
-              (void*)jump_fn, (void*)ground_fn, (void*)sneak_fn, (void*)attack_fn, (void*)interact_fn, (void*)move_fn);
-
-        /* Fallback movement bridge for builds exposing Mob/LocalPlayer::lerpMotion.
-         * The joystick is converted into camera-relative horizontal motion. */
-        move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN3Mob10lerpMotionERK4Vec3");
-        if (!move_fn) move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN11LocalPlayer10lerpMotionERK4Vec3");
-        if (!move_fn) move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN6Entity10lerpMotionERK4Vec3");
+        attack_press    = (fn_cic_ci)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks32handleDestoryOrAttackButtonPressER14ClientInstance");
+        if (!attack_press) attack_press = (fn_cic_ci)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks30handleBuildOrAttackButtonPressER14ClientInstance");
+        attack_release  = (fn_cic_ci)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks31handleAttackActionButtonReleaseER14ClientInstance");
+        interact_press  = (fn_cic_ci)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks32handleBuildOrInteractButtonPressER14ClientInstance");
+        if (!interact_press) interact_press = (fn_cic_ci)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks25handleInteractButtonPressER14ClientInstance");
+        interact_release = (fn_cic_ci)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks30handleBuildActionButtonReleaseER14ClientInstance");
+        nclog("controls symbols: attack=%p/%p interact=%p/%p",
+              (void*)attack_press, (void*)attack_release, (void*)interact_press, (void*)interact_release);
     }
 
-    const double tnow = now_s();
-    if (g_ctrl_pressed[NC_CTRL_JUMP]) {
-        bool can_jump = ground_fn ? ground_fn(g_local_player) : ((tnow - last_jump) > 0.80);
-        if (can_jump && jump_fn && (tnow - last_jump) > 0.08) {
-            jump_fn(g_local_player);
-            last_jump = tnow;
-        }
-    }
-    if (sneak_fn) sneak_fn(g_local_player, g_ctrl_pressed[NC_CTRL_SNEAK] != 0);
-
+    const int cur_attack = g_ctrl_pressed[NC_CTRL_ATTACK] ? 1 : 0;
+    const int cur_interact = g_ctrl_pressed[NC_CTRL_INTERACT] ? 1 : 0;
     if (g_cic && g_ci) {
-        if (g_ctrl_pressed[NC_CTRL_ATTACK] && attack_fn) attack_fn(g_cic, g_ci);
-        if (g_ctrl_pressed[NC_CTRL_INTERACT] && interact_fn) interact_fn(g_cic, g_ci);
+        if (cur_attack && !prev_attack && attack_press) attack_press(g_cic, g_ci);
+        if (!cur_attack && prev_attack && attack_release) attack_release(g_cic, g_ci);
+        if (cur_interact && !prev_interact && interact_press) interact_press(g_cic, g_ci);
+        if (!cur_interact && prev_interact && interact_release) interact_release(g_cic, g_ci);
     }
-
-    if (move_fn && g_ctrl_joy_id >= 0) {
-        const float dead = 0.12f;
-        float sx = fabsf(g_ctrl_joy_x) < dead ? 0.0f : g_ctrl_joy_x;
-        float sy = fabsf(g_ctrl_joy_y) < dead ? 0.0f : g_ctrl_joy_y;
-        if (sx != 0.0f || sy != 0.0f) {
-            NcVec2 rot = {0.0f, 0.0f};
-            entity_getRotation(&rot, g_local_player);
-            const float r = rot.y * 0.01745329251994329577f;
-            const float sn = sinf(r), cs = cosf(r);
-            /* joystick Y is screen-down, so invert it for forward. */
-            const float fwd = -sy;
-            const bool sprint = (fwd > 0.60f && !mob_isSneaking(g_local_player) && !player_isUsingItem(g_local_player));
-            lp_setSprinting(g_local_player, sprint);
-            const float speed = sprint ? 0.13f : 0.10f;
-            NcVec3 mv;
-            mv.x = (-sn * fwd - cs * sx) * speed;
-            mv.y = 0.0f;
-            mv.z = ( cs * fwd - sn * sx) * speed;
-            move_fn(g_local_player, &mv);
-        }
-    }
+    prev_attack = cur_attack;
+    prev_interact = cur_interact;
 }
 static void ctrl_consume_touch(int action, int id, float x, float y) {
     if (g_cfg.controls_mode != 1) return;
