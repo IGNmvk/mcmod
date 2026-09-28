@@ -55,6 +55,17 @@ extern "C" bool ii_isNull(const void *it)       __asm__("_ZNK12ItemInstance6isNu
 extern "C" int  ii_getId(const void *it)        __asm__("_ZNK12ItemInstance5getIdEv");
 extern "C" int  ii_getDamage(const void *it)    __asm__("_ZNK12ItemInstance14getDamageValueEv");
 extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12getMaxDamageEv");
+/* ---- the game's own item renderer (same call the Toolbox armor HUD makes) ----
+ * renderGuiItemNew(this, item, aux, x, y, alpha, scale, extra, glint):
+ * x/y are GUI units (screen pixels / gui scale). Because the game draws the item,
+ * texture packs, custom models and enchant glint all apply. */
+extern "C" void *g_ItemRendererInstance __asm__("_ZN12ItemRenderer8instanceE");
+extern "C" void ir_renderGuiItemNew(void *self, const void *item, int aux, float x, float y,
+                                    float alpha, float scale, float extra, bool glint)
+    __asm__("_ZN12ItemRenderer16renderGuiItemNewERK12ItemInstanceifffffb");
+extern "C" bool ii_isEnchanted(const void *it) __asm__("_ZNK12ItemInstance11isEnchantedEv");
+extern "C" void *ci_getGuiData(void *ci)       __asm__("_ZN14ClientInstance10getGuiDataEv");
+extern "C" float gd_getGuiScale(void *gd)      __asm__("_ZN7GuiData11getGuiScaleEv");
 extern "C" void cic_toggle3rd(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks38handleToggleThirdPersonViewButtonPressER14ClientInstance");
 extern "C" void cic_drop(void *self, void *ci)
@@ -730,6 +741,59 @@ static void hook_chat_open(void *self) {
 static void hook_chat_dtor(void *self) {
     if (self == g_chat_this) { g_chat_this = 0; ctrl_reset_states(); nclog("chat screen closed"); }
     if (g_orig_chat_dtor) g_orig_chat_dtor(self);
+}
+
+/* ---- Armor HUD items drawn by the game ----
+ * draw_armor() (ImGui, runs at swap time) records where each item goes; the
+ * HUD renderer hook below (runs inside the game's UI pass, like Toolbox) then
+ * asks the game to draw those items. One frame of latency, invisible in use. */
+struct ArmorItemDraw { int slot; float x_px, y_px, size_px, alpha; };
+static ArmorItemDraw g_armor_draw[6];
+static volatile int  g_armor_draw_n = 0;
+static volatile int  g_armor_draw_stamp = -1000;   /* g_frames when draw_armor last recorded */
+static volatile int  g_item_hook_frame = -1000;    /* g_frames when the hook last ran */
+static int           g_item_hook_last = -1;
+static int           g_item_log = 0;
+#define NC_ITEM_EXTRA 0.7f    /* 5th float Toolbox passes; leave as is */
+typedef void (*fn_hud_render)(void *, void *, void *, int, void *);
+static fn_hud_render g_orig_hud_vig = 0, g_orig_hud_heart = 0;
+
+static const void *armor_item_for_slot(void *player, int slot) {
+    if (!player) return 0;
+    if (slot >= 0 && slot < 4) return mob_getArmor(player, slot);
+    if (slot == 4) return player_getSelectedItem(player);
+    if (slot == 5) return mob_getOffhandSlot(player);
+    return 0;
+}
+
+static void armor_draw_items(void *ci) {
+    if (g_item_hook_last == g_frames) return;            /* once per frame */
+    g_item_hook_last = g_frames;
+    g_item_hook_frame = g_frames;
+    if (g_frames - g_armor_draw_stamp > 2) return;       /* HUD not showing armor right now */
+    void *player = g_local_player;
+    void *inst = g_ItemRendererInstance;
+    if (!player || !inst || !ci) return;
+    void *gd = ci_getGuiData(ci);
+    float gs = gd ? gd_getGuiScale(gd) : 0.0f;
+    if (!(gs > 0.1f && gs < 32.0f)) return;
+    const int n = g_armor_draw_n;
+    for (int i = 0; i < n && i < 6; i++) {
+        const ArmorItemDraw d = g_armor_draw[i];
+        const void *it = armor_item_for_slot(player, d.slot);
+        if (!it || ii_isNull(it)) continue;
+        float scale = d.size_px / (16.0f * gs);
+        if (g_item_log < 6) { g_item_log++; nclog("armor item slot=%d x=%.1f y=%.1f gs=%.2f scale=%.2f", d.slot, d.x_px / gs, d.y_px / gs, gs, scale); }
+        ir_renderGuiItemNew(inst, it, 0, d.x_px / gs, d.y_px / gs, d.alpha, scale, NC_ITEM_EXTRA, ii_isEnchanted(it));
+    }
+}
+static void hook_hud_vignette(void *self, void *ci, void *ctl, int a, void *area) {
+    if (g_orig_hud_vig) g_orig_hud_vig(self, ci, ctl, a, area);
+    armor_draw_items(ci);
+}
+static void hook_hud_heart(void *self, void *ci, void *ctl, int a, void *area) {
+    if (g_orig_hud_heart) g_orig_hud_heart(self, ci, ctl, a, area);
+    armor_draw_items(ci);
 }
 
 /* ---- New-controls mode: plain screen taps must not attack/place/interact ----
@@ -1973,14 +2037,66 @@ static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
     ArmorRow rows[6]; armor_rows(rows, preview);
     ImVec2 rs, total; armor_metrics(&rs, &total);
     float s = g_cfg.armor_size; float a = g_cfg.armor_alpha, pad = 2.0f * s, gap = 2.0f * s, icon = 16.0f * icon_k(s);
-    if (g_cfg.armor_bg) box_col(dl, p, total, g_cfg.armor_bg_alpha, s, g_cfg.armor_bg_col);
+    /* Real HUD: the game draws the item icons itself (texture packs apply).
+     * If its HUD hook hasn't run recently, fall back to the embedded icons. */
+    const bool game_icons = !preview && (g_frames - g_item_hook_frame) < 30;
+    int rec_n = 0;
+    if (g_cfg.armor_bg) {
+        if (!game_icons) {
+            box_col(dl, p, total, g_cfg.armor_bg_alpha, s, g_cfg.armor_bg_col);
+        } else {
+            /* The game's items are drawn BEFORE ImGui, so the backdrop must leave
+             * each icon square open or it would cover them. */
+            ImU32 c = packed(g_cfg.armor_bg_col, g_cfg.armor_bg_alpha);
+            int k = 0; float cy = p.y, cx = p.x;
+            ImVec2 q0[6];
+            for (int i = 0; i < 6; i++) {
+                if (!rows[i].present) continue;
+                ImVec2 o = g_cfg.armor_horiz ? V(pad + k * (rs.x + gap), pad) : V(pad, pad + k * (rs.y + gap));
+                q0[k++] = vadd(p, o);
+            }
+            (void)cy; (void)cx;
+            const float x0 = p.x, x1 = p.x + total.x, y0 = p.y, y1 = p.y + total.y;
+            if (k == 0) { dl->AddRectFilled(V(x0, y0), V(x1, y1), c); }
+            else if (!g_cfg.armor_horiz) {
+                float y = y0;
+                for (int j = 0; j < k; j++) {
+                    float top = q0[j].y, bot = q0[j].y + icon;
+                    if (top > y) dl->AddRectFilled(V(x0, y), V(x1, top), c);
+                    dl->AddRectFilled(V(x0, top), V(q0[j].x, bot), c);
+                    dl->AddRectFilled(V(q0[j].x + icon, top), V(x1, bot), c);
+                    y = bot;
+                    float rowEnd = q0[j].y + rs.y;
+                    float next = (j + 1 < k) ? q0[j + 1].y : y1;
+                    (void)rowEnd;
+                    if (next > y) dl->AddRectFilled(V(x0, y), V(x1, next), c), y = next;
+                }
+                if (y < y1) dl->AddRectFilled(V(x0, y), V(x1, y1), c);
+            } else {
+                float x = x0;
+                for (int j = 0; j < k; j++) {
+                    float left = q0[j].x, right = q0[j].x + icon;
+                    if (left > x) dl->AddRectFilled(V(x, y0), V(left, y1), c);
+                    dl->AddRectFilled(V(left, y0), V(right, q0[j].y), c);
+                    dl->AddRectFilled(V(left, q0[j].y + icon), V(right, y1), c);
+                    x = right;
+                }
+                if (x < x1) dl->AddRectFilled(V(x, y0), V(x1, y1), c);
+            }
+        }
+    }
     int shown = 0;
     for (int i = 0; i < 6; i++) {
         if (!rows[i].present) continue;
         ImVec2 o = g_cfg.armor_horiz ? V(pad + shown * (rs.x + gap), pad) : V(pad, pad + shown * (rs.y + gap));
         ImVec2 q = vadd(p, o);
         int id = rows[i].id, ix = embedded_item_icon(id);
-        if (ix >= 0) {
+        if (game_icons) {
+            g_armor_draw[rec_n].slot = rows[i].slot;
+            g_armor_draw[rec_n].x_px = q.x; g_armor_draw[rec_n].y_px = q.y;
+            g_armor_draw[rec_n].size_px = icon; g_armor_draw[rec_n].alpha = a;
+            rec_n++;
+        } else if (ix >= 0) {
             ImU32 tint = (id >= 298 && id <= 301) ? rgba(160, 101, 64, a) : rgba(255,255,255,a);
             draw_icon(dl, ix, q, icon, tint);
         } else {
@@ -2003,6 +2119,7 @@ static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
         }
         shown++;
     }
+    if (game_icons) { g_armor_draw_n = rec_n; g_armor_draw_stamp = g_frames; }
 }
 
 /* ---- Elytra indicator (outline icon, text, or both) ---- */
@@ -2936,6 +3053,8 @@ static void nc_init(void) {
     reg("settings open", "_ZN24SettingsScreenController6onOpenEv", (void *)hook_settings_open, (void **)&g_orig_onOpen);
     reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
+    reg("armor items (vignette)", "_ZN19HudVignetteRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea", (void *)hook_hud_vignette, (void **)&g_orig_hud_vig);
+    reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
