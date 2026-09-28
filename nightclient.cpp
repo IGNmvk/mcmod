@@ -796,6 +796,7 @@ static void hook_tick(void *self, void *player) {
     snapshot_totem_state(player);
     if (g_cfg.controls_mode == 1) ctrl_apply_player_actions();
     if (g_cfg.autosprint && g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
+        static bool nc_gameplay_input_active();
         if (g_ctrl_joy_id >= 0 && g_ctrl_joy_y < -0.55f && !mob_isSneaking(player) &&
             !player_isUsingItem(player) && !mob_isSprinting(player))
             lp_setSprinting(player, true);
@@ -2606,7 +2607,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
-              g_pause_this != 0, (int)in_world, (int)play_hud, (int)g_menu_open, fps);
+              g_pause_this != 0, (int)in_world, (int)g_hud_visible, (int)g_menu_open, fps);
     }
     if (need && !g_drawing_logged) { g_drawing_logged = true; nclog("drawing started"); }
 
