@@ -109,6 +109,7 @@ static struct { int type; float x, y; } g_q[256];
 static int g_qn = 0;
 
 static void *volatile g_settings_this = 0;   /* the open SettingsScreenController, if any */
+static void *volatile g_chat_this = 0;       /* the open chat screen, if any */
 static void *volatile g_pause_this = 0;      /* the open PauseScreenController, if any */
 static volatile double g_inventory_render_time = 0; /* last InventoryScreen render */
 static void *volatile g_cic = 0;             /* ClientInputCallbacks* (captured) */
@@ -396,6 +397,13 @@ static void ctrl_reset_states() {
     for (int i=0;i<NC_CTRL_COUNT;i++) g_ctrl_ids[i] = -1;
     g_ctrl_joy_x = 0.0f;
     g_ctrl_joy_y = 0.0f;
+}
+
+/* Called at the start of MoveInputHandler::tick. Movement is injected later
+ * in ctrl_apply_player_actions(), so here we only make sure stale touch state
+ * is cleared whenever the gameplay screen isn't the active one. */
+static void ctrl_prepare_input(void *) {
+    if (!nc_gameplay_input_active()) ctrl_reset_states();
 }
 
 static bool ctrl_point_in(const NcRect &r, float x, float y) {
@@ -1487,8 +1495,9 @@ static bool nc_gameplay_input_active() {
     const bool play = (now - g_play_time) < 0.35;
     const bool pause = (g_pause_this != 0);
     const bool settings = (g_settings_this != 0);
+    const bool chat = (g_chat_this != 0);
     const bool inventory = (now - g_inventory_render_time) < 0.35;
-    return play && !pause && !settings && !inventory && !g_menu_open && !g_edit;
+    return play && !pause && !chat && !settings && !inventory && !g_menu_open && !g_edit;
 }
 
 static void ctrl_apply_player_actions() {
