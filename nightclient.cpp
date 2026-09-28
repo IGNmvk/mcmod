@@ -457,9 +457,11 @@ static void ctrl_prepare_input(void *h) {
 #endif
     *mi_f(h, NC_MI_RAW_X) = sx;
     *mi_f(h, NC_MI_RAW_Y) = sy;
-    /* The game itself treats held Sneak as fly-down while flying (AiStep level),
-     * so we just keep sending the plain Sneak flag either way. */
+    /* The game itself treats held Sneak as fly-down while flying, but it reads
+     * this flag WHILE it computes movement inside tick() - same as the raw
+     * joystick above - so it has to be set before tick() runs, not after. */
     *mi_b(h, NC_MI_SNEAK) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
+    if (g_ctrl_flying) *mi_b(h, NC_MI_JUMP) = g_ctrl_pressed[NC_CTRL_JUMP] ? 1 : 0;
 }
 
 /* After tick: the player consumes the jumping flag later in its own update. */
@@ -1656,6 +1658,13 @@ static fn_touch_render g_orig_touch_render = 0;
 static void hook_touch_render(void *self, void *ctx) {
     if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
+}
+
+typedef void (*fn_touch_tick)(void *, void *, int);
+static fn_touch_tick g_orig_touch_tick = 0;
+static void hook_touch_tick(void *self, void *queue, int a) {
+    if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
+    if (g_orig_touch_tick) g_orig_touch_tick(self, queue, a);
 }
 
 static void ctrl_apply_player_actions() {
@@ -3078,6 +3087,7 @@ static void nc_init(void) {
     reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
+    reg("block vanilla controls", "_ZN15TouchControlSet4tickER15InputEventQueuei", (void *)hook_touch_tick, (void **)&g_orig_touch_tick);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
     reg("inventory render", "_ZN15InventoryScreen6renderEiif", (void *)hook_inventory_render, (void **)&g_orig_inv_render);
