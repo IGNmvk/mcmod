@@ -437,191 +437,51 @@ static float ctrl_px(float base, float size) {
 static ImVec2 txt(const char *s, float size);
 static void put_text(ImDrawList *dl, ImVec2 p, float size, ImU32 col, const char *s);
 
-static const NcControlPng *ctrl_png(int i, bool pressed) {
+/* Control textures are embedded as predecoded RGBA data in nc_controls.h.
+ * This uploads them once per GL context; there is no per-frame PNG/JNI work. */
+static const NcControlRgba *ctrl_raw(int i, bool pressed) {
     switch (i) {
-        case NC_CTRL_ATTACK:  return pressed ? &nc_ctrl_png_attack_pressed : &nc_ctrl_png_attack;
-        case NC_CTRL_INTERACT:return pressed ? &nc_ctrl_png_interact_pressed : &nc_ctrl_png_interact;
-        case NC_CTRL_JUMP:    return pressed ? &nc_ctrl_png_jump_pressed : &nc_ctrl_png_jump;
-        case NC_CTRL_SNEAK:   return pressed ? &nc_ctrl_png_sneak_pressed : &nc_ctrl_png_sneak;
-        case NC_CTRL_UP:      return pressed ? &nc_ctrl_png_flyingascend_pressed : &nc_ctrl_png_flyingascend;
-        case NC_CTRL_DOWN:    return pressed ? &nc_ctrl_png_flyingdescend_pressed : &nc_ctrl_png_flyingdescend;
+        case NC_CTRL_ATTACK:   return pressed ? &nc_ctrl_rgba_attack_pressed : &nc_ctrl_rgba_attack;
+        case NC_CTRL_INTERACT: return pressed ? &nc_ctrl_rgba_interact_pressed : &nc_ctrl_rgba_interact;
+        case NC_CTRL_JUMP:     return pressed ? &nc_ctrl_rgba_jump_pressed : &nc_ctrl_rgba_jump;
+        case NC_CTRL_SNEAK:    return pressed ? &nc_ctrl_rgba_sneak_pressed : &nc_ctrl_rgba_sneak;
+        case NC_CTRL_UP:       return pressed ? &nc_ctrl_rgba_flyingascend_pressed : &nc_ctrl_rgba_flyingascend;
+        case NC_CTRL_DOWN:     return pressed ? &nc_ctrl_rgba_flyingdescend_pressed : &nc_ctrl_rgba_flyingdescend;
+        case NC_CTRL_JOY:      return pressed ? &nc_ctrl_rgba_joystick_knob : &nc_ctrl_rgba_joystick_frame;
         default: return 0;
     }
 }
 
-/*
- * We intentionally keep the PNG bytes embedded in the client, but decode them
- * with Android's BitmapFactory on first use instead of depending on stb_image.
- */
-static bool ctrl_decode_bytes_texture(const unsigned char *data, size_t size, GLuint *out) {
-    if (!data || !out || size == 0) return false;
+static bool ctrl_upload_raw_texture(const NcControlRgba *src, GLuint *out) {
+    if (!src || !src->rgba || src->w <= 0 || src->h <= 0 || !out) return false;
     GLint prev = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
-    bool attached = false;
-    JNIEnv *env = kb_env(&attached);
-    if (!env) return false;
-
-    jclass bf = env->FindClass("android/graphics/BitmapFactory");
-    jclass bitmap_cls = env->FindClass("android/graphics/Bitmap");
-    jclass bos = env->FindClass("java/io/ByteArrayInputStream");
-    if (!bf || !bitmap_cls || !bos) { kb_release(env, attached); return false; }
-
-    jmethodID ctor = env->GetMethodID(bos, "<init>", "([B)V");
-    jmethodID decode = env->GetStaticMethodID(bf, "decodeStream",
-        "(Ljava/io/InputStream;)Landroid/graphics/Bitmap;");
-    jmethodID getW = env->GetMethodID(bitmap_cls, "getWidth", "()I");
-    jmethodID getH = env->GetMethodID(bitmap_cls, "getHeight", "()I");
-    jmethodID copy = env->GetMethodID(bitmap_cls, "copy", "(Landroid/graphics/Bitmap$Config;Z)Landroid/graphics/Bitmap;");
-    if (!ctor || !decode || !getW || !getH || !copy) {
-        kb_release(env, attached); return false;
-    }
-
-    jbyteArray arr = env->NewByteArray((jsize)size);
-    env->SetByteArrayRegion(arr, 0, (jsize)size, (const jbyte *)data);
-    jobject stream = env->NewObject(bos, ctor, arr);
-    jobject bmp = stream ? env->CallStaticObjectMethod(bf, decode, stream) : 0;
-    if (env->ExceptionCheck()) { env->ExceptionClear(); bmp = 0; }
-    if (!bmp) {
-        if (arr) env->DeleteLocalRef(arr);
-        if (stream) env->DeleteLocalRef(stream);
-        kb_release(env, attached); return false;
-    }
-
-    jint bw = env->CallIntMethod(bmp, getW);
-    jint bh = env->CallIntMethod(bmp, getH);
-    if (bw <= 0 || bh <= 0) {
-        env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
-        kb_release(env, attached); return false;
-    }
-
-    /* readPixels through Bitmap.copy(ARGB_8888,true), then getPixels() */
-    jclass config_cls = env->FindClass("android/graphics/Bitmap$Config");
-    jfieldID argb = config_cls ? env->GetStaticFieldID(config_cls, "ARGB_8888",
-                                                        "Landroid/graphics/Bitmap$Config;") : 0;
-    jobject cfg = argb ? env->GetStaticObjectField(config_cls, argb) : 0;
-    jobject copybmp = cfg ? env->CallObjectMethod(bmp, copy, cfg, JNI_FALSE) : 0;
-    if (env->ExceptionCheck()) { env->ExceptionClear(); copybmp = 0; }
-
-    jmethodID getPixels = env->GetMethodID(bitmap_cls, "getPixels", "([IIIIIII)V");
-    if (!copybmp || !getPixels) {
-        if (copybmp) env->DeleteLocalRef(copybmp);
-        env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
-        if (cfg) env->DeleteLocalRef(cfg); if (config_cls) env->DeleteLocalRef(config_cls);
-        kb_release(env, attached); return false;
-    }
-
-    const int count = bw * bh;
-    jintArray px = env->NewIntArray(count);
-    env->CallVoidMethod(copybmp, getPixels, px, 0, bw, 0, 0, bw, bh);
-    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr); if (cfg) env->DeleteLocalRef(cfg); if(config_cls) env->DeleteLocalRef(config_cls); kb_release(env, attached); return false; }
-
-    jint *pix = env->GetIntArrayElements(px, 0);
-    if (!pix) { env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr); if(cfg) env->DeleteLocalRef(cfg); if(config_cls) env->DeleteLocalRef(config_cls); kb_release(env, attached); return false; }
-
     glGenTextures(1, out);
+    if (!*out) { glBindTexture(GL_TEXTURE_2D, (GLuint)prev); return false; }
     glBindTexture(GL_TEXTURE_2D, *out);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    std::vector<unsigned char> rgba8((size_t)count * 4);
-    for (int i=0; i<count; ++i) {
-        unsigned int v = (unsigned int)pix[i];
-        rgba8[i*4+0] = (unsigned char)((v >> 16) & 0xff);
-        rgba8[i*4+1] = (unsigned char)((v >> 8) & 0xff);
-        rgba8[i*4+2] = (unsigned char)(v & 0xff);
-        rgba8[i*4+3] = (unsigned char)((v >> 24) & 0xff);
-    }
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, src->w, src->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, src->rgba);
+    GLenum err = glGetError();
     glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
-
-    env->ReleaseIntArrayElements(px, pix, JNI_ABORT);
-    env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp);
-    env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
-    if (cfg) env->DeleteLocalRef(cfg); if (config_cls) env->DeleteLocalRef(config_cls);
-    kb_release(env, attached);
-    return true;
+    return err == GL_NO_ERROR;
 }
 
-
-static jobject ctrl_get_asset_manager_java() {
-    bool attached = false;
-    JNIEnv *env = kb_env(&attached);
-    if (!env) return 0;
-    if (g_ctrl_asset_mgr_java) {
-        jobject out = env->NewLocalRef(g_ctrl_asset_mgr_java);
-        kb_release(env, attached);
-        return out;
-    }
-    bool activity_global = false;
-    jobject activity = 0;
-    if (g_kb_activity) activity = env->NewLocalRef(g_kb_activity);
-    else { activity = kb_find_activity(env); activity_global = activity != 0; }
-    if (!activity) { kb_release(env, attached); return 0; }
-    jclass ac = env->GetObjectClass(activity);
-    jmethodID getAssets = ac ? env->GetMethodID(ac, "getAssets", "()Landroid/content/res/AssetManager;") : 0;
-    jobject am = getAssets ? env->CallObjectMethod(activity, getAssets) : 0;
-    if (env->ExceptionCheck()) { env->ExceptionClear(); am = 0; }
-    if (am) g_ctrl_asset_mgr_java = env->NewGlobalRef(am);
-    if (am) env->DeleteLocalRef(am);
-    if (ac) env->DeleteLocalRef(ac);
-    if (activity_global) env->DeleteGlobalRef(activity);
-    else env->DeleteLocalRef(activity);
-    jobject out = g_ctrl_asset_mgr_java ? env->NewLocalRef(g_ctrl_asset_mgr_java) : 0;
-    kb_release(env, attached);
-    return out;
-}
-
-static bool ctrl_decode_asset_texture(const char *path, GLuint *out) {
-    if (!path || !out) return false;
-    bool attached = false;
-    JNIEnv *env = kb_env(&attached);
-    if (!env) return false;
-    jobject am = ctrl_get_asset_manager_java();
-    if (!am) { kb_release(env, attached); return false; }
-    jclass amCls = env->GetObjectClass(am);
-    jmethodID open = amCls ? env->GetMethodID(amCls, "open", "(Ljava/lang/String;I)Ljava/io/InputStream;") : 0;
-    jstring jpath = env->NewStringUTF(path);
-    jobject stream = open ? env->CallObjectMethod(am, open, jpath, 0) : 0;
-    if (env->ExceptionCheck()) { env->ExceptionClear(); stream = 0; }
-    if (jpath) env->DeleteLocalRef(jpath);
-    if (!stream) { if (amCls) env->DeleteLocalRef(amCls); env->DeleteLocalRef(am); kb_release(env, attached); return false; }
-    jclass inCls = env->GetObjectClass(stream);
-    jmethodID available = inCls ? env->GetMethodID(inCls, "available", "()I") : 0;
-    jmethodID read = inCls ? env->GetMethodID(inCls, "read", "([BII)I") : 0;
-    int len = available ? env->CallIntMethod(stream, available) : 0;
-    if (env->ExceptionCheck()) { env->ExceptionClear(); len = 0; }
-    bool ok = false;
-    if (len > 0 && len < (1 << 20) && read) {
-        jbyteArray arr = env->NewByteArray(len);
-        if (arr) {
-            jint n = env->CallIntMethod(stream, read, arr, 0, len);
-            if (env->ExceptionCheck()) { env->ExceptionClear(); n = -1; }
-            if (n > 0) {
-                jbyte *bytes = env->GetByteArrayElements(arr, 0);
-                if (bytes) {
-                    ok = ctrl_decode_bytes_texture((const unsigned char *)bytes, (size_t)n, out);
-                    env->ReleaseByteArrayElements(arr, bytes, JNI_ABORT);
-                }
-            }
-            env->DeleteLocalRef(arr);
+static void ctrl_init_textures() {
+    if (g_ctrl_assets_ready) return;
+    bool ok = true;
+    for (int i = 0; i < NC_CTRL_COUNT; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            if (g_ctrl_tex[i][j]) continue;
+            const NcControlRgba *src = ctrl_raw(i, j != 0);
+            if (!ctrl_upload_raw_texture(src, &g_ctrl_tex[i][j])) ok = false;
         }
     }
-    jclass closeCls = env->GetObjectClass(stream);
-    jmethodID close = closeCls ? env->GetMethodID(closeCls, "close", "()V") : 0;
-    if (close) env->CallVoidMethod(stream, close);
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    if (closeCls) env->DeleteLocalRef(closeCls);
-    if (inCls) env->DeleteLocalRef(inCls);
-    env->DeleteLocalRef(stream);
-    if (amCls) env->DeleteLocalRef(amCls);
-    env->DeleteLocalRef(am);
-    kb_release(env, attached);
-    return ok;
-}
-
-static bool ctrl_decode_png_texture(const NcControlPng *png, GLuint *out) {
-    return png && ctrl_decode_bytes_texture(png->data, png->size, out);
+    g_ctrl_assets_ready = ok;
+    if (ok) nclog("controls: raw embedded textures uploaded");
+    else if (g_frames % 120 == 0) nclog("controls: raw texture upload failed");
 }
 
 
@@ -662,6 +522,9 @@ typedef int   (*fn_ptr)(void *, void *, void *, int);
 typedef bool  (*fn_getb)(void *);
 typedef int   (*fn_geti)(void *);
 typedef void  (*fn_entity_render)(void *, void *, const void *, float, float);
+typedef void  (*fn_move_vector)(void *, float, float);
+typedef void  (*fn_touch_tick)(void *, void *, int);
+typedef void  (*fn_ui_draw)(void *);
 static fn_this  g_orig_onOpen = 0, g_orig_dtor = 0;
 static fn_tick  g_orig_tick = 0;
 static fn_apply g_orig_apply = 0;
@@ -671,6 +534,9 @@ static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0;
 static fn_geti  g_orig_view = 0;
 static fn_entity_render g_orig_entity_render = 0;
+static fn_move_vector g_orig_move_vector = 0;
+static fn_touch_tick g_orig_touch_tick = 0;
+static fn_ui_draw g_orig_input_ui = 0;
 static fn_entity_render g_orig_xp_render = 0;
 static fn_entity_render g_orig_crystal_render = 0;
 static fn_entity_render g_orig_crystal_effects = 0;
@@ -795,6 +661,20 @@ static void hook_pause_dtor(void *self) {
     if (g_orig_pausedtor) g_orig_pausedtor(self);
 }
 
+typedef void (*fn_chatopen)(void *);
+static fn_chatopen g_orig_chat_open = 0;
+static fn_this g_orig_chat_dtor = 0;
+static void hook_chat_open(void *self) {
+    if (g_orig_chat_open) g_orig_chat_open(self);
+    g_chat_this = self;
+    ctrl_reset_states();
+    nclog("chat screen opened");
+}
+static void hook_chat_dtor(void *self) {
+    if (self == g_chat_this) { g_chat_this = 0; ctrl_reset_states(); nclog("chat screen closed"); }
+    if (g_orig_chat_dtor) g_orig_chat_dtor(self);
+}
+
 /* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
 static void hook_apply(void *self, float dt) {
     g_play_time = now_s();
@@ -846,6 +726,7 @@ static void snapshot_totem_state(void *player) {
 }
 
 static void hook_tick(void *self, void *player) {
+    ctrl_prepare_input(self);
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
     g_local_player = player;
@@ -908,9 +789,14 @@ static void hook_tick(void *self, void *player) {
                        &g_snap.offhand_dur, &g_snap.offhand_max);
     snapshot_totem_state(player);
     if (g_cfg.controls_mode == 1) ctrl_apply_player_actions();
-    if (g_cfg.autosprint && mih_isMovingForward(self) && !mob_isSneaking(player) &&
-        !player_isUsingItem(player) && !mob_isSprinting(player))
+    if (g_cfg.autosprint && g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
+        if (g_ctrl_joy_id >= 0 && g_ctrl_joy_y < -0.55f && !mob_isSneaking(player) &&
+            !player_isUsingItem(player) && !mob_isSprinting(player))
+            lp_setSprinting(player, true);
+    } else if (g_cfg.autosprint && mih_isMovingForward(self) && !mob_isSneaking(player) &&
+               !player_isUsingItem(player) && !mob_isSprinting(player)) {
         lp_setSprinting(player, true);
+    }
 }
 
 /* No hurt cam */
@@ -1457,9 +1343,7 @@ static void combat_consider_entity(void *entity, float partial) {
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
-    if (g_cfg.combat_crosshair_on)
-        combat_consider_entity(entity, partial);
-    if (g_cfg.hitbox_on && entity && pos)
+    if (g_cfg.hitbox_on && entity && pos && entity != g_local_player)
         hit_draw_entity(entity, (const float *)pos, partial);
 }
 
@@ -1522,33 +1406,6 @@ static int  hook_view(void *s) {
     return v;
 }
 
-
-static void ctrl_init_textures() {
-    if (g_ctrl_assets_ready) return;
-    bool ok = true;
-    const char *paths[NC_CTRL_COUNT][2] = {
-        {"controls/joystick_frame.png", "controls/joystick_knob.png"},
-        {"controls/attack.png", "controls/attack_pressed.png"},
-        {"controls/interact.png", "controls/interact_pressed.png"},
-        {"controls/jump.png", "controls/jump_pressed.png"},
-        {"controls/sneak.png", "controls/sneak_pressed.png"},
-        {"controls/flyingascend.png", "controls/flyingascend_pressed.png"},
-        {"controls/flyingdescend.png", "controls/flyingdescend_pressed.png"}
-    };
-    for (int i=0; i<NC_CTRL_COUNT; ++i) {
-        for (int j=0; j<2; ++j) {
-            if (g_ctrl_tex[i][j]) continue;
-            bool loaded = ctrl_decode_asset_texture(paths[i][j], &g_ctrl_tex[i][j]);
-            if (!loaded) {
-                const NcControlPng *fallback = ctrl_png(i, j != 0);
-                loaded = fallback && ctrl_decode_png_texture(fallback, &g_ctrl_tex[i][j]);
-            }
-            if (!loaded) ok = false;
-        }
-    }
-    g_ctrl_assets_ready = ok;
-    if (!ok && (g_frames % 60 == 0)) nclog("controls: waiting for APK asset/embedded texture decode");
-}
 
 static ImVec2 ctrl_size_px(int i) {
     if (i == NC_CTRL_JOY) {
