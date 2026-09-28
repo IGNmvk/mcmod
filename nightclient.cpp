@@ -3074,10 +3074,10 @@ static void nc_init(void) {
     reg("settings open", "_ZN24SettingsScreenController6onOpenEv", (void *)hook_settings_open, (void **)&g_orig_onOpen);
     reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
-    reg("hide vanilla controls", "_ZNK14TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("armor items (vignette)", "_ZN19HudVignetteRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea", (void *)hook_hud_vignette, (void **)&g_orig_hud_vig);
     reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
+    reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
     reg("inventory render", "_ZN15InventoryScreen6renderEiif", (void *)hook_inventory_render, (void **)&g_orig_inv_render);
