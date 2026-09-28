@@ -1660,8 +1660,6 @@ static void hook_touch_render(void *self, void *ctx) {
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
 
-typedef void (*fn_touch_tick)(void *, void *, int);
-static fn_touch_tick g_orig_touch_tick = 0;
 static void hook_touch_tick(void *self, void *queue, int a) {
     if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
     if (g_orig_touch_tick) g_orig_touch_tick(self, queue, a);
