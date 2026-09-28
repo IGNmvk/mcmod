@@ -49,11 +49,6 @@ extern "C" bool mob_isSprinting(void *self)     __asm__("_ZNK3Mob11isSprintingEv
 extern "C" bool mob_isGliding(void *self)       __asm__("_ZNK3Mob9isGlidingEv");
 extern "C" bool player_isUsingItem(void *self)  __asm__("_ZNK6Player11isUsingItemEv");
 extern "C" void lp_setSprinting(void *self, bool on) __asm__("_ZN11LocalPlayer12setSprintingEb");
-extern "C" void move_setJumping(void *self, bool on) __asm__("_ZN9MoveInput10setJumpingEb");
-extern "C" void mih_setSneakDown(void *self, bool on) __asm__("_ZN16MoveInputHandler12setSneakDownEb");
-extern "C" void mih_updateMoveVector(void *self, float strafe, float forward) __asm__("_ZN16MoveInputHandler17_updateMoveVectorEff");
-extern "C" void cic_attack(void *self, void *ci) __asm__("_ZN20ClientInputCallbacks32handleDestoryOrAttackButtonPressER14ClientInstance");
-extern "C" void cic_interact(void *self, void *ci) __asm__("_ZN20ClientInputCallbacks25handleInteractButtonPressER14ClientInstance");
 extern "C" const void *mob_getArmor(void *self, int slot) __asm__("_ZNK3Mob8getArmorE9ArmorSlot");
 extern "C" bool ii_isNull(const void *it)       __asm__("_ZNK12ItemInstance6isNullEv");
 extern "C" int  ii_getId(const void *it)        __asm__("_ZNK12ItemInstance5getIdEv");
@@ -116,7 +111,6 @@ static int g_qn = 0;
 static void *volatile g_settings_this = 0;   /* the open SettingsScreenController, if any */
 static void *volatile g_pause_this = 0;      /* the open PauseScreenController, if any */
 static volatile double g_inventory_render_time = 0; /* last InventoryScreen render */
-static void *volatile g_chat_this = 0;
 static void *volatile g_cic = 0;             /* ClientInputCallbacks* (captured) */
 static void *volatile g_ci = 0;              /* ClientInstance* (captured) */
 static void *g_apply_self = 0;               /* which gameplay screen instance g_ci was captured for */
@@ -164,8 +158,8 @@ static char *g_kb_text = 0;
 
 /* Forward declaration: the keyboard bridge is above the logger definition. */
 static void nclog(const char *fmt, ...);
+static bool nc_gameplay_input_active();
 static void ctrl_apply_player_actions();
-static void ctrl_prepare_input(void *move_input);
 static void sl_f(const char *label, float *v, float lo, float hi);
 
 typedef jint (*fn_JNI_GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
@@ -443,51 +437,191 @@ static float ctrl_px(float base, float size) {
 static ImVec2 txt(const char *s, float size);
 static void put_text(ImDrawList *dl, ImVec2 p, float size, ImU32 col, const char *s);
 
-/* Control textures are embedded as predecoded RGBA data in nc_controls.h.
- * This uploads them once per GL context; there is no per-frame PNG/JNI work. */
-static const NcControlRgba *ctrl_raw(int i, bool pressed) {
+static const NcControlPng *ctrl_png(int i, bool pressed) {
     switch (i) {
-        case NC_CTRL_ATTACK:   return pressed ? &nc_ctrl_rgba_attack_pressed : &nc_ctrl_rgba_attack;
-        case NC_CTRL_INTERACT: return pressed ? &nc_ctrl_rgba_interact_pressed : &nc_ctrl_rgba_interact;
-        case NC_CTRL_JUMP:     return pressed ? &nc_ctrl_rgba_jump_pressed : &nc_ctrl_rgba_jump;
-        case NC_CTRL_SNEAK:    return pressed ? &nc_ctrl_rgba_sneak_pressed : &nc_ctrl_rgba_sneak;
-        case NC_CTRL_UP:       return pressed ? &nc_ctrl_rgba_flyingascend_pressed : &nc_ctrl_rgba_flyingascend;
-        case NC_CTRL_DOWN:     return pressed ? &nc_ctrl_rgba_flyingdescend_pressed : &nc_ctrl_rgba_flyingdescend;
-        case NC_CTRL_JOY:      return pressed ? &nc_ctrl_rgba_joystick_knob : &nc_ctrl_rgba_joystick_frame;
+        case NC_CTRL_ATTACK:  return pressed ? &nc_ctrl_png_attack_pressed : &nc_ctrl_png_attack;
+        case NC_CTRL_INTERACT:return pressed ? &nc_ctrl_png_interact_pressed : &nc_ctrl_png_interact;
+        case NC_CTRL_JUMP:    return pressed ? &nc_ctrl_png_jump_pressed : &nc_ctrl_png_jump;
+        case NC_CTRL_SNEAK:   return pressed ? &nc_ctrl_png_sneak_pressed : &nc_ctrl_png_sneak;
+        case NC_CTRL_UP:      return pressed ? &nc_ctrl_png_flyingascend_pressed : &nc_ctrl_png_flyingascend;
+        case NC_CTRL_DOWN:    return pressed ? &nc_ctrl_png_flyingdescend_pressed : &nc_ctrl_png_flyingdescend;
         default: return 0;
     }
 }
 
-static bool ctrl_upload_raw_texture(const NcControlRgba *src, GLuint *out) {
-    if (!src || !src->rgba || src->w <= 0 || src->h <= 0 || !out) return false;
+/*
+ * We intentionally keep the PNG bytes embedded in the client, but decode them
+ * with Android's BitmapFactory on first use instead of depending on stb_image.
+ */
+static bool ctrl_decode_bytes_texture(const unsigned char *data, size_t size, GLuint *out) {
+    if (!data || !out || size == 0) return false;
     GLint prev = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return false;
+
+    jclass bf = env->FindClass("android/graphics/BitmapFactory");
+    jclass bitmap_cls = env->FindClass("android/graphics/Bitmap");
+    jclass bos = env->FindClass("java/io/ByteArrayInputStream");
+    if (!bf || !bitmap_cls || !bos) { kb_release(env, attached); return false; }
+
+    jmethodID ctor = env->GetMethodID(bos, "<init>", "([B)V");
+    jmethodID decode = env->GetStaticMethodID(bf, "decodeStream",
+        "(Ljava/io/InputStream;)Landroid/graphics/Bitmap;");
+    jmethodID getW = env->GetMethodID(bitmap_cls, "getWidth", "()I");
+    jmethodID getH = env->GetMethodID(bitmap_cls, "getHeight", "()I");
+    jmethodID copy = env->GetMethodID(bitmap_cls, "copy", "(Landroid/graphics/Bitmap$Config;Z)Landroid/graphics/Bitmap;");
+    if (!ctor || !decode || !getW || !getH || !copy) {
+        kb_release(env, attached); return false;
+    }
+
+    jbyteArray arr = env->NewByteArray((jsize)size);
+    env->SetByteArrayRegion(arr, 0, (jsize)size, (const jbyte *)data);
+    jobject stream = env->NewObject(bos, ctor, arr);
+    jobject bmp = stream ? env->CallStaticObjectMethod(bf, decode, stream) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); bmp = 0; }
+    if (!bmp) {
+        if (arr) env->DeleteLocalRef(arr);
+        if (stream) env->DeleteLocalRef(stream);
+        kb_release(env, attached); return false;
+    }
+
+    jint bw = env->CallIntMethod(bmp, getW);
+    jint bh = env->CallIntMethod(bmp, getH);
+    if (bw <= 0 || bh <= 0) {
+        env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
+        kb_release(env, attached); return false;
+    }
+
+    /* readPixels through Bitmap.copy(ARGB_8888,true), then getPixels() */
+    jclass config_cls = env->FindClass("android/graphics/Bitmap$Config");
+    jfieldID argb = config_cls ? env->GetStaticFieldID(config_cls, "ARGB_8888",
+                                                        "Landroid/graphics/Bitmap$Config;") : 0;
+    jobject cfg = argb ? env->GetStaticObjectField(config_cls, argb) : 0;
+    jobject copybmp = cfg ? env->CallObjectMethod(bmp, copy, cfg, JNI_FALSE) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); copybmp = 0; }
+
+    jmethodID getPixels = env->GetMethodID(bitmap_cls, "getPixels", "([IIIIIII)V");
+    if (!copybmp || !getPixels) {
+        if (copybmp) env->DeleteLocalRef(copybmp);
+        env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
+        if (cfg) env->DeleteLocalRef(cfg); if (config_cls) env->DeleteLocalRef(config_cls);
+        kb_release(env, attached); return false;
+    }
+
+    const int count = bw * bh;
+    jintArray px = env->NewIntArray(count);
+    env->CallVoidMethod(copybmp, getPixels, px, 0, bw, 0, 0, bw, bh);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr); if (cfg) env->DeleteLocalRef(cfg); if(config_cls) env->DeleteLocalRef(config_cls); kb_release(env, attached); return false; }
+
+    jint *pix = env->GetIntArrayElements(px, 0);
+    if (!pix) { env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp); env->DeleteLocalRef(stream); env->DeleteLocalRef(arr); if(cfg) env->DeleteLocalRef(cfg); if(config_cls) env->DeleteLocalRef(config_cls); kb_release(env, attached); return false; }
+
     glGenTextures(1, out);
-    if (!*out) { glBindTexture(GL_TEXTURE_2D, (GLuint)prev); return false; }
     glBindTexture(GL_TEXTURE_2D, *out);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, src->w, src->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, src->rgba);
-    GLenum err = glGetError();
+    std::vector<unsigned char> rgba8((size_t)count * 4);
+    for (int i=0; i<count; ++i) {
+        unsigned int v = (unsigned int)pix[i];
+        rgba8[i*4+0] = (unsigned char)((v >> 16) & 0xff);
+        rgba8[i*4+1] = (unsigned char)((v >> 8) & 0xff);
+        rgba8[i*4+2] = (unsigned char)(v & 0xff);
+        rgba8[i*4+3] = (unsigned char)((v >> 24) & 0xff);
+    }
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
     glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
-    return err == GL_NO_ERROR;
+
+    env->ReleaseIntArrayElements(px, pix, JNI_ABORT);
+    env->DeleteLocalRef(px); env->DeleteLocalRef(copybmp); env->DeleteLocalRef(bmp);
+    env->DeleteLocalRef(stream); env->DeleteLocalRef(arr);
+    if (cfg) env->DeleteLocalRef(cfg); if (config_cls) env->DeleteLocalRef(config_cls);
+    kb_release(env, attached);
+    return true;
 }
 
-static void ctrl_init_textures() {
-    if (g_ctrl_assets_ready) return;
-    bool ok = true;
-    for (int i = 0; i < NC_CTRL_COUNT; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            if (g_ctrl_tex[i][j]) continue;
-            const NcControlRgba *src = ctrl_raw(i, j != 0);
-            if (!ctrl_upload_raw_texture(src, &g_ctrl_tex[i][j])) ok = false;
+
+static jobject ctrl_get_asset_manager_java() {
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return 0;
+    if (g_ctrl_asset_mgr_java) {
+        jobject out = env->NewLocalRef(g_ctrl_asset_mgr_java);
+        kb_release(env, attached);
+        return out;
+    }
+    bool activity_global = false;
+    jobject activity = 0;
+    if (g_kb_activity) activity = env->NewLocalRef(g_kb_activity);
+    else { activity = kb_find_activity(env); activity_global = activity != 0; }
+    if (!activity) { kb_release(env, attached); return 0; }
+    jclass ac = env->GetObjectClass(activity);
+    jmethodID getAssets = ac ? env->GetMethodID(ac, "getAssets", "()Landroid/content/res/AssetManager;") : 0;
+    jobject am = getAssets ? env->CallObjectMethod(activity, getAssets) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); am = 0; }
+    if (am) g_ctrl_asset_mgr_java = env->NewGlobalRef(am);
+    if (am) env->DeleteLocalRef(am);
+    if (ac) env->DeleteLocalRef(ac);
+    if (activity_global) env->DeleteGlobalRef(activity);
+    else env->DeleteLocalRef(activity);
+    jobject out = g_ctrl_asset_mgr_java ? env->NewLocalRef(g_ctrl_asset_mgr_java) : 0;
+    kb_release(env, attached);
+    return out;
+}
+
+static bool ctrl_decode_asset_texture(const char *path, GLuint *out) {
+    if (!path || !out) return false;
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return false;
+    jobject am = ctrl_get_asset_manager_java();
+    if (!am) { kb_release(env, attached); return false; }
+    jclass amCls = env->GetObjectClass(am);
+    jmethodID open = amCls ? env->GetMethodID(amCls, "open", "(Ljava/lang/String;I)Ljava/io/InputStream;") : 0;
+    jstring jpath = env->NewStringUTF(path);
+    jobject stream = open ? env->CallObjectMethod(am, open, jpath, 0) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); stream = 0; }
+    if (jpath) env->DeleteLocalRef(jpath);
+    if (!stream) { if (amCls) env->DeleteLocalRef(amCls); env->DeleteLocalRef(am); kb_release(env, attached); return false; }
+    jclass inCls = env->GetObjectClass(stream);
+    jmethodID available = inCls ? env->GetMethodID(inCls, "available", "()I") : 0;
+    jmethodID read = inCls ? env->GetMethodID(inCls, "read", "([BII)I") : 0;
+    int len = available ? env->CallIntMethod(stream, available) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); len = 0; }
+    bool ok = false;
+    if (len > 0 && len < (1 << 20) && read) {
+        jbyteArray arr = env->NewByteArray(len);
+        if (arr) {
+            jint n = env->CallIntMethod(stream, read, arr, 0, len);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); n = -1; }
+            if (n > 0) {
+                jbyte *bytes = env->GetByteArrayElements(arr, 0);
+                if (bytes) {
+                    ok = ctrl_decode_bytes_texture((const unsigned char *)bytes, (size_t)n, out);
+                    env->ReleaseByteArrayElements(arr, bytes, JNI_ABORT);
+                }
+            }
+            env->DeleteLocalRef(arr);
         }
     }
-    g_ctrl_assets_ready = ok;
-    if (ok) nclog("controls: raw embedded textures uploaded");
-    else if (g_frames % 120 == 0) nclog("controls: raw texture upload failed");
+    jclass closeCls = env->GetObjectClass(stream);
+    jmethodID close = closeCls ? env->GetMethodID(closeCls, "close", "()V") : 0;
+    if (close) env->CallVoidMethod(stream, close);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (closeCls) env->DeleteLocalRef(closeCls);
+    if (inCls) env->DeleteLocalRef(inCls);
+    env->DeleteLocalRef(stream);
+    if (amCls) env->DeleteLocalRef(amCls);
+    env->DeleteLocalRef(am);
+    kb_release(env, attached);
+    return ok;
+}
+
+static bool ctrl_decode_png_texture(const NcControlPng *png, GLuint *out) {
+    return png && ctrl_decode_bytes_texture(png->data, png->size, out);
 }
 
 
@@ -528,9 +662,6 @@ typedef int   (*fn_ptr)(void *, void *, void *, int);
 typedef bool  (*fn_getb)(void *);
 typedef int   (*fn_geti)(void *);
 typedef void  (*fn_entity_render)(void *, void *, const void *, float, float);
-typedef void  (*fn_move_vector)(void *, float, float);
-typedef void  (*fn_touch_tick)(void *, void *, int);
-typedef void  (*fn_ui_draw)(void *);
 static fn_this  g_orig_onOpen = 0, g_orig_dtor = 0;
 static fn_tick  g_orig_tick = 0;
 static fn_apply g_orig_apply = 0;
@@ -540,9 +671,6 @@ static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0;
 static fn_geti  g_orig_view = 0;
 static fn_entity_render g_orig_entity_render = 0;
-static fn_move_vector g_orig_move_vector = 0;
-static fn_touch_tick g_orig_touch_tick = 0;
-static fn_ui_draw g_orig_input_ui = 0;
 static fn_entity_render g_orig_xp_render = 0;
 static fn_entity_render g_orig_crystal_render = 0;
 static fn_entity_render g_orig_crystal_effects = 0;
@@ -667,20 +795,6 @@ static void hook_pause_dtor(void *self) {
     if (g_orig_pausedtor) g_orig_pausedtor(self);
 }
 
-typedef void (*fn_chatopen)(void *);
-static fn_chatopen g_orig_chat_open = 0;
-static fn_this g_orig_chat_dtor = 0;
-static void hook_chat_open(void *self) {
-    if (g_orig_chat_open) g_orig_chat_open(self);
-    g_chat_this = self;
-    ctrl_reset_states();
-    nclog("chat screen opened");
-}
-static void hook_chat_dtor(void *self) {
-    if (self == g_chat_this) { g_chat_this = 0; ctrl_reset_states(); nclog("chat screen closed"); }
-    if (g_orig_chat_dtor) g_orig_chat_dtor(self);
-}
-
 /* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
 static void hook_apply(void *self, float dt) {
     g_play_time = now_s();
@@ -732,7 +846,6 @@ static void snapshot_totem_state(void *player) {
 }
 
 static void hook_tick(void *self, void *player) {
-    ctrl_prepare_input(self);
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
     g_local_player = player;
@@ -795,15 +908,9 @@ static void hook_tick(void *self, void *player) {
                        &g_snap.offhand_dur, &g_snap.offhand_max);
     snapshot_totem_state(player);
     if (g_cfg.controls_mode == 1) ctrl_apply_player_actions();
-    if (g_cfg.autosprint && g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
-        static bool nc_gameplay_input_active();
-        if (g_ctrl_joy_id >= 0 && g_ctrl_joy_y < -0.55f && !mob_isSneaking(player) &&
-            !player_isUsingItem(player) && !mob_isSprinting(player))
-            lp_setSprinting(player, true);
-    } else if (g_cfg.autosprint && mih_isMovingForward(self) && !mob_isSneaking(player) &&
-               !player_isUsingItem(player) && !mob_isSprinting(player)) {
+    if (g_cfg.autosprint && mih_isMovingForward(self) && !mob_isSneaking(player) &&
+        !player_isUsingItem(player) && !mob_isSprinting(player))
         lp_setSprinting(player, true);
-    }
 }
 
 /* No hurt cam */
@@ -1350,7 +1457,9 @@ static void combat_consider_entity(void *entity, float partial) {
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
-    if (g_cfg.hitbox_on && entity && pos && entity != g_local_player)
+    if (g_cfg.combat_crosshair_on)
+        combat_consider_entity(entity, partial);
+    if (g_cfg.hitbox_on && entity && pos)
         hit_draw_entity(entity, (const float *)pos, partial);
 }
 
@@ -1413,6 +1522,33 @@ static int  hook_view(void *s) {
     return v;
 }
 
+
+static void ctrl_init_textures() {
+    if (g_ctrl_assets_ready) return;
+    bool ok = true;
+    const char *paths[NC_CTRL_COUNT][2] = {
+        {"controls/joystick_frame.png", "controls/joystick_knob.png"},
+        {"controls/attack.png", "controls/attack_pressed.png"},
+        {"controls/interact.png", "controls/interact_pressed.png"},
+        {"controls/jump.png", "controls/jump_pressed.png"},
+        {"controls/sneak.png", "controls/sneak_pressed.png"},
+        {"controls/flyingascend.png", "controls/flyingascend_pressed.png"},
+        {"controls/flyingdescend.png", "controls/flyingdescend_pressed.png"}
+    };
+    for (int i=0; i<NC_CTRL_COUNT; ++i) {
+        for (int j=0; j<2; ++j) {
+            if (g_ctrl_tex[i][j]) continue;
+            bool loaded = ctrl_decode_asset_texture(paths[i][j], &g_ctrl_tex[i][j]);
+            if (!loaded) {
+                const NcControlPng *fallback = ctrl_png(i, j != 0);
+                loaded = fallback && ctrl_decode_png_texture(fallback, &g_ctrl_tex[i][j]);
+            }
+            if (!loaded) ok = false;
+        }
+    }
+    g_ctrl_assets_ready = ok;
+    if (!ok && (g_frames % 60 == 0)) nclog("controls: waiting for APK asset/embedded texture decode");
+}
 
 static ImVec2 ctrl_size_px(int i) {
     if (i == NC_CTRL_JOY) {
@@ -1491,12 +1627,11 @@ static void ctrl_build_rects(float w, float h) {
  * never feed movement/actions while one of those screens is on top. */
 static bool nc_gameplay_input_active() {
     const double now = now_s();
-    const bool world_tick = (now - g_tick_time) < 0.60;
+    const bool play = (now - g_play_time) < 0.35;
     const bool pause = (g_pause_this != 0);
     const bool settings = (g_settings_this != 0);
     const bool inventory = (now - g_inventory_render_time) < 0.35;
-    const bool chat = (g_chat_this != 0);
-    return world_tick && g_local_player && !pause && !settings && !inventory && !chat && !g_menu_open && !g_edit;
+    return play && !pause && !settings && !inventory && !g_menu_open && !g_edit;
 }
 
 static void ctrl_apply_player_actions() {
@@ -1504,53 +1639,79 @@ static void ctrl_apply_player_actions() {
         if (!nc_gameplay_input_active()) ctrl_reset_states();
         return;
     }
+
+    /* Jump/sneak: use the game's own methods. */
+    static bool resolved = false;
+    static void (*jump_fn)(void*) = 0;
+    static void (*sneak_fn)(void*, bool) = 0;
+    static void (*attack_fn)(void*, void*) = 0;
+    static void (*interact_fn)(void*, void*) = 0;
+    static void (*move_fn)(void*, const NcVec3*) = 0;
+    static bool (*ground_fn)(void*) = 0;
+    static double last_jump = 0.0;
+
+    if (!resolved) {
+        resolved = true;
+        jump_fn = (void(*)(void*))dlsym(RTLD_DEFAULT, "_ZN11LocalPlayer14jumpFromGroundEv");
+        if (!jump_fn) jump_fn = (void(*)(void*))dlsym(RTLD_DEFAULT, "_ZN3Mob14jumpFromGroundEv");
+        ground_fn = (bool(*)(void*))dlsym(RTLD_DEFAULT, "_ZNK6Entity11isOnGroundEv");
+        sneak_fn = (void(*)(void*, bool))dlsym(RTLD_DEFAULT, "_ZN3Mob11setSneakingEb");
+
+        /* Best-effort movement/action bridges. These are looked up dynamically so
+         * an unavailable overload does not make the client fail to load. */
+        attack_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks23handleAttackButtonPressER14ClientInstance");
+        if (!attack_fn) attack_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks24handleAttackButtonPressER14ClientInstance");
+        interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks25handleInteractButtonPressER14ClientInstance");
+        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks26handleInteractButtonPressER14ClientInstance");
+        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks22handleBuildButtonPressER14ClientInstance");
+        if (!interact_fn) interact_fn = (void(*)(void*, void*))dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks23handleBuildButtonPressER14ClientInstance");
+        nclog("new controls symbols: jump=%p ground=%p sneak=%p attack=%p interact=%p move=%p",
+              (void*)jump_fn, (void*)ground_fn, (void*)sneak_fn, (void*)attack_fn, (void*)interact_fn, (void*)move_fn);
+
+        /* Fallback movement bridge for builds exposing Mob/LocalPlayer::lerpMotion.
+         * The joystick is converted into camera-relative horizontal motion. */
+        move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN3Mob10lerpMotionERK4Vec3");
+        if (!move_fn) move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN11LocalPlayer10lerpMotionERK4Vec3");
+        if (!move_fn) move_fn = (void(*)(void*, const NcVec3*))dlsym(RTLD_DEFAULT, "_ZN6Entity10lerpMotionERK4Vec3");
+    }
+
+    const double tnow = now_s();
+    if (g_ctrl_pressed[NC_CTRL_JUMP]) {
+        bool can_jump = ground_fn ? ground_fn(g_local_player) : ((tnow - last_jump) > 0.80);
+        if (can_jump && jump_fn && (tnow - last_jump) > 0.08) {
+            jump_fn(g_local_player);
+            last_jump = tnow;
+        }
+    }
+    if (sneak_fn) sneak_fn(g_local_player, g_ctrl_pressed[NC_CTRL_SNEAK] != 0);
+
     if (g_cic && g_ci) {
-        if (g_ctrl_pressed[NC_CTRL_ATTACK]) cic_attack(g_cic, g_ci);
-        if (g_ctrl_pressed[NC_CTRL_INTERACT]) cic_interact(g_cic, g_ci);
+        if (g_ctrl_pressed[NC_CTRL_ATTACK] && attack_fn) attack_fn(g_cic, g_ci);
+        if (g_ctrl_pressed[NC_CTRL_INTERACT] && interact_fn) interact_fn(g_cic, g_ci);
     }
-    if (g_ctrl_joy_id >= 0 && !mob_isSneaking(g_local_player) && !player_isUsingItem(g_local_player)) {
-        const float forward = -g_ctrl_joy_y;
-        if (forward > 0.55f && !mob_isSprinting(g_local_player)) lp_setSprinting(g_local_player, true);
+
+    if (move_fn && g_ctrl_joy_id >= 0) {
+        const float dead = 0.12f;
+        float sx = fabsf(g_ctrl_joy_x) < dead ? 0.0f : g_ctrl_joy_x;
+        float sy = fabsf(g_ctrl_joy_y) < dead ? 0.0f : g_ctrl_joy_y;
+        if (sx != 0.0f || sy != 0.0f) {
+            NcVec2 rot = {0.0f, 0.0f};
+            entity_getRotation(&rot, g_local_player);
+            const float r = rot.y * 0.01745329251994329577f;
+            const float sn = sinf(r), cs = cosf(r);
+            /* joystick Y is screen-down, so invert it for forward. */
+            const float fwd = -sy;
+            const bool sprint = (fwd > 0.60f && !mob_isSneaking(g_local_player) && !player_isUsingItem(g_local_player));
+            lp_setSprinting(g_local_player, sprint);
+            const float speed = sprint ? 0.13f : 0.10f;
+            NcVec3 mv;
+            mv.x = (-sn * fwd - cs * sx) * speed;
+            mv.y = 0.0f;
+            mv.z = ( cs * fwd - sn * sx) * speed;
+            move_fn(g_local_player, &mv);
+        }
     }
 }
-
-static void ctrl_prepare_input(void *move_input) {
-    if (!move_input) return;
-    const bool active = (g_cfg.controls_mode == 1 && nc_gameplay_input_active());
-    if (!active) { ctrl_reset_states(); return; }
-    float strafe = fabsf(g_ctrl_joy_x) < 0.08f ? 0.0f : clampf(g_ctrl_joy_x, -1.0f, 1.0f);
-    float forward = fabsf(g_ctrl_joy_y) < 0.08f ? 0.0f : clampf(-g_ctrl_joy_y, -1.0f, 1.0f);
-    float mag = sqrtf(strafe * strafe + forward * forward);
-    if (mag > 1.0f) { strafe /= mag; forward /= mag; }
-    mih_updateMoveVector(move_input, strafe, forward);
-    move_setJumping(move_input, g_ctrl_pressed[NC_CTRL_JUMP] != 0);
-    mih_setSneakDown(move_input, g_ctrl_pressed[NC_CTRL_SNEAK] != 0);
-}
-
-static void hook_move_vector(void *self, float a, float b) {
-    if (!g_orig_move_vector) return;
-    if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
-        const float dead = 0.08f;
-        float strafe = fabsf(g_ctrl_joy_x) < dead ? 0.0f : clampf(g_ctrl_joy_x, -1.0f, 1.0f);
-        float forward = fabsf(g_ctrl_joy_y) < dead ? 0.0f : clampf(-g_ctrl_joy_y, -1.0f, 1.0f);
-        float mag = sqrtf(strafe * strafe + forward * forward);
-        if (mag > 1.0f) { strafe /= mag; forward /= mag; }
-        g_orig_move_vector(self, strafe, forward);
-        return;
-    }
-    g_orig_move_vector(self, a, b);
-}
-
-static void hook_touch_control_tick(void *self, void *queue, int tick) {
-    if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
-    if (g_orig_touch_tick) g_orig_touch_tick(self, queue, tick);
-}
-
-static void hook_input_ui(void *self) {
-    if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
-    if (g_orig_input_ui) g_orig_input_ui(self);
-}
-
 static void ctrl_consume_touch(int action, int id, float x, float y) {
     if (g_cfg.controls_mode != 1) return;
     if (action == NC_EV_DOWN) {
@@ -1617,37 +1778,41 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                 m.y[i] = AMotionEvent_getY(ev, (size_t)i);
             }
             if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
+                bool claimed = false;
                 int idx = (m.idx >= 0 && m.idx < m.count) ? m.idx : 0;
                 int evt = (m.action == AMOTION_EVENT_ACTION_DOWN || m.action == AMOTION_EVENT_ACTION_POINTER_DOWN) ? NC_EV_DOWN :
                           ((m.action == AMOTION_EVENT_ACTION_UP || m.action == AMOTION_EVENT_ACTION_POINTER_UP || m.action == AMOTION_EVENT_ACTION_CANCEL) ? NC_EV_UP : NC_EV_MOVE);
                 if (evt == NC_EV_DOWN) {
-                    if (idx >= 0 && idx < m.count) ctrl_consume_touch(NC_EV_DOWN, m.id[idx], m.x[idx], m.y[idx]);
-                } else if (evt == NC_EV_MOVE) {
-                    for (int pi = 0; pi < m.count; ++pi) {
-                        bool owned = false;
-                        for (int ci = 0; ci < NC_CTRL_COUNT; ++ci) {
-                            if (g_ctrl_ids[ci] == m.id[pi]) { owned = true; break; }
-                        }
-                        if (owned || g_ctrl_joy_id == m.id[pi])
-                            ctrl_consume_touch(NC_EV_MOVE, m.id[pi], m.x[pi], m.y[pi]);
+                    for (int ci=0; ci<NC_CTRL_COUNT; ++ci) {
+                        if (ctrl_point_in(g_ctrl_rects[ci], m.x[idx], m.y[idx])) { claimed = true; break; }
                     }
-                } else if (evt == NC_EV_UP) {
-                    if (idx >= 0 && idx < m.count) ctrl_consume_touch(NC_EV_UP, m.id[idx], m.x[idx], m.y[idx]);
+                    if (claimed) ctrl_consume_touch(NC_EV_DOWN, m.id[idx], m.x[idx], m.y[idx]);
+                } else if (evt == NC_EV_MOVE) {
+                    for (int pi=0; pi<m.count; ++pi) {
+                        bool owned = false;
+                        for (int ci=0; ci<NC_CTRL_COUNT; ++ci) if (g_ctrl_ids[ci] == m.id[pi]) { owned = true; break; }
+                        if (owned || g_ctrl_joy_id == m.id[pi]) {
+                            ctrl_consume_touch(NC_EV_MOVE, m.id[pi], m.x[pi], m.y[pi]);
+                            claimed = true;
+                        }
+                    }
+                } else {
+                    if (idx >= 0 && idx < m.count) {
+                        for (int ci=0; ci<NC_CTRL_COUNT; ++ci) if (g_ctrl_ids[ci] == m.id[idx]) { claimed = true; break; }
+                        if (g_ctrl_joy_id == m.id[idx]) claimed = true;
+                        if (claimed) ctrl_consume_touch(NC_EV_UP, m.id[idx], m.x[idx], m.y[idx]);
+                    }
                     if (m.action == AMOTION_EVENT_ACTION_CANCEL) ctrl_reset_states();
                 }
-                /* Do NOT finish/swallow this MotionEvent. The camera/look input needs
-                 * the same multitouch stream; TouchControlSet itself is disabled by
-                 * hook_touch_control_tick() while New mode is active. */
+                if (claimed) { AInputQueue_finishEvent(q, ev, 1); continue; }
             }
-            if (!(g_cfg.controls_mode == 1 && nc_gameplay_input_active())) {
-                pthread_mutex_lock(&g_mu);
-                int swallow = nc_touch_event(&g_touch, &m, push_ev, 0);
-                pthread_mutex_unlock(&g_mu);
-                if (swallow) {
-                    if (g_touch_logged < 6) { g_touch_logged++; nclog("touch taken: action=%d", m.action); }
-                    AInputQueue_finishEvent(q, ev, 1);
-                    continue;
-                }
+            pthread_mutex_lock(&g_mu);
+            int swallow = nc_touch_event(&g_touch, &m, push_ev, 0);
+            pthread_mutex_unlock(&g_mu);
+            if (swallow) {
+                if (g_touch_logged < 6) { g_touch_logged++; nclog("touch taken: action=%d", m.action); }
+                AInputQueue_finishEvent(q, ev, 1);
+                continue;
             }
         }
         return r;
@@ -2136,25 +2301,6 @@ static ImVec2 elem_size(int e) {
 }
 
 
-extern "C" void *entity_getLevel(void *self) __asm__("_ZN6Entity8getLevelEv");
-extern "C" void *level_getHitResult(void *self) __asm__("_ZN5Level12getHitResultEv");
-
-static void combat_update_from_game() {
-    g_snap.combat_target = 0;
-    g_snap.combat_target_until = 0.0;
-    if (!g_cfg.combat_crosshair_on || !g_local_player) return;
-    void *level = entity_getLevel(g_local_player);
-    if (!level) return;
-    unsigned char *hr = (unsigned char *)level_getHitResult(level);
-    if (!hr) return;
-    int type = *(int *)(hr + 0x00);
-    void *target = *(void **)(hr + 0x20);
-    if (type == 1 && target && target != g_local_player) {
-        g_snap.combat_target = 1;
-        g_snap.combat_target_until = now_s() + 0.12;
-    }
-}
-
 static void draw_combat_crosshair(ImDrawList *dl, float w, float h) {
     if (!g_cfg.combat_crosshair_on || !g_snap.combat_target) return;
     if (g_snap.combat_target_until > 0.0 && now_s() > g_snap.combat_target_until) return;
@@ -2579,7 +2725,8 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool inventory_open = (now - g_inventory_render_time) < 0.35;
     bool menu_reach  = in_settings || in_pause;                 /* N button appears in either */
     bool in_world = (now - g_tick_time) < 0.6;
-    bool gameplay_hud = in_world && !in_settings && !in_pause && !inventory_open && !g_chat_this;
+    bool play_hud = (now - g_play_time) < 0.35;
+    bool gameplay_hud = play_hud && !in_settings && !in_pause && !inventory_open;
     if (!menu_reach) { g_menu_open = false; g_edit = false; g_edit_target = -1; kb_stop(); }
     if (g_cfg.controls_mode != 1 || !gameplay_hud) ctrl_reset_states();
 
@@ -2607,7 +2754,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
-              g_pause_this != 0, (int)in_world, (int)g_hud_visible, (int)g_menu_open, fps);
+              g_pause_this != 0, (int)in_world, (int)gameplay_hud, (int)g_menu_open, fps);
     }
     if (need && !g_drawing_logged) { g_drawing_logged = true; nclog("drawing started"); }
 
@@ -2707,10 +2854,8 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
                           false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col, &hud[3]))
                 fast_totem_move();
         }
-        if (in_world && !g_menu_open) {
-            combat_update_from_game();
+        if (in_world && !g_menu_open)
             draw_combat_crosshair(fg, (float)w, (float)h);
-        }
         if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
             if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, button_text(E_N),
@@ -2812,11 +2957,6 @@ static void nc_init(void) {
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
     reg("inventory render", "_ZN15InventoryScreen6renderEiif", (void *)hook_inventory_render, (void **)&g_orig_inv_render);
     reg("inventory tick fallback", "_ZN15InventoryScreen4tickEv", (void *)hook_inventory_tick, (void **)&g_orig_inv_tick);
-    reg("chat open", "_ZN20ChatScreenController6onOpenEv", (void *)hook_chat_open, (void **)&g_orig_chat_open);
-    reg("chat close", "_ZN20ChatScreenControllerD2Ev", (void *)hook_chat_dtor, (void **)&g_orig_chat_dtor);
-    reg("native move vector", "_ZN16MoveInputHandler17_updateMoveVectorEff", (void *)hook_move_vector, (void **)&g_orig_move_vector);
-    reg("native touch controls tick", "_ZN15TouchControlSet4tickER15InputEventQueuei", (void *)hook_touch_control_tick, (void **)&g_orig_touch_tick);
-    reg("native control UI", "_ZN12GameRenderer20_checkAndDrawInputUIEv", (void *)hook_input_ui, (void **)&g_orig_input_ui);
 
     /* per mod: can be switched off in config.txt (hook_x=0) if one of them ever crashes the game */
     if (g_cfg.hook_hurt)  reg("no hurt cam", "_ZN19LevelRendererPlayer7bobHurtER6Matrixf", (void *)hook_bobhurt, (void **)&g_orig_bob);
