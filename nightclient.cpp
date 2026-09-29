@@ -394,7 +394,8 @@ enum {
 
 static volatile int g_ctrl_pressed[NC_CTRL_COUNT] = {0};
 static volatile int g_ctrl_flying = 0;      /* local player is flying (Creative): jump/sneak become fly up/down */
-static int g_ctrl_internal = 0;             /* >0 while WE call the game's attack/interact callbacks */
+static int g_ctrl_internal = 0;
+static volatile int g_ctrl_mining_ours = 0;   /* true for the whole time OUR Attack button is held */             /* >0 while WE call the game's attack/interact callbacks */
 static volatile int g_ctrl_touch_id = -1;
 static volatile int g_ctrl_joy_id = -1;
 static volatile int g_ctrl_ids[NC_CTRL_COUNT] = {-1,-1,-1,-1,-1,-1,-1};
@@ -847,19 +848,30 @@ static void hook_build_action(void *self, void *ci, void *intention) {
     if (g_orig_build_action) g_orig_build_action(self, ci, intention);
 }
 
-/* Plain screen taps that hold-to-mine call this SAME function our own Attack
- * button calls (confirmed: it's the exact symbol attack_press dlsym's to
- * above). g_ctrl_internal marks the window where WE are the caller, so only
- * the game's own gesture-triggered calls get blocked. */
-typedef void (*fn_destroy_or_attack)(void *, void *);
-static fn_destroy_or_attack g_orig_destroy_or_attack = 0;
+/* Plain screen taps that hold-to-mine don't go through the button-press
+ * callback at all (that's edge-triggered, meant for an actual UI button) -
+ * they call these two GameMode functions directly, every tick, for as long
+ * as the world is tapped. Block them unless OUR Attack button is the reason
+ * mining is happening - g_ctrl_mining_ours stays true the whole time it's
+ * held, unlike the single-call g_ctrl_internal flag above. */
+typedef void (*fn_start_destroy)(void *, void *, void *, signed char, bool *);
+typedef void (*fn_continue_destroy)(void *, void *, void *, signed char, bool *);
+static fn_start_destroy    g_orig_start_destroy = 0;
+static fn_continue_destroy g_orig_continue_destroy = 0;
 static int g_mine_block_logged = 0;
-static void hook_destroy_or_attack(void *self, void *ci) {
-    if (g_cfg.controls_mode == 1 && g_ctrl_internal == 0 && nc_gameplay_input_active()) {
-        if (g_mine_block_logged < 8) { g_mine_block_logged++; nclog("tap blocked (handleDestoryOrAttackButtonPress)"); }
+static bool ctrl_should_block_mining() {
+    return g_cfg.controls_mode == 1 && !g_ctrl_mining_ours && nc_gameplay_input_active();
+}
+static void hook_start_destroy(void *self, void *player, void *pos, signed char face, bool *out) {
+    if (ctrl_should_block_mining()) {
+        if (g_mine_block_logged < 8) { g_mine_block_logged++; nclog("tap blocked (startDestroyBlock)"); }
         return;
     }
-    if (g_orig_destroy_or_attack) g_orig_destroy_or_attack(self, ci);
+    if (g_orig_start_destroy) g_orig_start_destroy(self, player, pos, face, out);
+}
+static void hook_continue_destroy(void *self, void *player, void *pos, signed char face, bool *out) {
+    if (ctrl_should_block_mining()) return;
+    if (g_orig_continue_destroy) g_orig_continue_destroy(self, player, pos, face, out);
 }
 
 /* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
@@ -1736,6 +1748,7 @@ static void ctrl_apply_player_actions() {
     }
 
     const int cur_attack = g_ctrl_pressed[NC_CTRL_ATTACK] ? 1 : 0;
+    g_ctrl_mining_ours = cur_attack;
     const int cur_interact = g_ctrl_pressed[NC_CTRL_INTERACT] ? 1 : 0;
     if (g_cic && g_ci) {
         g_ctrl_internal++;            /* let our own calls through the tap blocker */
@@ -3127,7 +3140,8 @@ static void nc_init(void) {
     reg("armor items (vignette)", "_ZN19HudVignetteRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea", (void *)hook_hud_vignette, (void **)&g_orig_hud_vig);
     reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
-    reg("tap blocker (mining)", "_ZN20ClientInputCallbacks32handleDestoryOrAttackButtonPressER14ClientInstance", (void *)hook_destroy_or_attack, (void **)&g_orig_destroy_or_attack);
+    reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
+    reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
