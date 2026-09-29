@@ -464,7 +464,7 @@ static void ctrl_prepare_input(void *h) {
      * fields found by diagnostic logging on 2026-09 (not guessed): these are
      * read WHILE tick() computes movement, same as the raw joystick above, so
      * they must be set before tick() runs, not after. Jump/Sneak while flying
-     * are guesses at which is which - swap the FLY_A_*/FLY_B_* assignment
+     * are guesses at which is which - swap the FLY_A vs FLY_B assignment
      * below if up/down come out backwards. */
     if (g_ctrl_flying) {
         const bool up = g_ctrl_pressed[NC_CTRL_JUMP];
