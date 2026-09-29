@@ -177,20 +177,7 @@ static void nclog(const char *fmt, ...);
 static bool nc_gameplay_input_active();
 static volatile double g_touch_render_time = 0;  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
 static void ctrl_apply_player_actions();
-static void ctrl_set_joy_from_touch(const NcRect &r, float x, float y) {
-    float jx = (x - (r.x + r.w * 0.5f)) / (r.w * 0.5f);
-    float jy = (y - (r.y + r.h * 0.5f)) / (r.h * 0.5f);
-    const float mag = sqrtf(jx * jx + jy * jy);
-    if (mag > 1.0f) { jx /= mag; jy /= mag; }   /* clamp to the circle, not the square */
-    /* Snap near an axis to a clean straight line - real joysticks rarely land
-     * on EXACTLY 0, and a hair of unintended strafe reads as "sideways feels
-     * weird" even when you meant to walk straight. */
-    const float snap = 0.06f;
-    if (fabsf(jx) < snap) jx = 0.0f;
-    if (fabsf(jy) < snap) jy = 0.0f;
-    g_ctrl_joy_x = jx;
-    g_ctrl_joy_y = jy;
-}
+
 static void sl_f(const char *label, float *v, float lo, float hi);
 
 typedef jint (*fn_JNI_GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
@@ -416,6 +403,20 @@ static volatile int g_ctrl_joy_id = -1;
 static volatile int g_ctrl_ids[NC_CTRL_COUNT] = {-1,-1,-1,-1,-1,-1,-1};
 static volatile float g_ctrl_joy_x = 0.0f;
 static volatile float g_ctrl_joy_y = 0.0f;
+static void ctrl_set_joy_from_touch(const NcRect &r, float x, float y) {
+    float jx = (x - (r.x + r.w * 0.5f)) / (r.w * 0.5f);
+    float jy = (y - (r.y + r.h * 0.5f)) / (r.h * 0.5f);
+    const float mag = sqrtf(jx * jx + jy * jy);
+    if (mag > 1.0f) { jx /= mag; jy /= mag; }   /* clamp to the circle, not the square */
+    /* Snap near an axis to a clean straight line - real joysticks rarely land
+     * on EXACTLY 0, and a hair of unintended strafe reads as "sideways feels
+     * weird" even when you meant to walk straight. */
+    const float snap = 0.06f;
+    if (fabsf(jx) < snap) jx = 0.0f;
+    if (fabsf(jy) < snap) jy = 0.0f;
+    g_ctrl_joy_x = jx;
+    g_ctrl_joy_y = jy;
+}
 static NcRect g_ctrl_rects[NC_CTRL_COUNT];
 static bool g_ctrl_assets_ready = false;
 static jobject g_ctrl_asset_mgr_java = 0;
