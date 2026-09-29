@@ -847,6 +847,21 @@ static void hook_build_action(void *self, void *ci, void *intention) {
     if (g_orig_build_action) g_orig_build_action(self, ci, intention);
 }
 
+/* Plain screen taps that hold-to-mine call this SAME function our own Attack
+ * button calls (confirmed: it's the exact symbol attack_press dlsym's to
+ * above). g_ctrl_internal marks the window where WE are the caller, so only
+ * the game's own gesture-triggered calls get blocked. */
+typedef void (*fn_destroy_or_attack)(void *, void *);
+static fn_destroy_or_attack g_orig_destroy_or_attack = 0;
+static int g_mine_block_logged = 0;
+static void hook_destroy_or_attack(void *self, void *ci) {
+    if (g_cfg.controls_mode == 1 && g_ctrl_internal == 0 && nc_gameplay_input_active()) {
+        if (g_mine_block_logged < 8) { g_mine_block_logged++; nclog("tap blocked (handleDestoryOrAttackButtonPress)"); }
+        return;
+    }
+    if (g_orig_destroy_or_attack) g_orig_destroy_or_attack(self, ci);
+}
+
 /* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
 static void hook_apply(void *self, float dt) {
     g_play_time = now_s();
@@ -3112,6 +3127,7 @@ static void nc_init(void) {
     reg("armor items (vignette)", "_ZN19HudVignetteRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea", (void *)hook_hud_vignette, (void **)&g_orig_hud_vig);
     reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
+    reg("tap blocker (mining)", "_ZN20ClientInputCallbacks32handleDestoryOrAttackButtonPressER14ClientInstance", (void *)hook_destroy_or_attack, (void **)&g_orig_destroy_or_attack);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
