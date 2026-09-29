@@ -1573,22 +1573,17 @@ static void combat_consider_entity(void *entity, float partial) {
     }
     g_snap.combat_target_until = now_s() + 0.045;
 }
-/* 0 = first person, 1/2 = third person (back/front) - checked in Options,
- * not guessed from a fixed offset. */
-static bool ctrl_in_third_person() {
-    if (!g_ci) return false;
-    void *opt = ci_getOptions(g_ci);
-    return opt && options_getPerspective(opt) != 0;
-}
-
+/* REVERTED (2026-09): crashed on switching to third person. +0x104 was only
+ * ever confirmed as Entity::bb's offset on OTHER entities (networked
+ * players/mobs) - LocalPlayer is almost certainly a larger, different class
+ * (extra input/camera state) where that same offset likely lands somewhere
+ * else entirely. Needs LocalPlayer's real layout confirmed before trying
+ * this again, not another guess. */
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
-    if (!g_cfg.hitbox_on || !entity || !pos) return;
-    /* The player's own hitbox only makes sense in third person - in first
-     * person the box would surround the camera itself. */
-    if (entity == g_local_player && !ctrl_in_third_person()) return;
-    hit_draw_entity(entity, (const float *)pos, partial);
+    if (g_cfg.hitbox_on && entity && pos && entity != g_local_player)
+        hit_draw_entity(entity, (const float *)pos, partial);
 }
 
 
