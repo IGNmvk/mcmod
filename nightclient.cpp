@@ -460,38 +460,31 @@ static void ctrl_prepare_input(void *h) {
 #endif
     *mi_f(h, NC_MI_RAW_X) = sx;
     *mi_f(h, NC_MI_RAW_Y) = sy;
-    /* The game itself treats held Sneak as fly-down while flying, but it reads
-     * this flag WHILE it computes movement inside tick() - same as the raw
-     * joystick above - so it has to be set before tick() runs, not after. */
-    *mi_b(h, NC_MI_SNEAK) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
-    if (g_ctrl_flying && g_local_player) {
-        mob_setJumping(g_local_player, g_ctrl_pressed[NC_CTRL_JUMP] ? true : false);
-        mob_setSneaking(g_local_player, g_ctrl_pressed[NC_CTRL_SNEAK] ? true : false);
+    /* On the ground, plain Sneak. While flying, drive the REAL fly-up/fly-down
+     * fields found by diagnostic logging on 2026-09 (not guessed): these are
+     * read WHILE tick() computes movement, same as the raw joystick above, so
+     * they must be set before tick() runs, not after. Jump/Sneak while flying
+     * are guesses at which is which - swap the FLY_A_*/FLY_B_* assignment
+     * below if up/down come out backwards. */
+    if (g_ctrl_flying) {
+        const bool up = g_ctrl_pressed[NC_CTRL_JUMP];
+        const bool down = g_ctrl_pressed[NC_CTRL_SNEAK];
+        *mi_b(h, NC_MI_FLY_A1) = up ? 1 : 0;
+        *mi_b(h, NC_MI_FLY_A2) = up ? 1 : 0;
+        *mi_b(h, NC_MI_FLY_B1) = down ? 1 : 0;
+        *mi_b(h, NC_MI_FLY_B2) = down ? 1 : 0;
+        *mi_b(h, NC_MI_FLY_B3) = down ? 1 : 0;
+        *mi_b(h, NC_MI_FLY_SHARED) = (up || down) ? 1 : 0;
+        *mi_b(h, NC_MI_SNEAK) = 0;
+    } else {
+        *mi_b(h, NC_MI_SNEAK) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
     }
-}
-
-/* ---- DIAGNOSTIC: find the real ascend/descend fields ----
- * Logs a byte range of MoveInputHandler while flying, once every ~20 frames.
- * To find the real fields: fly in LEGACY controls mode, tap the vanilla
- * fly-up/fly-down buttons, then check log.txt for which byte(s) flip
- * from 00 to 01 right when you tap them. Send me those two offsets. */
-static void ctrl_log_fly_bytes(void *h) {
-    if (!h || !g_ctrl_flying) return;
-    static int last = -1000;
-    if (g_frames - last < 20) return;
-    last = g_frames;
-    unsigned char *b = (unsigned char *)h;
-    char line[200]; int p2 = 0;
-    for (int off = 0x38; off <= 0x60; off++)
-        p2 += snprintf(line + p2, sizeof(line) - p2, "%02x ", b[off]);
-    nclog("flybytes[0x38..0x60] %s", line);
 }
 
 /* After tick: the player consumes the jumping flag later in its own update. */
 static void ctrl_finish_input(void *h) {
     if (!h || !ctrl_input_live()) return;
-    /* Same as Sneak: the game treats held Jump as fly-up while flying, using
-     * this same flag - no separate ascend field needed. */
+    if (g_ctrl_flying) return;   /* fly-up/fly-down are handled pre-tick above */
     if (g_ctrl_pressed[NC_CTRL_JUMP]) *mi_b(h, NC_MI_JUMP) = 1;
 }
 
@@ -895,7 +888,6 @@ static void snapshot_totem_state(void *player) {
 static void hook_tick(void *self, void *player) {
     ctrl_prepare_input(self);
     if (g_orig_tick) g_orig_tick(self, player);
-    ctrl_log_fly_bytes(self);   /* diagnostic: runs in BOTH control modes, remove once offsets are found */
     ctrl_finish_input(self);
     if (!player) return;
     g_local_player = player;
