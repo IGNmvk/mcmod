@@ -470,6 +470,23 @@ static void ctrl_prepare_input(void *h) {
     }
 }
 
+/* ---- DIAGNOSTIC: find the real ascend/descend fields ----
+ * Logs a byte range of MoveInputHandler while flying, once every ~20 frames.
+ * To find the real fields: fly in LEGACY controls mode, tap the vanilla
+ * fly-up/fly-down buttons, then check log.txt for which byte(s) flip
+ * from 00 to 01 right when you tap them. Send me those two offsets. */
+static void ctrl_log_fly_bytes(void *h) {
+    if (!h || !g_ctrl_flying) return;
+    static int last = -1000;
+    if (g_frames - last < 20) return;
+    last = g_frames;
+    unsigned char *b = (unsigned char *)h;
+    char line[200]; int p2 = 0;
+    for (int off = 0x38; off <= 0x60; off++)
+        p2 += snprintf(line + p2, sizeof(line) - p2, "%02x ", b[off]);
+    nclog("flybytes[0x38..0x60] %s", line);
+}
+
 /* After tick: the player consumes the jumping flag later in its own update. */
 static void ctrl_finish_input(void *h) {
     if (!h || !ctrl_input_live()) return;
@@ -878,6 +895,7 @@ static void snapshot_totem_state(void *player) {
 static void hook_tick(void *self, void *player) {
     ctrl_prepare_input(self);
     if (g_orig_tick) g_orig_tick(self, player);
+    ctrl_log_fly_bytes(self);   /* diagnostic: runs in BOTH control modes, remove once offsets are found */
     ctrl_finish_input(self);
     if (!player) return;
     g_local_player = player;
