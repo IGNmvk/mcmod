@@ -428,6 +428,18 @@ static void ctrl_reset_states() {
 #define NC_MI_RAW_X   0x58
 #define NC_MI_RAW_Y   0x5c
 #define NC_MI_JUMP    0x43
+/* Found by diagnostic logging (2026-09), not guessed: two distinct multi-
+ * second bit patterns showed up only during sustained fly-up/fly-down holds
+ * in Legacy mode. 0x42 is shared by both (general "vertical fly input active"
+ * flag); the rest distinguish direction. Assignment (up=A, down=B) is a first
+ * guess - swap which set Jump vs Sneak drives in ctrl_prepare_input if it's
+ * backwards. */
+#define NC_MI_FLY_SHARED 0x42
+#define NC_MI_FLY_A1 0x3e
+#define NC_MI_FLY_A2 0x45
+#define NC_MI_FLY_B1 0x3c
+#define NC_MI_FLY_B2 0x3f
+#define NC_MI_FLY_B3 0x46
 #define NC_MI_SNEAK   0x4e
 #define NC_JOY_INVERT_X 1   /* set to 1 if left/right feel swapped */
 #define NC_JOY_INVERT_Y 0   /* set to 1 if forward/back feel swapped */
