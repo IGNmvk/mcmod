@@ -47,6 +47,7 @@ extern "C" bool mih_isMovingForward(void *self) __asm__("_ZNK16MoveInputHandler1
 extern "C" bool mob_isSneaking(void *self)      __asm__("_ZNK3Mob10isSneakingEv");
 extern "C" void mob_setSneaking(void *self, bool on) __asm__("_ZN3Mob11setSneakingEb");
 extern "C" void mob_setJumping(void *self, bool on)  __asm__("_ZN3Mob10setJumpingEb");
+static void *g_local_player = 0;   /* moved up here so ctrl_prepare_input can use it; was declared later before */
 extern "C" bool mob_isSprinting(void *self)     __asm__("_ZNK3Mob11isSprintingEv");
 extern "C" bool mob_isGliding(void *self)       __asm__("_ZNK3Mob9isGlidingEv");
 extern "C" bool player_isUsingItem(void *self)  __asm__("_ZNK6Player11isUsingItemEv");
@@ -619,7 +620,6 @@ static fn_ui_draw g_orig_input_ui = 0;
 static fn_entity_render g_orig_xp_render = 0;
 static fn_entity_render g_orig_crystal_render = 0;
 static fn_entity_render g_orig_crystal_effects = 0;
-static void *g_local_player = 0;
 
 /* Exact 1.1.5 Entity::bb layout: Entity + 0x104 contains
  * six floats in AABB order: minX,minY,minZ,maxX,maxY,maxZ.
