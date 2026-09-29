@@ -63,6 +63,8 @@ extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12get
  * x/y are GUI units (screen pixels / gui scale). Because the game draws the item,
  * texture packs, custom models and enchant glint all apply. */
 extern "C" void *g_ItemRendererInstance __asm__("_ZN12ItemRenderer8instanceE");
+extern "C" void *ci_getOptions(void *ci) __asm__("_ZN14ClientInstance10getOptionsEv");
+extern "C" int   options_getPerspective(void *options) __asm__("_ZNK7Options24getPlayerViewPerspectiveEv");
 extern "C" void ir_renderGuiItemNew(void *self, const void *item, int aux, float x, float y,
                                     float scale, float alpha, float extra, bool glint)
     __asm__("_ZN12ItemRenderer16renderGuiItemNewERK12ItemInstanceifffffb");
@@ -1367,6 +1369,19 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     const NcAabb6 *aw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
     NcAabb6 b = *aw;
 
+    /* Sanity-check the box before drawing anything. A bad read here (garbage
+     * memory, an entity mid-teleport, or some non-mob object that happens to
+     * pass through this same render call) is the most likely explanation for
+     * a stray box floating near an entity at certain angles - reject anything
+     * clearly not a normal entity-sized, upright box rather than draw it. */
+    auto finite = [](float f) { return f == f && f > -1e6f && f < 1e6f; };  /* f==f rejects NaN */
+    if (!finite(b.minx) || !finite(b.maxx) || !finite(b.miny) || !finite(b.maxy) ||
+        !finite(b.minz) || !finite(b.maxz))
+        return;
+    const float sx = b.maxx - b.minx, sy = b.maxy - b.miny, sz = b.maxz - b.minz;
+    if (sx <= 0.01f || sy <= 0.01f || sz <= 0.01f || sx > 16.0f || sy > 16.0f || sz > 16.0f)
+        return;
+
     /* Keep the AABB in the same local coordinate space used by the entity
      * renderer.  Entity::bb is stored in world coordinates; subtract the
      * entity's current origin, then apply the exact interpolated render_pos
@@ -1558,11 +1573,22 @@ static void combat_consider_entity(void *entity, float partial) {
     }
     g_snap.combat_target_until = now_s() + 0.045;
 }
+/* 0 = first person, 1/2 = third person (back/front) - checked in Options,
+ * not guessed from a fixed offset. */
+static bool ctrl_in_third_person() {
+    if (!g_ci) return false;
+    void *opt = ci_getOptions(g_ci);
+    return opt && options_getPerspective(opt) != 0;
+}
+
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
-    if (g_cfg.hitbox_on && entity && pos && entity != g_local_player)
-        hit_draw_entity(entity, (const float *)pos, partial);
+    if (!g_cfg.hitbox_on || !entity || !pos) return;
+    /* The player's own hitbox only makes sense in third person - in first
+     * person the box would surround the camera itself. */
+    if (entity == g_local_player && !ctrl_in_third_person()) return;
+    hit_draw_entity(entity, (const float *)pos, partial);
 }
 
 
