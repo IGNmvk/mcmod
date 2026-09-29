@@ -175,6 +175,7 @@ static char *g_kb_text = 0;
 /* Forward declaration: the keyboard bridge is above the logger definition. */
 static void nclog(const char *fmt, ...);
 static bool nc_gameplay_input_active();
+static volatile double g_touch_render_time = 0;  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
 static void ctrl_apply_player_actions();
 static void sl_f(const char *label, float *v, float lo, float hi);
 
@@ -1701,7 +1702,11 @@ static bool nc_gameplay_input_active() {
     const bool settings = (g_settings_this != 0);
     const bool chat = (g_chat_this != 0);
     const bool inventory = (now - g_inventory_render_time) < 0.35;
-    return play && !pause && !chat && !settings && !inventory && !g_menu_open && !g_edit;
+    /* Catch-all: the game only calls TouchControlSet::render when NO overlay
+     * screen is on top (inventory, chat, pause, anything else) - this catches
+     * overlay screens our own per-screen hooks above might not cover. */
+    const bool overlay_free = (now - g_touch_render_time) < 0.35;
+    return play && overlay_free && !pause && !chat && !settings && !inventory && !g_menu_open && !g_edit;
 }
 
 /* TouchControlSet::render draws every vanilla on-screen button (joystick,
@@ -1710,6 +1715,7 @@ static bool nc_gameplay_input_active() {
 typedef void (*fn_touch_render)(void *, void *);
 static fn_touch_render g_orig_touch_render = 0;
 static void hook_touch_render(void *self, void *ctx) {
+    g_touch_render_time = now_s();   /* recorded even when we're about to skip drawing below */
     if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
