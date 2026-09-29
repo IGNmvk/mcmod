@@ -177,6 +177,20 @@ static void nclog(const char *fmt, ...);
 static bool nc_gameplay_input_active();
 static volatile double g_touch_render_time = 0;  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
 static void ctrl_apply_player_actions();
+static void ctrl_set_joy_from_touch(const NcRect &r, float x, float y) {
+    float jx = (x - (r.x + r.w * 0.5f)) / (r.w * 0.5f);
+    float jy = (y - (r.y + r.h * 0.5f)) / (r.h * 0.5f);
+    const float mag = sqrtf(jx * jx + jy * jy);
+    if (mag > 1.0f) { jx /= mag; jy /= mag; }   /* clamp to the circle, not the square */
+    /* Snap near an axis to a clean straight line - real joysticks rarely land
+     * on EXACTLY 0, and a hair of unintended strafe reads as "sideways feels
+     * weird" even when you meant to walk straight. */
+    const float snap = 0.06f;
+    if (fabsf(jx) < snap) jx = 0.0f;
+    if (fabsf(jy) < snap) jy = 0.0f;
+    g_ctrl_joy_x = jx;
+    g_ctrl_joy_y = jy;
+}
 static void sl_f(const char *label, float *v, float lo, float hi);
 
 typedef jint (*fn_JNI_GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
@@ -992,7 +1006,8 @@ static void hook_tick(void *self, void *player) {
     snapshot_totem_state(player);
     if (g_cfg.controls_mode == 1) ctrl_apply_player_actions();
     if (g_cfg.autosprint && g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
-        if (g_ctrl_joy_id >= 0 && g_ctrl_joy_y < -0.55f && !mob_isSneaking(player) &&
+        const float joy_mag = sqrtf(g_ctrl_joy_x * g_ctrl_joy_x + g_ctrl_joy_y * g_ctrl_joy_y);
+        if (g_ctrl_joy_id >= 0 && g_ctrl_joy_y < 0.0f && joy_mag > 0.55f && !mob_isSneaking(player) &&
             !player_isUsingItem(player) && !mob_isSprinting(player))
             lp_setSprinting(player, true);
     } else if (g_cfg.autosprint && mih_isMovingForward(self) && !mob_isSneaking(player) &&
@@ -1779,9 +1794,7 @@ static void ctrl_consume_touch(int action, int id, float x, float y) {
             g_ctrl_ids[i] = id;
             if (i == NC_CTRL_JOY) {
                 g_ctrl_joy_id = id;
-                const NcRect &r = g_ctrl_rects[i];
-                g_ctrl_joy_x = clampf((x - (r.x+r.w*0.5f))/(r.w*0.5f),-1,1);
-                g_ctrl_joy_y = clampf((y - (r.y+r.h*0.5f))/(r.h*0.5f),-1,1);
+                ctrl_set_joy_from_touch(g_ctrl_rects[i], x, y);
             } else {
                 g_ctrl_pressed[i] = 1;
             }
@@ -1790,9 +1803,7 @@ static void ctrl_consume_touch(int action, int id, float x, float y) {
         }
     } else if (action == NC_EV_MOVE) {
         if (id == g_ctrl_joy_id) {
-            const NcRect &r = g_ctrl_rects[NC_CTRL_JOY];
-            g_ctrl_joy_x = clampf((x - (r.x+r.w*0.5f))/(r.w*0.5f),-1,1);
-            g_ctrl_joy_y = clampf((y - (r.y+r.h*0.5f))/(r.h*0.5f),-1,1);
+            ctrl_set_joy_from_touch(g_ctrl_rects[NC_CTRL_JOY], x, y);
         }
     } else if (action == NC_EV_UP) {
         for (int i=0;i<NC_CTRL_COUNT;i++) {
