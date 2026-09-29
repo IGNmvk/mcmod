@@ -1715,8 +1715,11 @@ static bool nc_gameplay_input_active() {
 typedef void (*fn_touch_render)(void *, void *);
 static fn_touch_render g_orig_touch_render = 0;
 static void hook_touch_render(void *self, void *ctx) {
-    g_touch_render_time = now_s();   /* recorded even when we're about to skip drawing below */
-    if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) return;
+    /* No longer skips drawing - chat/pause/camera-turn are drawn by this same
+     * function as the old movement buttons, so hiding it made them translucent
+     * too. Still used purely as a timestamp: the game only calls this with no
+     * full-screen overlay on top, which nc_gameplay_input_active() relies on. */
+    g_touch_render_time = now_s();
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
 
@@ -2992,7 +2995,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         if (speed_vis)  draw_speed(fg, place(g_cfg.speed_x, g_cfg.speed_y, size_speed()), g_snap.speed_bps);
         if (coords_vis) draw_coords(fg, place(g_cfg.coords_x, g_cfg.coords_y, size_coords()));
         if (elytra_angle_vis) draw_elytra_angle(fg, place(g_cfg.elytra_angle_x, g_cfg.elytra_angle_y, size_elytra_angle()));
-        if (g_cfg.controls_mode == 1 && hud_btns) draw_new_controls(fg, (float)w, (float)h);
+        if (g_cfg.controls_mode == 1 && hud_btns && nc_gameplay_input_active()) draw_new_controls(fg, (float)w, (float)h);
 
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
