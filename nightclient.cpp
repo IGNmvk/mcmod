@@ -65,6 +65,7 @@ extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12get
 extern "C" void *g_ItemRendererInstance __asm__("_ZN12ItemRenderer8instanceE");
 extern "C" void *ci_getOptions(void *ci) __asm__("_ZN14ClientInstance10getOptionsEv");
 extern "C" int   options_getPerspective(void *options) __asm__("_ZNK7Options24getPlayerViewPerspectiveEv");
+extern "C" void *g_ItemEntityVtable __asm__("_ZTV10ItemEntity");
 extern "C" void ir_renderGuiItemNew(void *self, const void *item, int aux, float x, float y,
                                     float scale, float alpha, float extra, bool glint)
     __asm__("_ZN12ItemRenderer16renderGuiItemNewERK12ItemInstanceifffffb");
@@ -1359,6 +1360,16 @@ static void hit_draw_lines(float *verts, int n, const float *mvp) {
 static void hit_draw_entity(void *entity, const float *render_pos, float partial) {
     if (!g_cfg.hitbox_on || !entity || !render_pos) return;
     if (hit_seen_entity(entity)) return;
+    /* Dropped items (the pickup-flies-toward-you animation) briefly overlap
+     * the player's own position mid-pickup, which is the most likely source
+     * of a stray box appearing near the player at certain angles. Hitboxes
+     * are meant for mobs/players anyway - skip item entities outright.
+     * Identified by vtable pointer (Itanium ABI: the real vptr sits two
+     * words into the _ZTV symbol for a simple single-inheritance class),
+     * not by guessing at entity-type-id offsets. */
+    void *vptr = *(void **)entity;
+    void *item_vptr = (void *)((unsigned char *)&g_ItemEntityVtable + 2 * sizeof(void *));
+    if (vptr == item_vptr) return;
     if (!hit_resolve_symbols() || !hit_init_gl()) return;
 
     GLint depth_bits = 0;
