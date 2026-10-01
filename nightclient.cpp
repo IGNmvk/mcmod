@@ -1370,6 +1370,26 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     void *vptr = *(void **)entity;
     void *item_vptr = (void *)((unsigned char *)&g_ItemEntityVtable + 2 * sizeof(void *));
     if (vptr == item_vptr) return;
+
+    /* DIAGNOSTIC: item exclusion didn't fix the "box near the player" bug.
+     * Log anything drawn suspiciously close to the local player - pointer,
+     * whether it's actually g_local_player leaking through the exclusion
+     * check, and the box itself - so we can see what it really is instead of
+     * guessing again. Remove once identified. */
+    if (g_local_player && entity != g_local_player) {
+        const float *mypos = entity_getPos(g_local_player);
+        const float *epos = entity_getPos(entity);
+        if (mypos && epos) {
+            float dx = epos[0] - mypos[0], dy = epos[1] - mypos[1], dz = epos[2] - mypos[2];
+            float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            static int logged = 0;
+            if (d < 1.2f && logged < 20) {
+                logged++;
+                nclog("near-player box: entity=%p vptr=%p dist=%.2f dy=%.2f", entity, vptr, d, dy);
+            }
+        }
+    }
+
     if (!hit_resolve_symbols() || !hit_init_gl()) return;
 
     GLint depth_bits = 0;
