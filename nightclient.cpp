@@ -1418,7 +1418,11 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
         !finite(b.minz) || !finite(b.maxz))
         return;
     const float sx = b.maxx - b.minx, sy = b.maxy - b.miny, sz = b.maxz - b.minz;
-    if (sx <= 0.01f || sy <= 0.01f || sz <= 0.01f || sx > 16.0f || sy > 16.0f || sz > 16.0f)
+    /* Upper bound raised to fit the Ender Dragon (legitimately close to or
+     * over the old 16-block ceiling) - that ceiling was rejecting its real
+     * hitbox outright as if it were corrupted data, which is why the dragon
+     * hitbox disappeared entirely after this check was added. */
+    if (sx <= 0.01f || sy <= 0.01f || sz <= 0.01f || sx > 32.0f || sy > 16.0f || sz > 32.0f)
         return;
 
     /* Keep the AABB in the same local coordinate space used by the entity
