@@ -1653,6 +1653,18 @@ static void combat_consider_entity(void *entity, float partial) {
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
+    /* DIAGNOSTIC: PaperDollRenderer isn't what draws the inventory/skins
+     * player preview (confirmed - it never fires for those screens). It's
+     * possible the preview actually reuses THIS SAME entity-render path,
+     * just repositioned for a UI camera - if so, we already fully support
+     * hitboxes here and need no new hook at all. Log whenever this fires for
+     * the local player specifically while NOT in active gameplay. */
+    static int logged = 0;
+    if (logged < 10 && entity == g_local_player && !nc_gameplay_input_active()) {
+        logged++;
+        nclog("entity render for local player OUTSIDE gameplay (inventory/skins preview?) pos=%p",
+              pos);
+    }
     if (g_cfg.hitbox_on && entity && pos)
         hit_draw_entity(entity, (const float *)pos, partial);
 }
