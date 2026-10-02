@@ -1446,7 +1446,7 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     bool dragon = hit_is_dragon(entity);
     if (dragon) {
         /* The dragon uses its multipart boxes instead of the coarse overall AABB. */
-        hit_add_dragon_boxes(verts, &n, entity, *(const NcAabb6 *)aw, cp, rot.y);
+        hit_add_dragon_boxes(verts, &n, entity, b, cp, rot.y);
     } else {
         hit_aabb_edges(verts, &n, b);      /* 24 vertices */
     }
