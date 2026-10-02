@@ -1360,16 +1360,10 @@ static void hit_draw_lines(float *verts, int n, const float *mvp) {
 static void hit_draw_entity(void *entity, const float *render_pos, float partial) {
     if (!g_cfg.hitbox_on || !entity || !render_pos) return;
     if (hit_seen_entity(entity)) return;
-    /* Dropped items (the pickup-flies-toward-you animation) briefly overlap
-     * the player's own position mid-pickup, which is the most likely source
-     * of a stray box appearing near the player at certain angles. Hitboxes
-     * are meant for mobs/players anyway - skip item entities outright.
-     * Identified by vtable pointer (Itanium ABI: the real vptr sits two
-     * words into the _ZTV symbol for a simple single-inheritance class),
-     * not by guessing at entity-type-id offsets. */
+    /* Item-entity exclusion removed (2026-09) - testing showed it wasn't the
+     * cause of the rare stray-box bug, so item hitboxes are back. The vtable
+     * pointer is still grabbed below for the diagnostic log. */
     void *vptr = *(void **)entity;
-    void *item_vptr = (void *)((unsigned char *)&g_ItemEntityVtable + 2 * sizeof(void *));
-    if (vptr == item_vptr) return;
 
     /* DIAGNOSTIC: item exclusion didn't fix the "box near the player" bug.
      * Log anything drawn suspiciously close to the local player - pointer,
@@ -1396,9 +1390,28 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     glGetIntegerv(GL_DEPTH_BITS, &depth_bits);
     if (depth_bits <= 0) return;
 
-    /* Exact Entity::bb storage in 1.1.5 is at +0x104. */
-    const NcAabb6 *aw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
-    NcAabb6 b = *aw;
+    NcAabb6 b;
+    if (entity == g_local_player) {
+        /* Not read from the entity struct - LocalPlayer is almost certainly
+         * a different/larger class than the networked Player/Mob objects
+         * +0x104 was verified against, and guessing at it crashed on
+         * switching to third person last time. Built instead from a position
+         * we already read safely elsewhere, plus Minecraft's standard player
+         * dimensions (0.6 wide, 1.8 tall, 1.5 tall sneaking). entity_getPos
+         * gives the feet position. */
+        const float *p = render_pos ? render_pos : entity_getPos(entity);
+        if (!p) return;
+        const float half_w = 0.3f;
+        const float height = mob_isSneaking(entity) ? 1.5f : 1.8f;
+        b.minx = p[0] - half_w; b.maxx = p[0] + half_w;
+        b.miny = p[1];          b.maxy = p[1] + height;
+        b.minz = p[2] - half_w; b.maxz = p[2] + half_w;
+    } else {
+        /* Exact Entity::bb storage in 1.1.5 is at +0x104 - confirmed safe for
+         * networked players/mobs. */
+        const NcAabb6 *aw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
+        b = *aw;
+    }
 
     /* Sanity-check the box before drawing anything. A bad read here (garbage
      * memory, an entity mid-teleport, or some non-mob object that happens to
@@ -1604,17 +1617,24 @@ static void combat_consider_entity(void *entity, float partial) {
     }
     g_snap.combat_target_until = now_s() + 0.045;
 }
-/* REVERTED (2026-09): crashed on switching to third person. +0x104 was only
- * ever confirmed as Entity::bb's offset on OTHER entities (networked
- * players/mobs) - LocalPlayer is almost certainly a larger, different class
- * (extra input/camera state) where that same offset likely lands somewhere
- * else entirely. Needs LocalPlayer's real layout confirmed before trying
- * this again, not another guess. */
+/* 0 = first person, 1/2 = third person (back/front) - checked in Options,
+ * not guessed from a fixed offset. */
+static bool ctrl_in_third_person() {
+    if (!g_ci) return false;
+    void *opt = ci_getOptions(g_ci);
+    return opt && options_getPerspective(opt) != 0;
+}
+
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
-    if (g_cfg.hitbox_on && entity && pos && entity != g_local_player)
-        hit_draw_entity(entity, (const float *)pos, partial);
+    if (!g_cfg.hitbox_on || !entity || !pos) return;
+    /* The player's own hitbox only makes sense in third person - in first
+     * person the box would surround the camera. Now safe: see the synthetic
+     * box built in hit_draw_entity for entity==g_local_player, which avoids
+     * the offset read that crashed last time. */
+    if (entity == g_local_player && !ctrl_in_third_person()) return;
+    hit_draw_entity(entity, (const float *)pos, partial);
 }
 
 
