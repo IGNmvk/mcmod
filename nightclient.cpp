@@ -64,27 +64,6 @@ extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12get
  * texture packs, custom models and enchant glint all apply. */
 extern "C" void *g_ItemRendererInstance __asm__("_ZN12ItemRenderer8instanceE");
 extern "C" void *g_ItemEntityVtable __asm__("_ZTV10ItemEntity");
-
-/* ---- DIAGNOSTIC: paper-doll preview (inventory + skins screen) ----
- * This renders the player model in a completely different context than the
- * in-world EntityRenderDispatcher we already hook (a small UI widget, not a
- * camera in the world), so our existing hitbox pipeline never touches it and
- * we don't yet know what projection/view state is active here. Logging
- * first rather than guessing at matrix slots, since guessing at memory
- * layout has caused real crashes earlier in this project (third-person,
- * the dragon box). */
-typedef void (*fn_paperdoll_render)(void *, void *, void *, int, void *);
-static fn_paperdoll_render g_orig_paperdoll_render = 0;
-static int g_paperdoll_logged = 0;
-static void hook_paperdoll_render(void *self, void *ci, void *ui_control, int a, void *area) {
-    if (g_orig_paperdoll_render) g_orig_paperdoll_render(self, ci, ui_control, a, area);
-    if (g_paperdoll_logged < 10 && area) {
-        g_paperdoll_logged++;
-        const float *f = (const float *)area;
-        nclog("paperdoll render: self=%p area=%p floats=[%.2f %.2f %.2f %.2f]",
-              self, area, f[0], f[1], f[2], f[3]);
-    }
-}
 extern "C" void ir_renderGuiItemNew(void *self, const void *item, int aux, float x, float y,
                                     float scale, float alpha, float extra, bool glint)
     __asm__("_ZN12ItemRenderer16renderGuiItemNewERK12ItemInstanceifffffb");
@@ -196,6 +175,27 @@ static char *g_kb_text = 0;
 
 /* Forward declaration: the keyboard bridge is above the logger definition. */
 static void nclog(const char *fmt, ...);
+
+/* ---- DIAGNOSTIC: paper-doll preview (inventory + skins screen) ----
+ * This renders the player model in a completely different context than the
+ * in-world EntityRenderDispatcher we already hook (a small UI widget, not a
+ * camera in the world), so our existing hitbox pipeline never touches it and
+ * we don't yet know what projection/view state is active here. Logging
+ * first rather than guessing at matrix slots, since guessing at memory
+ * layout has caused real crashes earlier in this project (third-person,
+ * the dragon box). */
+typedef void (*fn_paperdoll_render)(void *, void *, void *, int, void *);
+static fn_paperdoll_render g_orig_paperdoll_render = 0;
+static int g_paperdoll_logged = 0;
+static void hook_paperdoll_render(void *self, void *ci, void *ui_control, int a, void *area) {
+    if (g_orig_paperdoll_render) g_orig_paperdoll_render(self, ci, ui_control, a, area);
+    if (g_paperdoll_logged < 10 && area) {
+        g_paperdoll_logged++;
+        const float *f = (const float *)area;
+        nclog("paperdoll render: self=%p area=%p floats=[%.2f %.2f %.2f %.2f]",
+              self, area, f[0], f[1], f[2], f[3]);
+    }
+}
 static bool nc_gameplay_input_active();
 static volatile double g_touch_render_time = 0;  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
 static void ctrl_apply_player_actions();
