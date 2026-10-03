@@ -175,6 +175,7 @@ static char *g_kb_text = 0;
 
 /* Forward declaration: the keyboard bridge is above the logger definition. */
 static void nclog(const char *fmt, ...);
+static double now_s();
 
 static bool nc_gameplay_input_active();
 static volatile double g_touch_render_time = 0;  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
