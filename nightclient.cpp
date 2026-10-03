@@ -498,36 +498,6 @@ static void ctrl_prepare_input(void *h) {
      * they must be set before tick() runs, not after. Jump/Sneak while flying
      * are guesses at which is which - swap the FLY_A vs FLY_B assignment
      * below if up/down come out backwards. */
-    /* Double-tap Sneak (the fly-down button) while flying stops flying, the
-     * same way double-tap Jump starts it - there's no dedicated Jump button
-     * visible mid-air to double-tap yourself. Rather than guess at a direct
-     * "stop flying" function and risk another crash, this simulates the same
-     * quick double press of the real Jump field (NC_MI_JUMP, already proven
-     * safe) that the game's own double-tap detector already watches for.
-     * Timings are a first guess at a human double-tap speed - if it doesn't
-     * reliably trigger, tell me and I'll adjust the window/pulse lengths. */
-    static bool sneak_prev_edge = false;
-    static double sneak_last_press = -10.0;
-    static bool synth_jump_active = false;
-    static double synth_jump_t0 = 0.0;
-    const bool sneak_now = g_ctrl_pressed[NC_CTRL_SNEAK];
-    if (sneak_now && !sneak_prev_edge && g_ctrl_flying) {
-        const double now = now_s();
-        if (now - sneak_last_press < 0.35) { synth_jump_active = true; synth_jump_t0 = now; }
-        sneak_last_press = now;
-    }
-    sneak_prev_edge = sneak_now;
-
-    bool synth_jump_bit = false;
-    if (synth_jump_active) {
-        const double t = now_s() - synth_jump_t0;
-        if      (t < 0.08) synth_jump_bit = true;
-        else if (t < 0.16) synth_jump_bit = false;
-        else if (t < 0.24) synth_jump_bit = true;
-        else if (t < 0.32) synth_jump_bit = false;
-        else synth_jump_active = false;
-    }
-
     if (g_ctrl_flying) {
         const bool up = g_ctrl_pressed[NC_CTRL_JUMP];
         const bool down = g_ctrl_pressed[NC_CTRL_SNEAK];
@@ -538,7 +508,6 @@ static void ctrl_prepare_input(void *h) {
         *mi_b(h, NC_MI_FLY_B3) = down ? 1 : 0;
         *mi_b(h, NC_MI_FLY_SHARED) = (up || down) ? 1 : 0;
         *mi_b(h, NC_MI_SNEAK) = 0;
-        if (synth_jump_active) *mi_b(h, NC_MI_JUMP) = synth_jump_bit ? 1 : 0;
     } else {
         *mi_b(h, NC_MI_SNEAK) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
     }
@@ -917,6 +886,57 @@ typedef void (*fn_continue_destroy)(void *, void *, void *, signed char, bool *)
 static fn_start_destroy    g_orig_start_destroy = 0;
 static fn_continue_destroy g_orig_continue_destroy = 0;
 static int g_mine_block_logged = 0;
+/* ---- Particle Remover ----
+ * Names and order confirmed directly from a contiguous string table in
+ * libminecraftpe.so (not guessed) - this is the real ParticleType enum.
+ * LevelRenderer::addParticle(ParticleType, Vec3, Vec3, int) is the actual
+ * spawn call; skipping it for a disabled type removes particles no texture
+ * pack can touch, since those are hardcoded engine effects, not textures. */
+static const char *g_particle_names[] = {
+    "bubble", "crit", "smoke", "explode", "evaporation", "flame", "largesmoke",
+    "reddust", "iconcrack", "snowballpoof", "largeexplode", "hugeexplosion",
+    "mobflame", "heart", "townaura", "watersplash", "waterwake", "dripwater",
+    "driplava", "fallingdust", "mobspell", "mobspellambient",
+    "mobspellinstantaneous", "ink", "rainsplash", "villagerangry",
+    "villagerhappy", "enchantingtable", "trackingemitter", "note",
+    "witchspell", "carrotboost", "dragonbreath", "spit", "totem", "food"
+};
+#define NC_PARTICLE_COUNT (int)(sizeof(g_particle_names) / sizeof(g_particle_names[0]))
+
+static int *ctrl_particle_toggle(int i) {
+    switch (i) {
+        case 0: return &g_cfg.ptcl_0;   case 1: return &g_cfg.ptcl_1;
+        case 2: return &g_cfg.ptcl_2;   case 3: return &g_cfg.ptcl_3;
+        case 4: return &g_cfg.ptcl_4;   case 5: return &g_cfg.ptcl_5;
+        case 6: return &g_cfg.ptcl_6;   case 7: return &g_cfg.ptcl_7;
+        case 8: return &g_cfg.ptcl_8;   case 9: return &g_cfg.ptcl_9;
+        case 10: return &g_cfg.ptcl_10; case 11: return &g_cfg.ptcl_11;
+        case 12: return &g_cfg.ptcl_12; case 13: return &g_cfg.ptcl_13;
+        case 14: return &g_cfg.ptcl_14; case 15: return &g_cfg.ptcl_15;
+        case 16: return &g_cfg.ptcl_16; case 17: return &g_cfg.ptcl_17;
+        case 18: return &g_cfg.ptcl_18; case 19: return &g_cfg.ptcl_19;
+        case 20: return &g_cfg.ptcl_20; case 21: return &g_cfg.ptcl_21;
+        case 22: return &g_cfg.ptcl_22; case 23: return &g_cfg.ptcl_23;
+        case 24: return &g_cfg.ptcl_24; case 25: return &g_cfg.ptcl_25;
+        case 26: return &g_cfg.ptcl_26; case 27: return &g_cfg.ptcl_27;
+        case 28: return &g_cfg.ptcl_28; case 29: return &g_cfg.ptcl_29;
+        case 30: return &g_cfg.ptcl_30; case 31: return &g_cfg.ptcl_31;
+        case 32: return &g_cfg.ptcl_32; case 33: return &g_cfg.ptcl_33;
+        case 34: return &g_cfg.ptcl_34; case 35: return &g_cfg.ptcl_35;
+        default: return 0;
+    }
+}
+
+typedef void (*fn_add_particle)(void *, int, const void *, const void *, int);
+static fn_add_particle g_orig_add_particle = 0;
+static void hook_add_particle(void *self, int type, const void *pos, const void *vel, int data) {
+    if (g_cfg.particle_remover_on) {
+        int *t = ctrl_particle_toggle(type);
+        if (t && *t == 0) return;   /* toggled off - skip spawning it entirely */
+    }
+    if (g_orig_add_particle) g_orig_add_particle(self, type, pos, vel, data);
+}
+
 static bool ctrl_should_block_mining() {
     return g_cfg.controls_mode == 1 && !g_ctrl_mining_ours && nc_gameplay_input_active();
 }
@@ -2828,6 +2848,15 @@ static void panel_persp() {
     hud_pos(&g_cfg.persp_x, &g_cfg.persp_y);
     ImGui::TextDisabled("Works after you have touched the screen in a world once.");
 }
+static void panel_particles() {
+    head("Particle Remover", &g_cfg.particle_remover_on,
+         "Turns off specific particle effects at the source, so texture packs that can't "
+         "remove them (they're hardcoded, not textures) are overridden here instead.");
+    for (int i = 0; i < NC_PARTICLE_COUNT; i++) {
+        int *t = ctrl_particle_toggle(i);
+        if (t) chk(g_particle_names[i], t);
+    }
+}
 static void panel_hitbox() {
     head("Hitboxes", &g_cfg.hitbox_on, "Turns on the game's own developer bounding-box renderer.");
     ImGui::TextDisabled("This shows every entity's and block's box, drawn by the game itself, so it renders");
@@ -2928,6 +2957,7 @@ static const Mod g_mods[] = {
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
     { "Perspective button", &g_cfg.persp_on,   panel_persp },
     { "Hitboxes",           &g_cfg.hitbox_on,  panel_hitbox },
+    { "Particle Remover",   &g_cfg.particle_remover_on, panel_particles },
     { "FPS optimizer",      0,                 panel_perf },
     { "Controls",            0,                 panel_controls },
     { "Client",             0,                 panel_client },
@@ -3273,6 +3303,7 @@ static void nc_init(void) {
     reg("armor items (vignette)", "_ZN19HudVignetteRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea", (void *)hook_hud_vignette, (void **)&g_orig_hud_vig);
     reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
+    reg("particle remover", "_ZN13LevelRenderer11addParticleE12ParticleTypeRK4Vec3S3_i", (void *)hook_add_particle, (void **)&g_orig_add_particle);
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);

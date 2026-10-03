@@ -52,7 +52,12 @@ extern "C" {
   X(xp_opt_on, I, 0, 0, 1) X(xp_opt_speed, F, 4.0, 1.0, 8.0) X(xp_opt_hide_near, F, 1.25, 0.25, 4.0) \
   X(crystal_opt_on, I, 0, 0, 1) X(crystal_opt_anim, I, 1, 0, 1) X(crystal_opt_effects, I, 1, 0, 1) \
   X(coords_on,     I, 0,    0, 1) X(coords_x, F, 0.02, 0, 1) X(coords_y, F, 0.08, 0, 1) X(coords_size, F, 2.5, 1.0, 8.0) X(coords_alpha, F, 1.0, 0.0, 1) X(coords_bg_alpha, F, 0.75, 0.0, 1) X(coords_col, I, 0xEBEBF5, 0, 0xFFFFFF) X(coords_bg_col, I, 0x08080E, 0, 0xFFFFFF) X(coords_bg, I, 1, 0, 1) X(coords_precision, I, 1, 1, 4) \
-  X(hook_hurt,    I, 1,    0, 1) X(hook_fov, I, 1, 0, 1) X(hook_persp, I, 1, 0, 1) X(hook_perf, I, 1, 0, 1) X(hook_xp, I, 1, 0, 1) X(hook_crystal, I, 1, 0, 1)
+  X(hook_hurt,    I, 1,    0, 1) X(hook_fov, I, 1, 0, 1) X(hook_persp, I, 1, 0, 1) X(hook_perf, I, 1, 0, 1) X(hook_xp, I, 1, 0, 1) X(hook_crystal, I, 1, 0, 1) \
+  X(particle_remover_on, I, 0, 0, 1) \
+  X(ptcl_0, I,1,0,1) X(ptcl_1, I,1,0,1) X(ptcl_2, I,1,0,1) X(ptcl_3, I,1,0,1) X(ptcl_4, I,1,0,1) X(ptcl_5, I,1,0,1) X(ptcl_6, I,1,0,1) X(ptcl_7, I,1,0,1) X(ptcl_8, I,1,0,1) X(ptcl_9, I,1,0,1) \
+  X(ptcl_10,I,1,0,1) X(ptcl_11,I,1,0,1) X(ptcl_12,I,1,0,1) X(ptcl_13,I,1,0,1) X(ptcl_14,I,1,0,1) X(ptcl_15,I,1,0,1) X(ptcl_16,I,1,0,1) X(ptcl_17,I,1,0,1) X(ptcl_18,I,1,0,1) X(ptcl_19,I,1,0,1) \
+  X(ptcl_20,I,1,0,1) X(ptcl_21,I,1,0,1) X(ptcl_22,I,1,0,1) X(ptcl_23,I,1,0,1) X(ptcl_24,I,1,0,1) X(ptcl_25,I,1,0,1) X(ptcl_26,I,1,0,1) X(ptcl_27,I,1,0,1) X(ptcl_28,I,1,0,1) X(ptcl_29,I,1,0,1) \
+  X(ptcl_30,I,1,0,1) X(ptcl_31,I,1,0,1) X(ptcl_32,I,1,0,1) X(ptcl_33,I,1,0,1) X(ptcl_34,I,1,0,1) X(ptcl_35,I,1,0,1)
 
 #define NC_TYPE_I int
 #define NC_TYPE_F float
