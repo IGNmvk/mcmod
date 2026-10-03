@@ -892,6 +892,14 @@ static int g_mine_block_logged = 0;
  * LevelRenderer::addParticle(ParticleType, Vec3, Vec3, int) is the actual
  * spawn call; skipping it for a disabled type removes particles no texture
  * pack can touch, since those are hardcoded engine effects, not textures. */
+/* Indices 0-35 confirmed from a contiguous debug-name string table in the
+ * binary (verified real, in order). That table genuinely ends at "food" -
+ * the next strings after it are an unrelated Abilities table (flySpeed,
+ * walkSpeed, noclip...), not more particles. But real gameplay clearly
+ * produces type values above 35 too (seen 41-44 in testing) - those particle
+ * types exist and fire in-game, they just have no name in this debug table
+ * (not every enum value gets a console-command-friendly name). Extended with
+ * numbered placeholders so those remain toggleable even without a name. */
 static const char *g_particle_names[] = {
     "bubble", "crit", "smoke", "explode", "evaporation", "flame", "largesmoke",
     "reddust", "iconcrack", "snowballpoof", "largeexplode", "hugeexplosion",
@@ -899,7 +907,10 @@ static const char *g_particle_names[] = {
     "driplava", "fallingdust", "mobspell", "mobspellambient",
     "mobspellinstantaneous", "ink", "rainsplash", "villagerangry",
     "villagerhappy", "enchantingtable", "trackingemitter", "note",
-    "witchspell", "carrotboost", "dragonbreath", "spit", "totem", "food"
+    "witchspell", "carrotboost", "dragonbreath", "spit", "totem", "food",
+    "particle #36", "particle #37", "particle #38", "particle #39",
+    "particle #40", "particle #41", "particle #42", "particle #43",
+    "particle #44", "particle #45", "particle #46", "particle #47"
 };
 #define NC_PARTICLE_COUNT (int)(sizeof(g_particle_names) / sizeof(g_particle_names[0]))
 
@@ -923,6 +934,12 @@ static int *ctrl_particle_toggle(int i) {
         case 30: return &g_cfg.ptcl_30; case 31: return &g_cfg.ptcl_31;
         case 32: return &g_cfg.ptcl_32; case 33: return &g_cfg.ptcl_33;
         case 34: return &g_cfg.ptcl_34; case 35: return &g_cfg.ptcl_35;
+        case 36: return &g_cfg.ptcl_36; case 37: return &g_cfg.ptcl_37;
+        case 38: return &g_cfg.ptcl_38; case 39: return &g_cfg.ptcl_39;
+        case 40: return &g_cfg.ptcl_40; case 41: return &g_cfg.ptcl_41;
+        case 42: return &g_cfg.ptcl_42; case 43: return &g_cfg.ptcl_43;
+        case 44: return &g_cfg.ptcl_44; case 45: return &g_cfg.ptcl_45;
+        case 46: return &g_cfg.ptcl_46; case 47: return &g_cfg.ptcl_47;
         default: return 0;
     }
 }

@@ -57,7 +57,10 @@ extern "C" {
   X(ptcl_0, I,1,0,1) X(ptcl_1, I,1,0,1) X(ptcl_2, I,1,0,1) X(ptcl_3, I,1,0,1) X(ptcl_4, I,1,0,1) X(ptcl_5, I,1,0,1) X(ptcl_6, I,1,0,1) X(ptcl_7, I,1,0,1) X(ptcl_8, I,1,0,1) X(ptcl_9, I,1,0,1) \
   X(ptcl_10,I,1,0,1) X(ptcl_11,I,1,0,1) X(ptcl_12,I,1,0,1) X(ptcl_13,I,1,0,1) X(ptcl_14,I,1,0,1) X(ptcl_15,I,1,0,1) X(ptcl_16,I,1,0,1) X(ptcl_17,I,1,0,1) X(ptcl_18,I,1,0,1) X(ptcl_19,I,1,0,1) \
   X(ptcl_20,I,1,0,1) X(ptcl_21,I,1,0,1) X(ptcl_22,I,1,0,1) X(ptcl_23,I,1,0,1) X(ptcl_24,I,1,0,1) X(ptcl_25,I,1,0,1) X(ptcl_26,I,1,0,1) X(ptcl_27,I,1,0,1) X(ptcl_28,I,1,0,1) X(ptcl_29,I,1,0,1) \
-  X(ptcl_30,I,1,0,1) X(ptcl_31,I,1,0,1) X(ptcl_32,I,1,0,1) X(ptcl_33,I,1,0,1) X(ptcl_34,I,1,0,1) X(ptcl_35,I,1,0,1)
+  X(ptcl_30,I,1,0,1) X(ptcl_31,I,1,0,1) X(ptcl_32,I,1,0,1) X(ptcl_33,I,1,0,1) X(ptcl_34,I,1,0,1) X(ptcl_35,I,1,0,1) \
+  X(ptcl_36,I,1,0,1) X(ptcl_37,I,1,0,1) X(ptcl_38,I,1,0,1) X(ptcl_39,I,1,0,1) X(ptcl_40,I,1,0,1) \
+  X(ptcl_41,I,1,0,1) X(ptcl_42,I,1,0,1) X(ptcl_43,I,1,0,1) X(ptcl_44,I,1,0,1) X(ptcl_45,I,1,0,1) \
+  X(ptcl_46,I,1,0,1) X(ptcl_47,I,1,0,1)
 
 #define NC_TYPE_I int
 #define NC_TYPE_F float
