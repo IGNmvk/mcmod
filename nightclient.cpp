@@ -1907,6 +1907,29 @@ static void hook_touch_render(void *self, void *ctx) {
      * too. Still used purely as a timestamp: the game only calls this with no
      * full-screen overlay on top, which nc_gameplay_input_active() relies on. */
     g_touch_render_time = now_s();
+
+    /* DIAGNOSTIC: find where TouchControlSet stores each button's on-screen
+     * position, so old movement buttons can be moved off-screen instead of
+     * hidden (hiding broke chat/camera last time, since they share this same
+     * render function). Scans for float PAIRS that look like plausible
+     * screen coordinates for THIS device (2400x1080, from earlier logs):
+     * x in roughly [0,2400], y in roughly [0,1080], logged once. */
+    static bool scanned = false;
+    if (!scanned && self) {
+        scanned = true;
+        const float *f = (const float *)self;
+        const int n = 512;   /* scan first 2048 bytes as floats */
+        int hits = 0;
+        for (int i = 0; i < n - 1 && hits < 60; i++) {
+            float a = f[i], b = f[i + 1];
+            if (a > 5.0f && a < 2400.0f && b > 5.0f && b < 1080.0f) {
+                nclog("touchctrl scan off=0x%x (%.1f, %.1f)", i * 4, a, b);
+                hits++;
+            }
+        }
+        nclog("touchctrl scan done: %d candidate pairs", hits);
+    }
+
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
 
