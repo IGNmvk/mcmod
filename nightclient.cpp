@@ -929,7 +929,16 @@ static int *ctrl_particle_toggle(int i) {
 
 typedef void (*fn_add_particle)(void *, int, const void *, const void *, int);
 static fn_add_particle g_orig_add_particle = 0;
+static bool g_particle_seen[64] = {false};
 static void hook_add_particle(void *self, int type, const void *pos, const void *vel, int data) {
+    /* DIAGNOSTIC: log each DISTINCT type value the first time it's seen, with
+     * the name we believe it maps to, so a short play session shows whether
+     * our index->name mapping is actually correct or has drifted somewhere. */
+    if (type >= 0 && type < 64 && !g_particle_seen[type]) {
+        g_particle_seen[type] = true;
+        const char *n = (type < NC_PARTICLE_COUNT) ? g_particle_names[type] : "???";
+        nclog("particle type=%d believed_name=%s", type, n);
+    }
     if (g_cfg.particle_remover_on) {
         int *t = ctrl_particle_toggle(type);
         if (t && *t == 0) return;   /* toggled off - skip spawning it entirely */
@@ -943,7 +952,9 @@ static void hook_add_particle(void *self, int type, const void *pos, const void 
  * stays in one place in the UI, but caught at its own real call site now. */
 typedef void (*fn_spawn_eat)(void *, const void *, int);
 static fn_spawn_eat g_orig_spawn_eat = 0;
+static int g_eat_hook_logged = 0;
 static void hook_spawn_eat(void *self, const void *item, int count) {
+    if (g_eat_hook_logged < 5) { g_eat_hook_logged++; nclog("spawnEatParticles called (food toggle=%d)", g_cfg.ptcl_35); }
     if (g_cfg.particle_remover_on && g_cfg.ptcl_35 == 0) return;
     if (g_orig_spawn_eat) g_orig_spawn_eat(self, item, count);
 }
