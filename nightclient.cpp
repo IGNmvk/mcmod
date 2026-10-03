@@ -1908,22 +1908,25 @@ static void hook_touch_render(void *self, void *ctx) {
      * full-screen overlay on top, which nc_gameplay_input_active() relies on. */
     g_touch_render_time = now_s();
 
-    /* DIAGNOSTIC: find where TouchControlSet stores each button's on-screen
-     * position, so old movement buttons can be moved off-screen instead of
-     * hidden (hiding broke chat/camera last time, since they share this same
-     * render function). Scans for float PAIRS that look like plausible
-     * screen coordinates for THIS device (2400x1080, from earlier logs):
-     * x in roughly [0,2400], y in roughly [0,1080], logged once. */
+    /* DIAGNOSTIC v2: first scan (pixel-range floats, 2KB window) found
+     * nothing. Most likely reason: positions are probably stored as
+     * NORMALIZED fractions of the screen (0.0-1.0), same as our own config
+     * stores its control positions (ctrl_joy_x=0.16 etc.), not raw pixels.
+     * Widened to catch both, and doubled the scan window in case the data
+     * sits further into the object than the first 2KB. */
     static bool scanned = false;
     if (!scanned && self) {
         scanned = true;
         const float *f = (const float *)self;
-        const int n = 512;   /* scan first 2048 bytes as floats */
+        const int n = 1024;   /* scan first 4096 bytes as floats */
         int hits = 0;
-        for (int i = 0; i < n - 1 && hits < 60; i++) {
+        for (int i = 0; i < n - 1 && hits < 120; i++) {
             float a = f[i], b = f[i + 1];
-            if (a > 5.0f && a < 2400.0f && b > 5.0f && b < 1080.0f) {
-                nclog("touchctrl scan off=0x%x (%.1f, %.1f)", i * 4, a, b);
+            bool pixel_like = (a > 5.0f && a < 2400.0f && b > 5.0f && b < 1080.0f);
+            bool frac_like  = (a > 0.01f && a < 1.0f && b > 0.01f && b < 1.0f);
+            if (pixel_like || frac_like) {
+                nclog("touchctrl scan off=0x%x (%.4f, %.4f) %s", i * 4, a, b,
+                      pixel_like ? "pixel" : "frac");
                 hits++;
             }
         }
@@ -2572,7 +2575,7 @@ static void build_control_editor(float w, float h) {
     if (g_ctrl_editor_tab==0) {
         sl_f("Opacity",ctrl_alpha(g_ctrl_selected),0.10f,1.0f);
     } else {
-        sl_f("Size",ctrl_size(g_ctrl_selected),0.5f,4.0f);
+        sl_f("Size",ctrl_size(g_ctrl_selected),0.5f,10.0f);
     }
     ImGui::TextDisabled("Drag a control to move it.");
     ImGui::EndChild();
