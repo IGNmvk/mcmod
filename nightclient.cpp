@@ -176,26 +176,6 @@ static char *g_kb_text = 0;
 /* Forward declaration: the keyboard bridge is above the logger definition. */
 static void nclog(const char *fmt, ...);
 
-/* ---- DIAGNOSTIC: paper-doll preview (inventory + skins screen) ----
- * This renders the player model in a completely different context than the
- * in-world EntityRenderDispatcher we already hook (a small UI widget, not a
- * camera in the world), so our existing hitbox pipeline never touches it and
- * we don't yet know what projection/view state is active here. Logging
- * first rather than guessing at matrix slots, since guessing at memory
- * layout has caused real crashes earlier in this project (third-person,
- * the dragon box). */
-typedef void (*fn_paperdoll_render)(void *, void *, void *, int, void *);
-static fn_paperdoll_render g_orig_paperdoll_render = 0;
-static int g_paperdoll_logged = 0;
-static void hook_paperdoll_render(void *self, void *ci, void *ui_control, int a, void *area) {
-    if (g_orig_paperdoll_render) g_orig_paperdoll_render(self, ci, ui_control, a, area);
-    if (g_paperdoll_logged < 10 && area) {
-        g_paperdoll_logged++;
-        const float *f = (const float *)area;
-        nclog("paperdoll render: self=%p area=%p floats=[%.2f %.2f %.2f %.2f]",
-              self, area, f[0], f[1], f[2], f[3]);
-    }
-}
 static bool nc_gameplay_input_active();
 static volatile double g_touch_render_time = 0;  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
 static void ctrl_apply_player_actions();
@@ -517,6 +497,36 @@ static void ctrl_prepare_input(void *h) {
      * they must be set before tick() runs, not after. Jump/Sneak while flying
      * are guesses at which is which - swap the FLY_A vs FLY_B assignment
      * below if up/down come out backwards. */
+    /* Double-tap Sneak (the fly-down button) while flying stops flying, the
+     * same way double-tap Jump starts it - there's no dedicated Jump button
+     * visible mid-air to double-tap yourself. Rather than guess at a direct
+     * "stop flying" function and risk another crash, this simulates the same
+     * quick double press of the real Jump field (NC_MI_JUMP, already proven
+     * safe) that the game's own double-tap detector already watches for.
+     * Timings are a first guess at a human double-tap speed - if it doesn't
+     * reliably trigger, tell me and I'll adjust the window/pulse lengths. */
+    static bool sneak_prev_edge = false;
+    static double sneak_last_press = -10.0;
+    static bool synth_jump_active = false;
+    static double synth_jump_t0 = 0.0;
+    const bool sneak_now = g_ctrl_pressed[NC_CTRL_SNEAK];
+    if (sneak_now && !sneak_prev_edge && g_ctrl_flying) {
+        const double now = now_s();
+        if (now - sneak_last_press < 0.35) { synth_jump_active = true; synth_jump_t0 = now; }
+        sneak_last_press = now;
+    }
+    sneak_prev_edge = sneak_now;
+
+    bool synth_jump_bit = false;
+    if (synth_jump_active) {
+        const double t = now_s() - synth_jump_t0;
+        if      (t < 0.08) synth_jump_bit = true;
+        else if (t < 0.16) synth_jump_bit = false;
+        else if (t < 0.24) synth_jump_bit = true;
+        else if (t < 0.32) synth_jump_bit = false;
+        else synth_jump_active = false;
+    }
+
     if (g_ctrl_flying) {
         const bool up = g_ctrl_pressed[NC_CTRL_JUMP];
         const bool down = g_ctrl_pressed[NC_CTRL_SNEAK];
@@ -527,6 +537,7 @@ static void ctrl_prepare_input(void *h) {
         *mi_b(h, NC_MI_FLY_B3) = down ? 1 : 0;
         *mi_b(h, NC_MI_FLY_SHARED) = (up || down) ? 1 : 0;
         *mi_b(h, NC_MI_SNEAK) = 0;
+        if (synth_jump_active) *mi_b(h, NC_MI_JUMP) = synth_jump_bit ? 1 : 0;
     } else {
         *mi_b(h, NC_MI_SNEAK) = g_ctrl_pressed[NC_CTRL_SNEAK] ? 1 : 0;
     }
@@ -828,6 +839,14 @@ static volatile int  g_item_hook_ever = 0;         /* the hook has run at least 
 static int           g_item_hook_last = -1;
 static int           g_item_log = 0;
 #define NC_ITEM_EXTRA 0.7f    /* 5th float Toolbox passes; leave as is */
+/* The game's own item renderer likely has a different internal anchor/padding
+ * convention than our old custom icons did (which were plain top-left blits),
+ * which is the most likely reason the durability number no longer lines up
+ * with the icon now that items are drawn by the game. Nudge here in pixels;
+ * positive Y moves the icon down, positive X moves it right. Starting at 0 -
+ * tell me which way and by how much it looks off and I'll dial it in exactly. */
+#define NC_ITEM_OFFSET_X 0.0f
+#define NC_ITEM_OFFSET_Y 0.0f
 typedef void (*fn_hud_render)(void *, void *, void *, int, void *);
 static fn_hud_render g_orig_hud_vig = 0, g_orig_hud_heart = 0;
 
@@ -858,7 +877,7 @@ static void armor_draw_items(void *ci) {
         if (!it || ii_isNull(it)) continue;
         float scale = d.size_px / (16.0f * gs);
         if (g_item_log < 6) { g_item_log++; nclog("armor item slot=%d x=%.1f y=%.1f gs=%.2f scale=%.2f", d.slot, d.x_px / gs, d.y_px / gs, gs, scale); }
-        ir_renderGuiItemNew(inst, it, 0, d.x_px / gs, d.y_px / gs, scale, d.alpha, NC_ITEM_EXTRA, ii_isEnchanted(it));
+        ir_renderGuiItemNew(inst, it, 0, d.x_px / gs + NC_ITEM_OFFSET_X, d.y_px / gs + NC_ITEM_OFFSET_Y, scale, d.alpha, NC_ITEM_EXTRA, ii_isEnchanted(it));
     }
 }
 static void hook_hud_vignette(void *self, void *ci, void *ctl, int a, void *area) {
@@ -1653,18 +1672,6 @@ static void combat_consider_entity(void *entity, float partial) {
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
-    /* DIAGNOSTIC: PaperDollRenderer isn't what draws the inventory/skins
-     * player preview (confirmed - it never fires for those screens). It's
-     * possible the preview actually reuses THIS SAME entity-render path,
-     * just repositioned for a UI camera - if so, we already fully support
-     * hitboxes here and need no new hook at all. Log whenever this fires for
-     * the local player specifically while NOT in active gameplay. */
-    static int logged = 0;
-    if (logged < 10 && entity == g_local_player && !nc_gameplay_input_active()) {
-        logged++;
-        nclog("entity render for local player OUTSIDE gameplay (inventory/skins preview?) pos=%p",
-              pos);
-    }
     if (g_cfg.hitbox_on && entity && pos)
         hit_draw_entity(entity, (const float *)pos, partial);
 }
@@ -3263,7 +3270,6 @@ static void nc_init(void) {
     reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
     reg("armor items (vignette)", "_ZN19HudVignetteRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea", (void *)hook_hud_vignette, (void **)&g_orig_hud_vig);
-    reg("paperdoll diagnostic", "_ZN17PaperDollRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea", (void *)hook_paperdoll_render, (void **)&g_orig_paperdoll_render);
     reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
