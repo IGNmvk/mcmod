@@ -937,6 +937,17 @@ static void hook_add_particle(void *self, int type, const void *pos, const void 
     if (g_orig_add_particle) g_orig_add_particle(self, type, pos, vel, data);
 }
 
+/* Eating particles are spawned by this dedicated function, bypassing the
+ * generic addParticle path above entirely - that's why toggling "food" in
+ * the list alone didn't remove them. Gated on the same "food" toggle so it
+ * stays in one place in the UI, but caught at its own real call site now. */
+typedef void (*fn_spawn_eat)(void *, const void *, int);
+static fn_spawn_eat g_orig_spawn_eat = 0;
+static void hook_spawn_eat(void *self, const void *item, int count) {
+    if (g_cfg.particle_remover_on && g_cfg.ptcl_35 == 0) return;
+    if (g_orig_spawn_eat) g_orig_spawn_eat(self, item, count);
+}
+
 static bool ctrl_should_block_mining() {
     return g_cfg.controls_mode == 1 && !g_ctrl_mining_ours && nc_gameplay_input_active();
 }
@@ -3304,6 +3315,7 @@ static void nc_init(void) {
     reg("armor items (hearts)",   "_ZN16HudHeartRenderer6renderER14ClientInstanceR9UIControliR13RectangleArea",   (void *)hook_hud_heart,    (void **)&g_orig_hud_heart);
     reg("tap blocker", "_ZN20ClientInputCallbacks17handleBuildActionER14ClientInstanceR20BuildActionIntention", (void *)hook_build_action, (void **)&g_orig_build_action);
     reg("particle remover", "_ZN13LevelRenderer11addParticleE12ParticleTypeRK4Vec3S3_i", (void *)hook_add_particle, (void **)&g_orig_add_particle);
+    reg("particle remover (eating)", "_ZN6Entity17spawnEatParticlesERK12ItemInstancei", (void *)hook_spawn_eat, (void **)&g_orig_spawn_eat);
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
