@@ -2043,6 +2043,35 @@ static bool ctrl_in_old_button_zone(float x, float y) {
     return left || right;
 }
 
+/* A touch's dead-zone membership is decided ONCE, at the moment it starts,
+ * and stays sticky for that touch's whole lifetime - exactly like our own
+ * button ownership below. Checking position live on every move was the bug:
+ * a camera-drag finger merely passing through this screen region mid-drag
+ * would vanish for the game, breaking the look. Only a touch that actually
+ * STARTS inside the zone gets swallowed. */
+static int g_deadzone_ids[NC_MAX_PTR];
+static bool g_deadzone_inited = false;
+static void deadzone_init_once() {
+    if (g_deadzone_inited) return;
+    g_deadzone_inited = true;
+    for (int k = 0; k < NC_MAX_PTR; k++) g_deadzone_ids[k] = -1;
+}
+static bool deadzone_owns(int id) {
+    if (id < 0) return false;
+    deadzone_init_once();
+    for (int k = 0; k < NC_MAX_PTR; k++) if (g_deadzone_ids[k] == id) return true;
+    return false;
+}
+static void deadzone_claim(int id) {
+    deadzone_init_once();
+    if (deadzone_owns(id)) return;
+    for (int k = 0; k < NC_MAX_PTR; k++) if (g_deadzone_ids[k] == -1) { g_deadzone_ids[k] = id; return; }
+}
+static void deadzone_release(int id) {
+    deadzone_init_once();
+    for (int k = 0; k < NC_MAX_PTR; k++) if (g_deadzone_ids[k] == id) g_deadzone_ids[k] = -1;
+}
+
 static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
     for (;;) {
         g_filt_ev = 0;                                   /* previous event is finished */
@@ -2063,19 +2092,6 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                 m.y[i] = AMotionEvent_getY(ev, (size_t)i);
             }
 
-            /* DIAGNOSTIC: raw screen position of every tap, regardless of
-             * control mode. Sidesteps trying to find the old buttons' layout
-             * inside the game's own object entirely - test in LEGACY mode,
-             * tap each old button once by itself (joystick, jump, sneak,
-             * attack, interact), and the resulting (x, y) pairs here give us
-             * real screen regions we can feed into our ALREADY-WORKING touch
-             * ownership/ignore system below, the same one that already
-             * reliably hides touches on our own buttons from the game. */
-            if (m.action == AMOTION_EVENT_ACTION_DOWN && nc_gameplay_input_active()) {
-                const int idx0 = (m.idx >= 0 && m.idx < m.count) ? m.idx : 0;
-                nclog("raw tap down: (%.1f, %.1f) mode=%d", m.x[idx0], m.y[idx0], g_cfg.controls_mode);
-            }
-
             NcMotion mv = m;                             /* what the game / mod buttons get to see */
             if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
                 const int idx = (m.idx >= 0 && m.idx < m.count) ? m.idx : 0;
@@ -2084,19 +2100,22 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
 
                 if (m.action == AMOTION_EVENT_ACTION_CANCEL) {
                     ctrl_reset_states();                 /* game gets the cancel untouched */
+                    for (int pi = 0; pi < m.count; ++pi) deadzone_release(m.id[pi]);
                 } else {
                     if (is_down) {
                         ctrl_consume_touch(NC_EV_DOWN, m.id[idx], m.x[idx], m.y[idx]);   /* claims it if it hit a control */
+                        if (ctrl_in_old_button_zone(m.x[idx], m.y[idx])) deadzone_claim(m.id[idx]);
                     } else if (!is_up) {
                         for (int pi = 0; pi < m.count; ++pi)
                             if (ctrl_owns_pointer(m.id[pi])) ctrl_consume_touch(NC_EV_MOVE, m.id[pi], m.x[pi], m.y[pi]);
                     }
+                    if (is_up) deadzone_release(m.id[idx]);
 
                     bool hide[NC_MAX_PTR];
                     int vis = 0, new_idx = -1, any_hidden = 0;
                     int map[NC_MAX_PTR];
                     for (int pi = 0; pi < m.count; ++pi) {
-                        hide[pi] = ctrl_owns_pointer(m.id[pi]) || ctrl_in_old_button_zone(m.x[pi], m.y[pi]);
+                        hide[pi] = ctrl_owns_pointer(m.id[pi]) || deadzone_owns(m.id[pi]);
                         if (hide[pi]) { any_hidden = 1; continue; }
                         if (pi == m.idx) new_idx = vis;
                         map[vis++] = pi;
