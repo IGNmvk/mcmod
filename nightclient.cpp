@@ -2029,6 +2029,20 @@ static bool ctrl_owns_pointer(int id) {
     return false;
 }
 
+/* First real attempt at the old-button dead zones, built from the clusters
+ * visible in a general-gameplay touch log (not a clean one-tap-per-button
+ * test) - two broad rectangles rather than five precise ones. Left covers
+ * the whole joystick-drag cluster; right covers jump/sneak/attack/interact
+ * together, since they sit close enough to treat as one region for now.
+ * Expect this to need narrowing once you've tried it - if it's eating
+ * hotbar taps, tell me and I'll shrink it; if a button still gets through,
+ * I'll widen that side. Values are in raw screen pixels (this device: 2400x1080). */
+static bool ctrl_in_old_button_zone(float x, float y) {
+    const bool left  = (x > 40.0f  && x < 480.0f  && y > 600.0f && y < 1080.0f);
+    const bool right = (x > 1700.0f && x < 2400.0f && y > 220.0f && y < 1030.0f);
+    return left || right;
+}
+
 static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
     for (;;) {
         g_filt_ev = 0;                                   /* previous event is finished */
@@ -2082,7 +2096,7 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                     int vis = 0, new_idx = -1, any_hidden = 0;
                     int map[NC_MAX_PTR];
                     for (int pi = 0; pi < m.count; ++pi) {
-                        hide[pi] = ctrl_owns_pointer(m.id[pi]);
+                        hide[pi] = ctrl_owns_pointer(m.id[pi]) || ctrl_in_old_button_zone(m.x[pi], m.y[pi]);
                         if (hide[pi]) { any_hidden = 1; continue; }
                         if (pi == m.idx) new_idx = vis;
                         map[vis++] = pi;
