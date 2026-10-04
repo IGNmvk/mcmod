@@ -1908,31 +1908,6 @@ static void hook_touch_render(void *self, void *ctx) {
      * full-screen overlay on top, which nc_gameplay_input_active() relies on. */
     g_touch_render_time = now_s();
 
-    /* DIAGNOSTIC v2: first scan (pixel-range floats, 2KB window) found
-     * nothing. Most likely reason: positions are probably stored as
-     * NORMALIZED fractions of the screen (0.0-1.0), same as our own config
-     * stores its control positions (ctrl_joy_x=0.16 etc.), not raw pixels.
-     * Widened to catch both, and doubled the scan window in case the data
-     * sits further into the object than the first 2KB. */
-    static bool scanned = false;
-    if (!scanned && self) {
-        scanned = true;
-        const float *f = (const float *)self;
-        const int n = 1024;   /* scan first 4096 bytes as floats */
-        int hits = 0;
-        for (int i = 0; i < n - 1 && hits < 120; i++) {
-            float a = f[i], b = f[i + 1];
-            bool pixel_like = (a > 5.0f && a < 2400.0f && b > 5.0f && b < 1080.0f);
-            bool frac_like  = (a > 0.01f && a < 1.0f && b > 0.01f && b < 1.0f);
-            if (pixel_like || frac_like) {
-                nclog("touchctrl scan off=0x%x (%.4f, %.4f) %s", i * 4, a, b,
-                      pixel_like ? "pixel" : "frac");
-                hits++;
-            }
-        }
-        nclog("touchctrl scan done: %d candidate pairs", hits);
-    }
-
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
 
@@ -2072,6 +2047,19 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                 m.id[i] = AMotionEvent_getPointerId(ev, (size_t)i);
                 m.x[i] = AMotionEvent_getX(ev, (size_t)i);
                 m.y[i] = AMotionEvent_getY(ev, (size_t)i);
+            }
+
+            /* DIAGNOSTIC: raw screen position of every tap, regardless of
+             * control mode. Sidesteps trying to find the old buttons' layout
+             * inside the game's own object entirely - test in LEGACY mode,
+             * tap each old button once by itself (joystick, jump, sneak,
+             * attack, interact), and the resulting (x, y) pairs here give us
+             * real screen regions we can feed into our ALREADY-WORKING touch
+             * ownership/ignore system below, the same one that already
+             * reliably hides touches on our own buttons from the game. */
+            if (m.action == AMOTION_EVENT_ACTION_DOWN && nc_gameplay_input_active()) {
+                const int idx0 = (m.idx >= 0 && m.idx < m.count) ? m.idx : 0;
+                nclog("raw tap down: (%.1f, %.1f) mode=%d", m.x[idx0], m.y[idx0], g_cfg.controls_mode);
             }
 
             NcMotion mv = m;                             /* what the game / mod buttons get to see */
