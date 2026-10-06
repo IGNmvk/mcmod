@@ -182,8 +182,7 @@ static void nclog(const char *fmt, ...);
 static double now_s();
 
 static bool nc_gameplay_input_active();
-static volatile double g_touch_render_time = 0;
-static volatile float g_cur_gs = 4.0f;   /* GUI scale, refreshed once per frame in hook_touch_render (4.0 = this device) */  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
+static volatile double g_touch_render_time = 0;  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
 static void ctrl_apply_player_actions();
 
 static void sl_f(const char *label, float *v, float lo, float hi);
@@ -1920,10 +1919,6 @@ static void hook_touch_render(void *self, void *ctx) {
      * too. Still used purely as a timestamp: the game only calls this with no
      * full-screen overlay on top, which nc_gameplay_input_active() relies on. */
     g_touch_render_time = now_s();
-    if (g_ci) {   /* once per frame: GUI scale, so draw hooks can compare GUI-unit rects to our pixel zones */
-        void *gd = ci_getGuiData(g_ci);
-        if (gd) { float sc = gd_getGuiScale(gd); if (sc > 0.5f && sc < 16.0f) g_cur_gs = sc; }
-    }
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
 
@@ -2178,76 +2173,6 @@ static void ctrl_look_track_up(int id) {
     if (id >= 0 && id < 32) g_ptr_last_valid[id] = false;
 }
 
-/* ---- Make the old buttons invisible ----
- * Skipping all of TouchControlSet::render hid chat/pause too (they share it).
- * Instead, hook the draw calls themselves: each one is handed the rectangle
- * it's drawing, so skip only the ones whose center falls in the old-button
- * zones. Chat, pause, hotbar sit far from those zones and keep drawing.
- * Units are uncertain (raw pixels vs GUI units), so a rect counts as "in the
- * zone" if it is in either interpretation. Only active in new-controls mode
- * during gameplay. */
-static bool ctrl_hide_old_rect(float x0, float x1, float y0, float y1, bool allow_px) {
-    if (g_cfg.controls_mode != 1) return false;
-    if (!nc_gameplay_input_active()) return false;
-    const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
-    if (!(cx == cx) || !(cy == cy)) return false;              /* NaN guard */
-    const float gs = g_cur_gs;
-    if (ctrl_in_old_button_zone(cx * gs, cy * gs)) return true; /* rect was in GUI units */
-    return allow_px && ctrl_in_old_button_zone(cx, cy);         /* rect was in raw pixels */
-}
-
-typedef void (*fn_ictx_rect)(void *, const void *, int, int, int, int);
-static fn_ictx_rect g_orig_ictx_rect = 0;
-static void hook_ictx_rect(void *self, const void *rect, int a, int b, int c, int d) {
-    if (rect) {
-        const float *r = (const float *)rect;                  /* RectangleArea = x0, x1, y0, y1 */
-        if (ctrl_hide_old_rect(r[0], r[1], r[2], r[3], true)) return;
-    }
-    if (g_orig_ictx_rect) g_orig_ictx_rect(self, rect, a, b, c, d);
-}
-
-typedef void (*fn_ictx_text)(void *, const void *, const void *);
-static fn_ictx_text g_orig_ictx_text = 0;
-static void hook_ictx_text(void *self, const void *rect, const void *str) {
-    if (rect) {
-        const float *r = (const float *)rect;
-        if (ctrl_hide_old_rect(r[0], r[1], r[2], r[3], true)) return;
-    }
-    if (g_orig_ictx_text) g_orig_ictx_text(self, rect, str);
-}
-
-/* UI image draw: (this, TexturePtr const&, vec2 pos, vec2 size, vec2 uv, vec2 uvSize).
- * Whether glm's vec2 arrives by value (floats in r2,r3 + stack) or by hidden
- * reference depends on how that old glm declares its copy constructor, which
- * I can't read off the binary. So the hook takes ten raw machine words and
- * forwards all ten unchanged (the original sees identical registers/stack
- * either way), and works out which form it got by checking whether the words
- * look like float coordinates or like pointers. A pointer is only
- * dereferenced if it looks like one. */
-static bool ctrl_word_is_coord(uintptr_t w, float *out) {
-    float f; memcpy(&f, &w, sizeof(f));
-    if (!(f == f) || f < -1.0e5f || f > 1.0e5f) return false;
-    *out = f; return true;
-}
-typedef void (*fn_uictx_image)(void *, void *, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
-static fn_uictx_image g_orig_uictx_image = 0;
-static void hook_uictx_image(void *self, void *tex, uintptr_t a2, uintptr_t a3,
-                             uintptr_t s0, uintptr_t s1, uintptr_t s2, uintptr_t s3, uintptr_t s4, uintptr_t s5) {
-    if (g_cfg.controls_mode == 1) {
-        float px = 0, py = 0, sx = 0, sy = 0;
-        bool have = false;
-        if (ctrl_word_is_coord(a2, &px) && ctrl_word_is_coord(a3, &py) &&
-            ctrl_word_is_coord(s0, &sx) && ctrl_word_is_coord(s1, &sy)) {
-            have = true;                                                  /* vec2 passed by value */
-        } else if (a2 > 0x10000 && a3 > 0x10000 && (a2 & 3) == 0 && (a3 & 3) == 0) {
-            const float *pp = (const float *)a2, *ss = (const float *)a3;  /* vec2 passed by reference */
-            px = pp[0]; py = pp[1]; sx = ss[0]; sy = ss[1];
-            have = (px == px) && (py == py) && (sx == sx) && (sy == sy);
-        }
-        if (have && ctrl_hide_old_rect(px, px + sx, py, py + sy, false)) return;
-    }
-    if (g_orig_uictx_image) g_orig_uictx_image(self, tex, a2, a3, s0, s1, s2, s3, s4, s5);
-}
 
 static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
     for (;;) {
@@ -3579,9 +3504,6 @@ static void nc_init(void) {
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
-    reg("old buttons invisible (rect)",  "_ZNK27MinecraftInputRenderContext8drawRectERK13RectangleAreaiiii", (void *)hook_ictx_rect, (void **)&g_orig_ictx_rect);
-    reg("old buttons invisible (text)",  "_ZN27MinecraftInputRenderContext8drawTextERK13RectangleAreaRKSs", (void *)hook_ictx_text, (void **)&g_orig_ictx_text);
-    reg("old buttons invisible (image)", "_ZN24MinecraftUIRenderContext9drawImageERKN3mce10TexturePtrEN3glm6detail5tvec2IfEES7_S7_S7_", (void *)hook_uictx_image, (void **)&g_orig_uictx_image);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
     reg("inventory render", "_ZN15InventoryScreen6renderEiif", (void *)hook_inventory_render, (void **)&g_orig_inv_render);
