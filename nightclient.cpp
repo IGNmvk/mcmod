@@ -102,6 +102,10 @@ extern "C" void entity_getInterpolatedPosition(NcVec3 *out, void *self, float a)
     __asm__("_ZNK6Entity23getInterpolatedPositionEf");
 extern "C" void entity_getInterpolatedRotation(NcVec2 *out, void *self, float a)
     __asm__("_ZNK6Entity23getInterpolatedRotationEf");
+/* Entity::turn(Vec2 const&, bool) - used to rotate the camera ourselves for
+ * fingers that start on Attack/Interact or on a disabled old button. */
+extern "C" void entity_turn(void *self, const NcVec2 *delta, bool flag)
+    __asm__("_ZN6Entity4turnERK4Vec2b");
 /*
  * Arrow inventory access is intentionally not called yet.
  *
@@ -178,7 +182,8 @@ static void nclog(const char *fmt, ...);
 static double now_s();
 
 static bool nc_gameplay_input_active();
-static volatile double g_touch_render_time = 0;  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
+static volatile double g_touch_render_time = 0;
+static volatile float g_cur_gs = 4.0f;   /* GUI scale, refreshed once per frame in hook_touch_render (4.0 = this device) */  /* last time the game itself called TouchControlSet::render - it only does this with no full-screen overlay on top */
 static void ctrl_apply_player_actions();
 
 static void sl_f(const char *label, float *v, float lo, float hi);
@@ -400,6 +405,14 @@ enum {
 static volatile int g_ctrl_pressed[NC_CTRL_COUNT] = {0};
 static volatile int g_ctrl_flying = 0;      /* local player is flying (Creative): jump/sneak become fly up/down */
 static int g_ctrl_internal = 0;
+/* Drag-to-look: the input thread accumulates finger movement (fixed point,
+ * 1/1000 px) for fingers that started on Attack/Interact or a disabled old
+ * button; the game thread drains it in ctrl_apply_player_actions and turns
+ * the camera. Same split as every other control: input thread writes, game
+ * thread applies. */
+static volatile int g_look_dx_fp = 0, g_look_dy_fp = 0;
+static float g_ptr_last_x[32], g_ptr_last_y[32];
+static bool  g_ptr_last_valid[32];
 static volatile int g_ctrl_mining_ours = 0;   /* true for the whole time OUR Attack button is held */             /* >0 while WE call the game's attack/interact callbacks */
 static volatile int g_ctrl_touch_id = -1;
 static volatile int g_ctrl_joy_id = -1;
@@ -1907,7 +1920,10 @@ static void hook_touch_render(void *self, void *ctx) {
      * too. Still used purely as a timestamp: the game only calls this with no
      * full-screen overlay on top, which nc_gameplay_input_active() relies on. */
     g_touch_render_time = now_s();
-
+    if (g_ci) {   /* once per frame: GUI scale, so draw hooks can compare GUI-unit rects to our pixel zones */
+        void *gd = ci_getGuiData(g_ci);
+        if (gd) { float sc = gd_getGuiScale(gd); if (sc > 0.5f && sc < 16.0f) g_cur_gs = sc; }
+    }
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
 
@@ -1917,10 +1933,75 @@ static void hook_touch_render(void *self, void *ctx) {
  * old buttons' TAPS (not just their icons) needs a more surgical fix that
  * targets just the movement/jump/attack bindings, which is in the dump. */
 
+/* ---- Camera turn for drag-to-look ----
+ * Entity::turn(Vec2 const&, bool) takes a delta whose units and axis order I
+ * can't read off the binary (Java's turn() scales by 0.15 internally, this
+ * one may or may not). So instead of assuming, it calibrates itself the first
+ * time it's needed: nudge each component by a tiny probe (2 units - well under
+ * a degree or two), read the camera rotation back, and learn which component
+ * is yaw, which is pitch, and the signed degrees-per-unit of each. After that
+ * we can ask for an exact number of degrees in the right direction regardless
+ * of the unknowns. One log line reports what it learned. */
+struct NcTurnCal { bool done; int yaw_comp; float yaw_scale; int pitch_comp; float pitch_scale; };
+static NcTurnCal g_turn_cal = { false, 1, 0.15f, 0, 0.15f };
+
+static float ctrl_wrap180(float a) {
+    while (a > 180.0f) a -= 360.0f;
+    while (a < -180.0f) a += 360.0f;
+    return a;
+}
+
+static void ctrl_turn_calibrate(void *p) {
+    g_turn_cal.done = true;                  /* one attempt per session, never loops */
+    const float probe = 2.0f;
+    int yaw_comp = -1, pitch_comp = -1;
+    float yaw_scale = 0.0f, pitch_scale = 0.0f;
+    for (int c = 0; c < 2; c++) {
+        NcVec2 before = {0, 0}, after = {0, 0}, d = {0, 0};
+        entity_getInterpolatedRotation(&before, p, 1.0f);
+        if (c == 0) d.x = probe; else d.y = probe;
+        entity_turn(p, &d, false);
+        entity_getInterpolatedRotation(&after, p, 1.0f);
+        const float dpitch = after.x - before.x;                 /* rot.x = pitch, rot.y = yaw (same as the hitbox look line) */
+        const float dyaw   = ctrl_wrap180(after.y - before.y);
+        if (fabsf(dyaw) > fabsf(dpitch) && fabsf(dyaw) > 0.001f) { yaw_comp = c; yaw_scale = dyaw / probe; }
+        else if (fabsf(dpitch) > 0.001f) { pitch_comp = c; pitch_scale = dpitch / probe; }
+    }
+    if (yaw_comp >= 0 && pitch_comp >= 0 && yaw_comp != pitch_comp) {
+        g_turn_cal.yaw_comp = yaw_comp;     g_turn_cal.yaw_scale = yaw_scale;
+        g_turn_cal.pitch_comp = pitch_comp; g_turn_cal.pitch_scale = pitch_scale;
+        nclog("look calibrated: yaw comp=%d scale=%.4f deg/unit, pitch comp=%d scale=%.4f deg/unit",
+              yaw_comp, yaw_scale, pitch_comp, pitch_scale);
+    } else {
+        nclog("look calibration FAILED (yaw comp=%d, pitch comp=%d) - using default guess", yaw_comp, pitch_comp);
+    }
+}
+
+static void ctrl_apply_look(float dx_px, float dy_px) {
+    if (!g_local_player) return;
+    if (!g_turn_cal.done) ctrl_turn_calibrate(g_local_player);
+    const float deg_per_px = 0.10f * g_cfg.ctrl_look_sens;
+    const float yaw_deg   = dx_px * deg_per_px * (g_cfg.ctrl_look_inv_x ? -1.0f : 1.0f);   /* finger right -> turn right */
+    const float pitch_deg = dy_px * deg_per_px * (g_cfg.ctrl_look_inv_y ? -1.0f : 1.0f);   /* finger down -> look down  */
+    float comp[2] = { 0.0f, 0.0f };
+    if (fabsf(g_turn_cal.yaw_scale)   > 1e-4f) comp[g_turn_cal.yaw_comp]   = yaw_deg   / g_turn_cal.yaw_scale;
+    if (fabsf(g_turn_cal.pitch_scale) > 1e-4f) comp[g_turn_cal.pitch_comp] = pitch_deg / g_turn_cal.pitch_scale;
+    NcVec2 d = { comp[0], comp[1] };
+    entity_turn(g_local_player, &d, false);
+}
+
 static void ctrl_apply_player_actions() {
     if (!g_local_player || g_cfg.controls_mode != 1 || !nc_gameplay_input_active()) {
         if (!nc_gameplay_input_active()) ctrl_reset_states();
+        __sync_lock_test_and_set(&g_look_dx_fp, 0);       /* drop stale look movement */
+        __sync_lock_test_and_set(&g_look_dy_fp, 0);
         return;
+    }
+
+    {   /* drag-to-look accumulated by the input thread since last frame */
+        const int dxp = __sync_lock_test_and_set(&g_look_dx_fp, 0);
+        const int dyp = __sync_lock_test_and_set(&g_look_dy_fp, 0);
+        if (dxp != 0 || dyp != 0) ctrl_apply_look(dxp / 1000.0f, dyp / 1000.0f);
     }
 
     /* Attack/Interact: the game's own press/release callbacks (names verified
@@ -2072,6 +2153,102 @@ static void deadzone_release(int id) {
     for (int k = 0; k < NC_MAX_PTR; k++) if (g_deadzone_ids[k] == id) g_deadzone_ids[k] = -1;
 }
 
+/* Which fingers also steer the camera: the ones holding Attack or Interact
+ * (hold-and-drag to aim, like vanilla) and any finger that started on a
+ * disabled old button. Never the joystick finger. Jump/Sneak fingers don't
+ * look, so a stray slide off them can't spin the view. */
+static bool ctrl_look_capable(int id) {
+    if (id < 0 || id >= 32) return false;
+    if (id == g_ctrl_joy_id) return false;
+    return g_ctrl_ids[NC_CTRL_ATTACK] == id || g_ctrl_ids[NC_CTRL_INTERACT] == id || deadzone_owns(id);
+}
+static void ctrl_look_track_down(int id, float x, float y) {
+    if (!ctrl_look_capable(id)) return;
+    g_ptr_last_x[id] = x; g_ptr_last_y[id] = y; g_ptr_last_valid[id] = true;
+}
+static void ctrl_look_track_move(int id, float x, float y) {
+    if (id < 0 || id >= 32 || !g_ptr_last_valid[id]) return;
+    if (!ctrl_look_capable(id)) { g_ptr_last_valid[id] = false; return; }
+    const float dx = x - g_ptr_last_x[id], dy = y - g_ptr_last_y[id];
+    g_ptr_last_x[id] = x; g_ptr_last_y[id] = y;
+    __sync_fetch_and_add(&g_look_dx_fp, (int)(dx * 1000.0f));
+    __sync_fetch_and_add(&g_look_dy_fp, (int)(dy * 1000.0f));
+}
+static void ctrl_look_track_up(int id) {
+    if (id >= 0 && id < 32) g_ptr_last_valid[id] = false;
+}
+
+/* ---- Make the old buttons invisible ----
+ * Skipping all of TouchControlSet::render hid chat/pause too (they share it).
+ * Instead, hook the draw calls themselves: each one is handed the rectangle
+ * it's drawing, so skip only the ones whose center falls in the old-button
+ * zones. Chat, pause, hotbar sit far from those zones and keep drawing.
+ * Units are uncertain (raw pixels vs GUI units), so a rect counts as "in the
+ * zone" if it is in either interpretation. Only active in new-controls mode
+ * during gameplay. */
+static bool ctrl_hide_old_rect(float x0, float x1, float y0, float y1, bool allow_px) {
+    if (g_cfg.controls_mode != 1) return false;
+    if (!nc_gameplay_input_active()) return false;
+    const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+    if (!(cx == cx) || !(cy == cy)) return false;              /* NaN guard */
+    const float gs = g_cur_gs;
+    if (ctrl_in_old_button_zone(cx * gs, cy * gs)) return true; /* rect was in GUI units */
+    return allow_px && ctrl_in_old_button_zone(cx, cy);         /* rect was in raw pixels */
+}
+
+typedef void (*fn_ictx_rect)(void *, const void *, int, int, int, int);
+static fn_ictx_rect g_orig_ictx_rect = 0;
+static void hook_ictx_rect(void *self, const void *rect, int a, int b, int c, int d) {
+    if (rect) {
+        const float *r = (const float *)rect;                  /* RectangleArea = x0, x1, y0, y1 */
+        if (ctrl_hide_old_rect(r[0], r[1], r[2], r[3], true)) return;
+    }
+    if (g_orig_ictx_rect) g_orig_ictx_rect(self, rect, a, b, c, d);
+}
+
+typedef void (*fn_ictx_text)(void *, const void *, const void *);
+static fn_ictx_text g_orig_ictx_text = 0;
+static void hook_ictx_text(void *self, const void *rect, const void *str) {
+    if (rect) {
+        const float *r = (const float *)rect;
+        if (ctrl_hide_old_rect(r[0], r[1], r[2], r[3], true)) return;
+    }
+    if (g_orig_ictx_text) g_orig_ictx_text(self, rect, str);
+}
+
+/* UI image draw: (this, TexturePtr const&, vec2 pos, vec2 size, vec2 uv, vec2 uvSize).
+ * Whether glm's vec2 arrives by value (floats in r2,r3 + stack) or by hidden
+ * reference depends on how that old glm declares its copy constructor, which
+ * I can't read off the binary. So the hook takes ten raw machine words and
+ * forwards all ten unchanged (the original sees identical registers/stack
+ * either way), and works out which form it got by checking whether the words
+ * look like float coordinates or like pointers. A pointer is only
+ * dereferenced if it looks like one. */
+static bool ctrl_word_is_coord(uintptr_t w, float *out) {
+    float f; memcpy(&f, &w, sizeof(f));
+    if (!(f == f) || f < -1.0e5f || f > 1.0e5f) return false;
+    *out = f; return true;
+}
+typedef void (*fn_uictx_image)(void *, void *, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+static fn_uictx_image g_orig_uictx_image = 0;
+static void hook_uictx_image(void *self, void *tex, uintptr_t a2, uintptr_t a3,
+                             uintptr_t s0, uintptr_t s1, uintptr_t s2, uintptr_t s3, uintptr_t s4, uintptr_t s5) {
+    if (g_cfg.controls_mode == 1) {
+        float px = 0, py = 0, sx = 0, sy = 0;
+        bool have = false;
+        if (ctrl_word_is_coord(a2, &px) && ctrl_word_is_coord(a3, &py) &&
+            ctrl_word_is_coord(s0, &sx) && ctrl_word_is_coord(s1, &sy)) {
+            have = true;                                                  /* vec2 passed by value */
+        } else if (a2 > 0x10000 && a3 > 0x10000 && (a2 & 3) == 0 && (a3 & 3) == 0) {
+            const float *pp = (const float *)a2, *ss = (const float *)a3;  /* vec2 passed by reference */
+            px = pp[0]; py = pp[1]; sx = ss[0]; sy = ss[1];
+            have = (px == px) && (py == py) && (sx == sx) && (sy == sy);
+        }
+        if (have && ctrl_hide_old_rect(px, px + sx, py, py + sy, false)) return;
+    }
+    if (g_orig_uictx_image) g_orig_uictx_image(self, tex, a2, a3, s0, s1, s2, s3, s4, s5);
+}
+
 static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
     for (;;) {
         g_filt_ev = 0;                                   /* previous event is finished */
@@ -2100,16 +2277,19 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
 
                 if (m.action == AMOTION_EVENT_ACTION_CANCEL) {
                     ctrl_reset_states();                 /* game gets the cancel untouched */
-                    for (int pi = 0; pi < m.count; ++pi) deadzone_release(m.id[pi]);
+                    for (int pi = 0; pi < m.count; ++pi) { deadzone_release(m.id[pi]); ctrl_look_track_up(m.id[pi]); }
                 } else {
                     if (is_down) {
                         ctrl_consume_touch(NC_EV_DOWN, m.id[idx], m.x[idx], m.y[idx]);   /* claims it if it hit a control */
                         if (ctrl_in_old_button_zone(m.x[idx], m.y[idx])) deadzone_claim(m.id[idx]);
+                        ctrl_look_track_down(m.id[idx], m.x[idx], m.y[idx]);
                     } else if (!is_up) {
-                        for (int pi = 0; pi < m.count; ++pi)
+                        for (int pi = 0; pi < m.count; ++pi) {
                             if (ctrl_owns_pointer(m.id[pi])) ctrl_consume_touch(NC_EV_MOVE, m.id[pi], m.x[pi], m.y[pi]);
+                            ctrl_look_track_move(m.id[pi], m.x[pi], m.y[pi]);
+                        }
                     }
-                    if (is_up) deadzone_release(m.id[idx]);
+                    if (is_up) { deadzone_release(m.id[idx]); ctrl_look_track_up(m.id[idx]); }
 
                     bool hide[NC_MAX_PTR];
                     int vis = 0, new_idx = -1, any_hidden = 0;
@@ -3001,6 +3181,11 @@ static void panel_controls() {
         ImGui::TextDisabled("Move each control, then choose Opacity or Size at the top.");
         sl_f("Joystick opacity",&g_cfg.ctrl_joy_alpha,0.10f,1.0f);
         sl_f("Button opacity",&g_cfg.ctrl_attack_alpha,0.10f,1.0f);
+        ImGui::Separator();
+        ImGui::TextDisabled("Hold Attack or Interact and slide your finger to aim.");
+        sl_f("Look sensitivity",&g_cfg.ctrl_look_sens,0.1f,5.0f);
+        chk("Invert look X (left/right)", &g_cfg.ctrl_look_inv_x);
+        chk("Invert look Y (up/down)", &g_cfg.ctrl_look_inv_y);
     }
 }
 
@@ -3394,6 +3579,9 @@ static void nc_init(void) {
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
+    reg("old buttons invisible (rect)",  "_ZNK27MinecraftInputRenderContext8drawRectERK13RectangleAreaiiii", (void *)hook_ictx_rect, (void **)&g_orig_ictx_rect);
+    reg("old buttons invisible (text)",  "_ZN27MinecraftInputRenderContext8drawTextERK13RectangleAreaRKSs", (void *)hook_ictx_text, (void **)&g_orig_ictx_text);
+    reg("old buttons invisible (image)", "_ZN24MinecraftUIRenderContext9drawImageERKN3mce10TexturePtrEN3glm6detail5tvec2IfEES7_S7_S7_", (void *)hook_uictx_image, (void **)&g_orig_uictx_image);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
     reg("inventory render", "_ZN15InventoryScreen6renderEiif", (void *)hook_inventory_render, (void **)&g_orig_inv_render);
