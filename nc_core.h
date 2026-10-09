@@ -60,8 +60,7 @@ extern "C" {
   X(ptcl_30,I,1,0,1) X(ptcl_31,I,1,0,1) X(ptcl_32,I,1,0,1) X(ptcl_33,I,1,0,1) X(ptcl_34,I,1,0,1) X(ptcl_35,I,1,0,1) \
   X(ptcl_36,I,1,0,1) X(ptcl_37,I,1,0,1) X(ptcl_38,I,1,0,1) X(ptcl_39,I,1,0,1) X(ptcl_40,I,1,0,1) \
   X(ptcl_41,I,1,0,1) X(ptcl_42,I,1,0,1) X(ptcl_43,I,1,0,1) X(ptcl_44,I,1,0,1) X(ptcl_45,I,1,0,1) \
-  X(ptcl_46,I,1,0,1) X(ptcl_47,I,1,0,1) \
-  X(ctrl_look_sens, F, 1.0, 0.1, 5.0) X(ctrl_look_inv_x, I, 0, 0, 1) X(ctrl_look_inv_y, I, 0, 0, 1)
+  X(ptcl_46,I,1,0,1) X(ptcl_47,I,1,0,1)
 
 #define NC_TYPE_I int
 #define NC_TYPE_F float

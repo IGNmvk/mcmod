@@ -102,10 +102,6 @@ extern "C" void entity_getInterpolatedPosition(NcVec3 *out, void *self, float a)
     __asm__("_ZNK6Entity23getInterpolatedPositionEf");
 extern "C" void entity_getInterpolatedRotation(NcVec2 *out, void *self, float a)
     __asm__("_ZNK6Entity23getInterpolatedRotationEf");
-/* Entity::turn(Vec2 const&, bool) - used to rotate the camera ourselves for
- * fingers that start on Attack/Interact or on a disabled old button. */
-extern "C" void entity_turn(void *self, const NcVec2 *delta, bool flag)
-    __asm__("_ZN6Entity4turnERK4Vec2b");
 /*
  * Arrow inventory access is intentionally not called yet.
  *
@@ -404,14 +400,6 @@ enum {
 static volatile int g_ctrl_pressed[NC_CTRL_COUNT] = {0};
 static volatile int g_ctrl_flying = 0;      /* local player is flying (Creative): jump/sneak become fly up/down */
 static int g_ctrl_internal = 0;
-/* Drag-to-look: the input thread accumulates finger movement (fixed point,
- * 1/1000 px) for fingers that started on Attack/Interact or a disabled old
- * button; the game thread drains it in ctrl_apply_player_actions and turns
- * the camera. Same split as every other control: input thread writes, game
- * thread applies. */
-static volatile int g_look_dx_fp = 0, g_look_dy_fp = 0;
-static float g_ptr_last_x[32], g_ptr_last_y[32];
-static bool  g_ptr_last_valid[32];
 static volatile int g_ctrl_mining_ours = 0;   /* true for the whole time OUR Attack button is held */             /* >0 while WE call the game's attack/interact callbacks */
 static volatile int g_ctrl_touch_id = -1;
 static volatile int g_ctrl_joy_id = -1;
@@ -1928,75 +1916,10 @@ static void hook_touch_render(void *self, void *ctx) {
  * old buttons' TAPS (not just their icons) needs a more surgical fix that
  * targets just the movement/jump/attack bindings, which is in the dump. */
 
-/* ---- Camera turn for drag-to-look ----
- * Entity::turn(Vec2 const&, bool) takes a delta whose units and axis order I
- * can't read off the binary (Java's turn() scales by 0.15 internally, this
- * one may or may not). So instead of assuming, it calibrates itself the first
- * time it's needed: nudge each component by a tiny probe (2 units - well under
- * a degree or two), read the camera rotation back, and learn which component
- * is yaw, which is pitch, and the signed degrees-per-unit of each. After that
- * we can ask for an exact number of degrees in the right direction regardless
- * of the unknowns. One log line reports what it learned. */
-struct NcTurnCal { bool done; int yaw_comp; float yaw_scale; int pitch_comp; float pitch_scale; };
-static NcTurnCal g_turn_cal = { false, 1, 0.15f, 0, 0.15f };
-
-static float ctrl_wrap180(float a) {
-    while (a > 180.0f) a -= 360.0f;
-    while (a < -180.0f) a += 360.0f;
-    return a;
-}
-
-static void ctrl_turn_calibrate(void *p) {
-    g_turn_cal.done = true;                  /* one attempt per session, never loops */
-    const float probe = 2.0f;
-    int yaw_comp = -1, pitch_comp = -1;
-    float yaw_scale = 0.0f, pitch_scale = 0.0f;
-    for (int c = 0; c < 2; c++) {
-        NcVec2 before = {0, 0}, after = {0, 0}, d = {0, 0};
-        entity_getInterpolatedRotation(&before, p, 1.0f);
-        if (c == 0) d.x = probe; else d.y = probe;
-        entity_turn(p, &d, false);
-        entity_getInterpolatedRotation(&after, p, 1.0f);
-        const float dpitch = after.x - before.x;                 /* rot.x = pitch, rot.y = yaw (same as the hitbox look line) */
-        const float dyaw   = ctrl_wrap180(after.y - before.y);
-        if (fabsf(dyaw) > fabsf(dpitch) && fabsf(dyaw) > 0.001f) { yaw_comp = c; yaw_scale = dyaw / probe; }
-        else if (fabsf(dpitch) > 0.001f) { pitch_comp = c; pitch_scale = dpitch / probe; }
-    }
-    if (yaw_comp >= 0 && pitch_comp >= 0 && yaw_comp != pitch_comp) {
-        g_turn_cal.yaw_comp = yaw_comp;     g_turn_cal.yaw_scale = yaw_scale;
-        g_turn_cal.pitch_comp = pitch_comp; g_turn_cal.pitch_scale = pitch_scale;
-        nclog("look calibrated: yaw comp=%d scale=%.4f deg/unit, pitch comp=%d scale=%.4f deg/unit",
-              yaw_comp, yaw_scale, pitch_comp, pitch_scale);
-    } else {
-        nclog("look calibration FAILED (yaw comp=%d, pitch comp=%d) - using default guess", yaw_comp, pitch_comp);
-    }
-}
-
-static void ctrl_apply_look(float dx_px, float dy_px) {
-    if (!g_local_player) return;
-    if (!g_turn_cal.done) ctrl_turn_calibrate(g_local_player);
-    const float deg_per_px = 0.10f * g_cfg.ctrl_look_sens;
-    const float yaw_deg   = dx_px * deg_per_px * (g_cfg.ctrl_look_inv_x ? -1.0f : 1.0f);   /* finger right -> turn right */
-    const float pitch_deg = dy_px * deg_per_px * (g_cfg.ctrl_look_inv_y ? -1.0f : 1.0f);   /* finger down -> look down  */
-    float comp[2] = { 0.0f, 0.0f };
-    if (fabsf(g_turn_cal.yaw_scale)   > 1e-4f) comp[g_turn_cal.yaw_comp]   = yaw_deg   / g_turn_cal.yaw_scale;
-    if (fabsf(g_turn_cal.pitch_scale) > 1e-4f) comp[g_turn_cal.pitch_comp] = pitch_deg / g_turn_cal.pitch_scale;
-    NcVec2 d = { comp[0], comp[1] };
-    entity_turn(g_local_player, &d, false);
-}
-
 static void ctrl_apply_player_actions() {
     if (!g_local_player || g_cfg.controls_mode != 1 || !nc_gameplay_input_active()) {
         if (!nc_gameplay_input_active()) ctrl_reset_states();
-        __sync_lock_test_and_set(&g_look_dx_fp, 0);       /* drop stale look movement */
-        __sync_lock_test_and_set(&g_look_dy_fp, 0);
         return;
-    }
-
-    {   /* drag-to-look accumulated by the input thread since last frame */
-        const int dxp = __sync_lock_test_and_set(&g_look_dx_fp, 0);
-        const int dyp = __sync_lock_test_and_set(&g_look_dy_fp, 0);
-        if (dxp != 0 || dyp != 0) ctrl_apply_look(dxp / 1000.0f, dyp / 1000.0f);
     }
 
     /* Attack/Interact: the game's own press/release callbacks (names verified
@@ -2007,6 +1930,7 @@ static void ctrl_apply_player_actions() {
     static bool resolved = false;
     static fn_cic_ci attack_press = 0, attack_release = 0, interact_press = 0, interact_release = 0;
     static int prev_attack = 0, prev_interact = 0;
+    static double interact_next = 0.0;      /* when the next hold-to-repeat interact is due */
 
     if (!resolved) {
         resolved = true;
@@ -2027,7 +1951,17 @@ static void ctrl_apply_player_actions() {
         g_ctrl_internal++;            /* let our own calls through the tap blocker */
         if (cur_attack && !prev_attack && attack_press) attack_press(g_cic, g_ci);
         if (!cur_attack && prev_attack && attack_release) attack_release(g_cic, g_ci);
-        if (cur_interact && !prev_interact && interact_press) interact_press(g_cic, g_ci);
+        if (cur_interact && !prev_interact && interact_press) {
+            interact_press(g_cic, g_ci);
+            interact_next = now_s() + 0.35;                   /* first repeat after 0.35 s */
+        }
+        if (cur_interact && prev_interact && interact_press && now_s() >= interact_next) {
+            interact_next = now_s() + 0.25;                   /* then every 0.25 s */
+            if (!player_isUsingItem(g_local_player)) {        /* never cancel a bite / bow draw in progress */
+                if (interact_release) interact_release(g_cic, g_ci);
+                interact_press(g_cic, g_ci);                  /* same as a quick tap */
+            }
+        }
         if (!cur_interact && prev_interact && interact_release) interact_release(g_cic, g_ci);
         g_ctrl_internal--;
     }
@@ -2088,15 +2022,40 @@ static int     g_filt_n = 0;
 static int     g_filt_map[NC_MAX_PTR];
 static int32_t g_filt_action = 0;
 
+/* ---- Promoted look fingers ----
+ * A finger on Attack/Interact (or an old-button zone) is hidden from the game.
+ * Once it moves more than NC_PROMOTE_PX it is shown to the game as a NEW finger
+ * that starts at the screen centre, with a fixed offset added to its position,
+ * so the game's own look control (sensitivity, invert, feel) handles it.
+ * state: 0 none, 1 candidate (hidden), 2 promoted (visible, offset applied). */
+#define NC_PR_N 32
+#define NC_PROMOTE_PX 20.0f
+static int   g_pr_state[NC_PR_N];
+static float g_pr_sx[NC_PR_N], g_pr_sy[NC_PR_N];
+static float g_pr_ox[NC_PR_N], g_pr_oy[NC_PR_N];
+static int   g_pr_clear_pending = -1;     /* cleared on the next event, so the UP still gets its offset */
+static float pr_off(const AInputEvent *e, size_t real_i, bool y) {
+    if (e != g_filt_ev) return 0.0f;
+    const int id = AMotionEvent_getPointerId(e, real_i);
+    if (id < 0 || id >= NC_PR_N || g_pr_state[id] != 2) return 0.0f;
+    return y ? g_pr_oy[id] : g_pr_ox[id];
+}
+
 static int32_t hk_m_getAction(const AInputEvent *e) { return e == g_filt_ev ? g_filt_action : AMotionEvent_getAction(e); }
 static size_t  hk_m_getPointerCount(const AInputEvent *e) { return e == g_filt_ev ? (size_t)g_filt_n : AMotionEvent_getPointerCount(e); }
 #define NC_FILT(e, i) ((e) == g_filt_ev && (int)(i) < g_filt_n ? (size_t)g_filt_map[i] : (i))
 static int32_t hk_m_getPointerId(const AInputEvent *e, size_t i) { return AMotionEvent_getPointerId(e, NC_FILT(e, i)); }
-static float   hk_m_getX(const AInputEvent *e, size_t i)    { return AMotionEvent_getX(e, NC_FILT(e, i)); }
-static float   hk_m_getY(const AInputEvent *e, size_t i)    { return AMotionEvent_getY(e, NC_FILT(e, i)); }
-static float   hk_m_getRawX(const AInputEvent *e, size_t i) { return AMotionEvent_getRawX(e, NC_FILT(e, i)); }
-static float   hk_m_getRawY(const AInputEvent *e, size_t i) { return AMotionEvent_getRawY(e, NC_FILT(e, i)); }
-static float   hk_m_getAxisValue(const AInputEvent *e, int32_t axis, size_t i) { return AMotionEvent_getAxisValue(e, axis, NC_FILT(e, i)); }
+static float   hk_m_getX(const AInputEvent *e, size_t i)    { const size_t r = NC_FILT(e, i); return AMotionEvent_getX(e, r) + pr_off(e, r, false); }
+static float   hk_m_getY(const AInputEvent *e, size_t i)    { const size_t r = NC_FILT(e, i); return AMotionEvent_getY(e, r) + pr_off(e, r, true); }
+static float   hk_m_getRawX(const AInputEvent *e, size_t i) { const size_t r = NC_FILT(e, i); return AMotionEvent_getRawX(e, r) + pr_off(e, r, false); }
+static float   hk_m_getRawY(const AInputEvent *e, size_t i) { const size_t r = NC_FILT(e, i); return AMotionEvent_getRawY(e, r) + pr_off(e, r, true); }
+static float   hk_m_getAxisValue(const AInputEvent *e, int32_t axis, size_t i) {
+    const size_t r = NC_FILT(e, i);
+    float v = AMotionEvent_getAxisValue(e, axis, r);
+    if (axis == AMOTION_EVENT_AXIS_X) v += pr_off(e, r, false);
+    else if (axis == AMOTION_EVENT_AXIS_Y) v += pr_off(e, r, true);
+    return v;
+}
 
 static bool ctrl_owns_pointer(int id) {
     if (id < 0) return false;
@@ -2148,35 +2107,27 @@ static void deadzone_release(int id) {
     for (int k = 0; k < NC_MAX_PTR; k++) if (g_deadzone_ids[k] == id) g_deadzone_ids[k] = -1;
 }
 
-/* Which fingers also steer the camera: the ones holding Attack or Interact
- * (hold-and-drag to aim, like vanilla) and any finger that started on a
- * disabled old button. Never the joystick finger. Jump/Sneak fingers don't
- * look, so a stray slide off them can't spin the view. */
+/* Which fingers may be promoted to the game's own look: the ones holding
+ * Attack or Interact (hold-and-drag to aim, like vanilla) and any finger that
+ * started on a disabled old button without hitting one of our controls. Never
+ * the joystick, Jump, Sneak, Up or Down fingers. */
 static bool ctrl_look_capable(int id) {
-    if (id < 0 || id >= 32) return false;
-    if (id == g_ctrl_joy_id) return false;
-    return g_ctrl_ids[NC_CTRL_ATTACK] == id || g_ctrl_ids[NC_CTRL_INTERACT] == id || deadzone_owns(id);
+    if (id < 0 || id >= NC_PR_N || id == g_ctrl_joy_id) return false;
+    if (ctrl_owns_pointer(id)) return g_ctrl_ids[NC_CTRL_ATTACK] == id || g_ctrl_ids[NC_CTRL_INTERACT] == id;
+    return deadzone_owns(id);
 }
-static void ctrl_look_track_down(int id, float x, float y) {
-    if (!ctrl_look_capable(id)) return;
-    g_ptr_last_x[id] = x; g_ptr_last_y[id] = y; g_ptr_last_valid[id] = true;
+static void pr_clear(int id) { if (id >= 0 && id < NC_PR_N) g_pr_state[id] = 0; }
+static void pr_clear_all() { for (int k = 0; k < NC_PR_N; k++) g_pr_state[k] = 0; g_pr_clear_pending = -1; }
+static void pr_track_down(int id, float x, float y) {
+    if (id < 0 || id >= NC_PR_N) return;
+    if (ctrl_look_capable(id)) { g_pr_state[id] = 1; g_pr_sx[id] = x; g_pr_sy[id] = y; }
+    else g_pr_state[id] = 0;
 }
-static void ctrl_look_track_move(int id, float x, float y) {
-    if (id < 0 || id >= 32 || !g_ptr_last_valid[id]) return;
-    if (!ctrl_look_capable(id)) { g_ptr_last_valid[id] = false; return; }
-    const float dx = x - g_ptr_last_x[id], dy = y - g_ptr_last_y[id];
-    g_ptr_last_x[id] = x; g_ptr_last_y[id] = y;
-    __sync_fetch_and_add(&g_look_dx_fp, (int)(dx * 1000.0f));
-    __sync_fetch_and_add(&g_look_dy_fp, (int)(dy * 1000.0f));
-}
-static void ctrl_look_track_up(int id) {
-    if (id >= 0 && id < 32) g_ptr_last_valid[id] = false;
-}
-
 
 static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
     for (;;) {
         g_filt_ev = 0;                                   /* previous event is finished */
+        if (g_pr_clear_pending >= 0) { pr_clear(g_pr_clear_pending); g_pr_clear_pending = -1; }
         int32_t r = g_orig_getEvent(q, out);
         if (r < 0 || !out || !*out) return r;
         AInputEvent *ev = *out;
@@ -2194,71 +2145,112 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
                 m.y[i] = AMotionEvent_getY(ev, (size_t)i);
             }
 
-            NcMotion mv = m;                             /* what the game / mod buttons get to see */
-            if (g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
+            NcMotion mv = m;                             /* what the mod buttons get to see */
+            bool mod_skip = false;
+            if (g_cfg.controls_mode != 1 || !nc_gameplay_input_active()) {
+                pr_clear_all();
+            } else {
                 const int idx = (m.idx >= 0 && m.idx < m.count) ? m.idx : 0;
                 const bool is_down = (m.action == AMOTION_EVENT_ACTION_DOWN || m.action == AMOTION_EVENT_ACTION_POINTER_DOWN);
                 const bool is_up   = (m.action == AMOTION_EVENT_ACTION_UP || m.action == AMOTION_EVENT_ACTION_POINTER_UP);
 
                 if (m.action == AMOTION_EVENT_ACTION_CANCEL) {
                     ctrl_reset_states();                 /* game gets the cancel untouched */
-                    for (int pi = 0; pi < m.count; ++pi) { deadzone_release(m.id[pi]); ctrl_look_track_up(m.id[pi]); }
+                    for (int pi = 0; pi < m.count; ++pi) deadzone_release(m.id[pi]);
+                    pr_clear_all();
                 } else {
                     if (is_down) {
                         ctrl_consume_touch(NC_EV_DOWN, m.id[idx], m.x[idx], m.y[idx]);   /* claims it if it hit a control */
                         if (ctrl_in_old_button_zone(m.x[idx], m.y[idx])) deadzone_claim(m.id[idx]);
-                        ctrl_look_track_down(m.id[idx], m.x[idx], m.y[idx]);
+                        pr_track_down(m.id[idx], m.x[idx], m.y[idx]);
                     } else if (!is_up) {
-                        for (int pi = 0; pi < m.count; ++pi) {
+                        for (int pi = 0; pi < m.count; ++pi)
                             if (ctrl_owns_pointer(m.id[pi])) ctrl_consume_touch(NC_EV_MOVE, m.id[pi], m.x[pi], m.y[pi]);
-                            ctrl_look_track_move(m.id[pi], m.x[pi], m.y[pi]);
+                    }
+
+                    /* a hidden look finger that moved far enough becomes visible to the game (one per event) */
+                    int prom_pi = -1;
+                    if (!is_down && !is_up) {
+                        for (int pi = 0; pi < m.count; ++pi) {
+                            const int id = m.id[pi];
+                            if (id < 0 || id >= NC_PR_N || g_pr_state[id] != 1) continue;
+                            const float dx = m.x[pi] - g_pr_sx[id], dy = m.y[pi] - g_pr_sy[id];
+                            if (dx * dx + dy * dy <= NC_PROMOTE_PX * NC_PROMOTE_PX) continue;
+                            g_pr_state[id] = 2;
+                            g_pr_ox[id] = g_w * 0.5f - m.x[pi];       /* its first position as the game sees it = screen centre */
+                            g_pr_oy[id] = g_h * 0.5f - m.y[pi];
+                            prom_pi = pi;
+                            static int logged = 0;
+                            if (logged < 3) { logged++; nclog("look finger promoted: id=%d at %.0f,%.0f", id, m.x[pi], m.y[pi]); }
+                            break;
                         }
                     }
-                    if (is_up) { deadzone_release(m.id[idx]); ctrl_look_track_up(m.id[idx]); }
 
-                    bool hide[NC_MAX_PTR];
-                    int vis = 0, new_idx = -1, any_hidden = 0;
-                    int map[NC_MAX_PTR];
+                    /* two views: the game sees everything except hidden fingers (promoted ones are shown),
+                     * the mod HUD never sees owned / dead-zone fingers (promoted ones included) */
+                    bool hide_g[NC_MAX_PTR], hide_m[NC_MAX_PTR];
+                    int map_g[NC_MAX_PTR], map_m[NC_MAX_PTR];
+                    int vis_g = 0, vis_m = 0, new_g = -1, new_m = -1, any_g = 0, any_m = 0, any_prom = 0;
+                    const int act_g = (prom_pi >= 0) ? prom_pi : idx;    /* the pointer the action is about, for the game */
                     for (int pi = 0; pi < m.count; ++pi) {
-                        hide[pi] = ctrl_owns_pointer(m.id[pi]) || deadzone_owns(m.id[pi]);
-                        if (hide[pi]) { any_hidden = 1; continue; }
-                        if (pi == m.idx) new_idx = vis;
-                        map[vis++] = pi;
+                        const int id = m.id[pi];
+                        const bool owned = ctrl_owns_pointer(id) || deadzone_owns(id);
+                        const bool prom = (id >= 0 && id < NC_PR_N && g_pr_state[id] == 2);
+                        hide_m[pi] = owned;
+                        hide_g[pi] = owned && !prom;
+                        if (prom) any_prom = 1;
+                        if (hide_g[pi]) any_g = 1;
+                        else { if (pi == act_g) new_g = vis_g; map_g[vis_g++] = pi; }
+                        if (hide_m[pi]) any_m = 1;
+                        else { if (pi == idx) new_m = vis_m; map_m[vis_m++] = pi; }
                     }
-                    const bool acting_hidden = (is_down || is_up) && hide[idx];
+                    const bool game_acting_hidden = (is_down || is_up) && hide_g[idx];
+                    const bool mod_acting_hidden  = (is_down || is_up) && hide_m[idx];
 
-                    if (is_up && hide[idx])
-                        ctrl_consume_touch(NC_EV_UP, m.id[idx], m.x[idx], m.y[idx]);      /* release our control */
+                    if (is_up) {
+                        const int up_id = m.id[idx];
+                        if (hide_m[idx]) ctrl_consume_touch(NC_EV_UP, up_id, m.x[idx], m.y[idx]);   /* release our control */
+                        deadzone_release(up_id);
+                        g_pr_clear_pending = up_id;          /* keep its offset until the game has read this UP */
+                    }
 
-                    if (acting_hidden || vis == 0) {     /* nothing in this event concerns the game */
+                    if (game_acting_hidden || vis_g == 0) {  /* nothing in this event concerns the game */
                         AInputQueue_finishEvent(q, ev, 1);
                         continue;
                     }
-                    if (any_hidden) {
+                    if (any_g || any_prom) {
                         int32_t base = m.action;
-                        if (is_down) base = (vis == 1) ? AMOTION_EVENT_ACTION_DOWN : AMOTION_EVENT_ACTION_POINTER_DOWN;
-                        else if (is_up) base = (vis == 1) ? AMOTION_EVENT_ACTION_UP : AMOTION_EVENT_ACTION_POINTER_UP;
-                        g_filt_n = vis;
-                        for (int k = 0; k < vis; ++k) g_filt_map[k] = map[k];
+                        if (prom_pi >= 0 || is_down) base = (vis_g == 1) ? AMOTION_EVENT_ACTION_DOWN : AMOTION_EVENT_ACTION_POINTER_DOWN;
+                        else if (is_up)              base = (vis_g == 1) ? AMOTION_EVENT_ACTION_UP   : AMOTION_EVENT_ACTION_POINTER_UP;
+                        g_filt_n = vis_g;
+                        for (int k = 0; k < vis_g; ++k) g_filt_map[k] = map_g[k];
                         g_filt_action = base | ((base == AMOTION_EVENT_ACTION_POINTER_DOWN || base == AMOTION_EVENT_ACTION_POINTER_UP)
-                                                ? (new_idx << 8) : 0);
+                                                ? ((new_g >= 0 ? new_g : 0) << 8) : 0);
                         g_filt_ev = ev;
-
-                        mv.action = base;
-                        mv.idx = (new_idx >= 0) ? new_idx : 0;
-                        mv.count = vis;
-                        for (int k = 0; k < vis; ++k) { mv.id[k] = m.id[map[k]]; mv.x[k] = m.x[map[k]]; mv.y[k] = m.y[map[k]]; }
                     }
+
+                    if (any_m) {
+                        int32_t base = m.action;
+                        if (is_down) base = (vis_m == 1) ? AMOTION_EVENT_ACTION_DOWN : AMOTION_EVENT_ACTION_POINTER_DOWN;
+                        else if (is_up) base = (vis_m == 1) ? AMOTION_EVENT_ACTION_UP : AMOTION_EVENT_ACTION_POINTER_UP;
+                        mv.action = base;
+                        mv.idx = (new_m >= 0) ? new_m : 0;
+                        mv.count = vis_m;
+                        for (int k = 0; k < vis_m; ++k) { mv.id[k] = m.id[map_m[k]]; mv.x[k] = m.x[map_m[k]]; mv.y[k] = m.y[map_m[k]]; }
+                    }
+                    if (mod_acting_hidden || vis_m == 0) mod_skip = true;   /* only a promoted finger is moving: not for the HUD */
                 }
             }
-            pthread_mutex_lock(&g_mu);
-            int swallow = nc_touch_event(&g_touch, &mv, push_ev, 0);
-            pthread_mutex_unlock(&g_mu);
-            if (swallow) {
-                if (g_touch_logged < 6) { g_touch_logged++; nclog("touch taken: action=%d", m.action); }
-                g_filt_ev = 0;
-                AInputQueue_finishEvent(q, ev, 1);
-                continue;
+            if (!mod_skip) {
+                pthread_mutex_lock(&g_mu);
+                int swallow = nc_touch_event(&g_touch, &mv, push_ev, 0);
+                pthread_mutex_unlock(&g_mu);
+                if (swallow) {
+                    if (g_touch_logged < 6) { g_touch_logged++; nclog("touch taken: action=%d", m.action); }
+                    g_filt_ev = 0;
+                    AInputQueue_finishEvent(q, ev, 1);
+                    continue;
+                }
             }
         }
         return r;
@@ -3108,9 +3100,7 @@ static void panel_controls() {
         sl_f("Button opacity",&g_cfg.ctrl_attack_alpha,0.10f,1.0f);
         ImGui::Separator();
         ImGui::TextDisabled("Hold Attack or Interact and slide your finger to aim.");
-        sl_f("Look sensitivity",&g_cfg.ctrl_look_sens,0.1f,5.0f);
-        chk("Invert look X (left/right)", &g_cfg.ctrl_look_inv_x);
-        chk("Invert look Y (up/down)", &g_cfg.ctrl_look_inv_y);
+        ImGui::TextDisabled("Uses the game's own look sensitivity setting.");
     }
 }
 
