@@ -1910,6 +1910,73 @@ static void hook_touch_render(void *self, void *ctx) {
     if (g_orig_touch_render) g_orig_touch_render(self, ctx);
 }
 
+/* ---- Hide the old on-screen buttons (new-controls mode) ----
+ * TouchControlSet::render also draws chat/pause, so it can't be skipped as a
+ * whole. Instead hook each glyph button's own render and skip it only when the
+ * button sits below the top bar (jump / sneak / fly / etc.). The control's
+ * area comes from the std::function it was built with (libstdc++ layout on
+ * ARM32: functor 8 bytes, manager at +8, invoker at +12). Rather than guess
+ * where that function lives inside the control, the constructor hook finds it
+ * by matching manager+invoker against the argument it was built from. */
+extern "C" float rect_centerX(const void *self) __asm__("_ZNK13RectangleArea7centerXEv");
+extern "C" float rect_centerY(const void *self) __asm__("_ZNK13RectangleArea7centerYEv");
+
+typedef void (*fn_glyph_ctor)(void *, void *, void *, short, const void *, int, int, int, int, bool, int, float, void *, bool);
+typedef void (*fn_glyph_render)(const void *, void *);
+static fn_glyph_ctor   g_orig_glyph_ctor = 0;
+static fn_glyph_render g_orig_glyph_render = 0;
+#define NC_GLYPH_MAX 64
+static const void *volatile g_glyph_obj[NC_GLYPH_MAX];
+static volatile int g_glyph_off[NC_GLYPH_MAX];
+static int g_glyph_next = 0;
+
+static void hook_glyph_ctor(void *self, void *fArea, void *fVis, short id, const void *col,
+                            int a, int b, int c, int d, bool e, int f, float g, void *str, bool h) {
+    const uint32_t *fa = (const uint32_t *)fArea;
+    const uint32_t mgr = fa[2], inv = fa[3];          /* read BEFORE the ctor moves the argument away */
+    g_orig_glyph_ctor(self, fArea, fVis, id, col, a, b, c, d, e, f, g, str, h);
+    int found = -1;
+    if (mgr && inv) {
+        for (int off = 0; off <= 32; off += 4) {
+            const uint32_t *w = (const uint32_t *)((const char *)self + off);
+            if (w[2] == mgr && w[3] == inv) { found = off; break; }
+        }
+    }
+    if (found >= 0) {
+        int slot = -1;
+        for (int i = 0; i < NC_GLYPH_MAX; i++) if (g_glyph_obj[i] == self) { slot = i; break; }
+        if (slot < 0) { slot = g_glyph_next; g_glyph_next = (g_glyph_next + 1) % NC_GLYPH_MAX; }
+        g_glyph_obj[slot] = 0;
+        g_glyph_off[slot] = found;
+        g_glyph_obj[slot] = self;
+    }
+    static int logged = 0;
+    if (logged < 8) { logged++; nclog("glyph button built: id=%d area fn offset=%d", (int)id, found); }
+}
+
+static bool glyph_is_old_button(const void *self) {
+    int off = -1;
+    for (int i = 0; i < NC_GLYPH_MAX; i++) if (g_glyph_obj[i] == self) { off = g_glyph_off[i]; break; }
+    if (off < 0) return false;                          /* unknown control: leave it visible */
+    const char *fn = (const char *)self + off;
+    typedef void (*inv_t)(void *sret, const void *any);
+    const inv_t inv = (inv_t)(uintptr_t)(*(const uint32_t *)(fn + 12));
+    if (!inv) return false;
+    float buf[16];
+    memset(buf, 0, sizeof(buf));
+    inv(buf, fn);                                       /* RectangleArea comes back through the hidden return pointer */
+    float cx = rect_centerX(buf), cy = rect_centerY(buf);
+    if (cx >= 0.0f && cx <= 2.0f && cy >= 0.0f && cy <= 2.0f) { cx *= g_w; cy *= g_h; }   /* normalised units */
+    static int logged = 0;
+    if (logged < 10) { logged++; nclog("glyph button area centre %.0f,%.0f (screen %.0fx%.0f)", cx, cy, g_w, g_h); }
+    return cy > g_h * 0.22f;                            /* top bar (pause / chat) stays */
+}
+
+static void hook_glyph_render(const void *self, void *ctx) {
+    if (g_cfg.controls_mode == 1 && glyph_is_old_button(self)) return;
+    if (g_orig_glyph_render) g_orig_glyph_render(self, ctx);
+}
+
 /* NOTE: TouchControlSet::tick() also drives camera-turn (drag to look) and
  * gui-passthrough taps (chat, pause), not just the old movement buttons -
  * blocking it wholesale breaks those too. Left unhooked for now; hiding the
@@ -2653,13 +2720,38 @@ static void panel_controls();
 static ImVec2 txt(const char *s, float size);
 static void put_text(ImDrawList *dl, ImVec2 p, float size, ImU32 col, const char *s);
 
+/* Overlap (px^2, with a small gap) between control i placed at p/s and every
+ * other visible control. Used so buttons can't be dragged or resized on top
+ * of each other. */
+static float ctrl_overlap_area(int self, ImVec2 p, ImVec2 s, float w, float h) {
+    const float gap = 3.0f * g_base;
+    float sum = 0.0f;
+    for (int j = 0; j < NC_CTRL_COUNT; j++) {
+        if (j == self || !ctrl_slot_shown(j)) continue;
+        const ImVec2 q = ctrl_place(j, w, h), t = ctrl_size_px(j);
+        const float ox = fminf(p.x + s.x, q.x + t.x) - fmaxf(p.x, q.x) + gap;
+        const float oy = fminf(p.y + s.y, q.y + t.y) - fmaxf(p.y, q.y) + gap;
+        if (ox > 0.0f && oy > 0.0f) sum += ox * oy;
+    }
+    return sum;
+}
+static bool ctrl_try_move(int i, ImVec2 np, ImVec2 p, ImVec2 s, float w, float h) {
+    const float rx = fmaxf(1.0f, w - s.x), ry = fmaxf(1.0f, h - s.y);
+    np.x = clampf(np.x, 0.0f, rx); np.y = clampf(np.y, 0.0f, ry);
+    const float before = ctrl_overlap_area(i, p, s, w, h);
+    if (ctrl_overlap_area(i, np, s, w, h) > before) return false;     /* would end up on another button */
+    *ctrl_x(i) = clampf(np.x / rx, 0, 1);
+    *ctrl_y(i) = clampf(np.y / ry, 0, 1);
+    return true;
+}
+
 static void build_control_editor(float w, float h) {
     ImGui::SetNextWindowPos(V(0,0), ImGuiCond_Always);
     ImGui::SetNextWindowSize(V(w,h), ImGuiCond_Always);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,V(0,0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize,0.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4(0,0,0,0));
-    ImGui::Begin("##night_controls_editor",NULL,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoBackground);
+    ImGui::Begin("##night_controls_editor",NULL,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoBackground|ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImDrawList *dl=ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0,0),V(w,h),IM_COL32(0,0,0,130));
 
@@ -2682,21 +2774,11 @@ static void build_control_editor(float w, float h) {
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0,0.0f)) {
             ImGuiIO &io=ImGui::GetIO();
             ImVec2 np=V(p.x+io.MouseDelta.x,p.y+io.MouseDelta.y);
-            float rx=fmaxf(1.0f,w-s.x), ry=fmaxf(1.0f,h-s.y);
-            *ctrl_x(i)=clampf(np.x/rx,0,1); *ctrl_y(i)=clampf(np.y/ry,0,1);
+            if (!ctrl_try_move(i,np,p,s,w,h)) {              /* blocked: slide along one axis instead */
+                if (!ctrl_try_move(i,V(np.x,p.y),p,s,w,h)) ctrl_try_move(i,V(p.x,np.y),p,s,w,h);
+            }
         }
     }
-
-    ImGui::SetCursorScreenPos(V(18*g_base,70*g_base));
-    ImGui::BeginChild("##ctrl_settings",V(260*g_base,165*g_base),true,0);
-    ImGui::TextColored(ACCENT,"Selected: %s",ctrl_name(g_ctrl_selected));
-    if (g_ctrl_editor_tab==0) {
-        sl_f("Opacity",ctrl_alpha(g_ctrl_selected),0.10f,1.0f);
-    } else {
-        sl_f("Size",ctrl_size(g_ctrl_selected),0.5f,10.0f);
-    }
-    ImGui::TextDisabled("Drag a control to move it.");
-    ImGui::EndChild();
 
     ImGui::SetCursorScreenPos(V(w*0.5f-90*g_base,h-58*g_base));
     if (ImGui::Button("Done",V(180*g_base,40*g_base))) {
@@ -2706,6 +2788,28 @@ static void build_control_editor(float w, float h) {
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
+
+    /* Settings panel: its own window, so the title bar drags it anywhere. */
+    ImGui::SetNextWindowPos(V(18*g_base,70*g_base), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(V(270*g_base,150*g_base), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Control settings (drag here)##ctrl_panel", NULL,
+                     ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoNav)) {
+        const int sel = g_ctrl_selected;
+        ImGui::TextColored(ACCENT,"Selected: %s",ctrl_name(sel));
+        if (g_ctrl_editor_tab==0) {
+            sl_f("Opacity",ctrl_alpha(sel),0.10f,1.0f);
+        } else {
+            const float old_size = *ctrl_size(sel);
+            const float before = ctrl_overlap_area(sel, ctrl_place(sel,w,h), ctrl_size_px(sel), w, h);
+            sl_f("Size",ctrl_size(sel),0.5f,10.0f);
+            if (*ctrl_size(sel) != old_size &&
+                ctrl_overlap_area(sel, ctrl_place(sel,w,h), ctrl_size_px(sel), w, h) > before)
+                *ctrl_size(sel) = old_size;                  /* growing would overlap another button */
+        }
+        ImGui::TextDisabled("Drag a control to move it.");
+        ImGui::TextDisabled("Buttons can't overlap.");
+    }
+    ImGui::End();
 }
 
 /* ---- round/square buttons (N, Zoom, Perspective) with preset labels ---- */
@@ -3494,6 +3598,8 @@ static void nc_init(void) {
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
+    reg("old buttons (build)", "_ZN23TouchGlyphButtonControlC1ESt8functionIF13RectangleAreavEES0_IFbvEEsRK12ButtonColorsiiiibifSsb", (void *)hook_glyph_ctor, (void **)&g_orig_glyph_ctor);
+    reg("old buttons (hide)", "_ZNK23TouchGlyphButtonControl6renderER18InputRenderContext", (void *)hook_glyph_render, (void **)&g_orig_glyph_render);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
     reg("inventory render", "_ZN15InventoryScreen6renderEiif", (void *)hook_inventory_render, (void **)&g_orig_inv_render);
