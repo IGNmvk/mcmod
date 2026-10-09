@@ -1477,21 +1477,24 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
      * pointer is still grabbed below for the diagnostic log. */
     void *vptr = *(void **)entity;
 
-    /* DIAGNOSTIC: item exclusion didn't fix the "box near the player" bug.
-     * Log anything drawn suspiciously close to the local player - pointer,
-     * whether it's actually g_local_player leaking through the exclusion
-     * check, and the box itself - so we can see what it really is instead of
-     * guessing again. Remove once identified. */
+    /* The "stray box next to the player" was identified from the log: a dropped
+     * item (ItemEntity vtable) 0.8 blocks away, drawn for two frames - the pickup
+     * animation (or an item just thrown). Skip item boxes within 2.5 blocks of
+     * the local player; items further away still get their box. */
     if (g_local_player && entity != g_local_player) {
-        const float *mypos = entity_getPos(g_local_player);
-        const float *epos = entity_getPos(entity);
-        if (mypos && epos) {
-            float dx = epos[0] - mypos[0], dy = epos[1] - mypos[1], dz = epos[2] - mypos[2];
-            float d = sqrtf(dx * dx + dy * dy + dz * dz);
-            static int logged = 0;
-            if (d < 1.2f && logged < 20) {
-                logged++;
-                nclog("near-player box: entity=%p vptr=%p dist=%.2f dy=%.2f", entity, vptr, d, dy);
+        static uintptr_t item_vt = 0;
+        static bool item_vt_ready = false;
+        if (!item_vt_ready) {
+            void *vt = hit_dlsym("_ZTV10ItemEntity");
+            if (vt) item_vt = (uintptr_t)vt + sizeof(void *) * 2;     /* object vptr = vtable + 8 */
+            item_vt_ready = true;
+        }
+        if (item_vt && (uintptr_t)vptr == item_vt) {
+            const float *mypos = entity_getPos(g_local_player);
+            const float *epos = entity_getPos(entity);
+            if (mypos && epos) {
+                const float dx = epos[0] - mypos[0], dy = epos[1] - mypos[1], dz = epos[2] - mypos[2];
+                if (dx * dx + dy * dy + dz * dz < 2.5f * 2.5f) return;
             }
         }
     }
@@ -1928,6 +1931,8 @@ static fn_glyph_render g_orig_glyph_render = 0;
 #define NC_GLYPH_MAX 64
 static const void *volatile g_glyph_obj[NC_GLYPH_MAX];
 static volatile int g_glyph_off[NC_GLYPH_MAX];
+static volatile int g_glyph_id[NC_GLYPH_MAX];
+static volatile int g_glyph_logged[NC_GLYPH_MAX];
 static int g_glyph_next = 0;
 
 static void hook_glyph_ctor(void *self, void *fArea, void *fVis, short id, const void *col,
@@ -1948,6 +1953,8 @@ static void hook_glyph_ctor(void *self, void *fArea, void *fVis, short id, const
         if (slot < 0) { slot = g_glyph_next; g_glyph_next = (g_glyph_next + 1) % NC_GLYPH_MAX; }
         g_glyph_obj[slot] = 0;
         g_glyph_off[slot] = found;
+        g_glyph_id[slot] = (int)id;
+        g_glyph_logged[slot] = 0;
         g_glyph_obj[slot] = self;
     }
     static int logged = 0;
@@ -1955,9 +1962,13 @@ static void hook_glyph_ctor(void *self, void *fArea, void *fVis, short id, const
 }
 
 static bool glyph_is_old_button(const void *self) {
-    int off = -1;
-    for (int i = 0; i < NC_GLYPH_MAX; i++) if (g_glyph_obj[i] == self) { off = g_glyph_off[i]; break; }
-    if (off < 0) return false;                          /* unknown control: leave it visible */
+    int off = -1, slot = -1;
+    for (int i = 0; i < NC_GLYPH_MAX; i++) if (g_glyph_obj[i] == self) { off = g_glyph_off[i]; slot = i; break; }
+    if (off < 0) {
+        static int unk = 0;
+        if (unk < 3) { unk++; nclog("glyph button not tracked (built before the hook?): %p", self); }
+        return false;                                   /* unknown control: leave it visible */
+    }
     const char *fn = (const char *)self + off;
     typedef void (*inv_t)(void *sret, const void *any);
     const inv_t inv = (inv_t)(uintptr_t)(*(const uint32_t *)(fn + 12));
@@ -1967,9 +1978,22 @@ static bool glyph_is_old_button(const void *self) {
     inv(buf, fn);                                       /* RectangleArea comes back through the hidden return pointer */
     float cx = rect_centerX(buf), cy = rect_centerY(buf);
     if (cx >= 0.0f && cx <= 2.0f && cy >= 0.0f && cy <= 2.0f) { cx *= g_w; cy *= g_h; }   /* normalised units */
+    const bool hide = cy > g_h * 0.22f;                 /* top bar (pause / chat) stays */
+    if (!g_glyph_logged[slot]) {
+        g_glyph_logged[slot] = 1;
+        nclog("glyph button id=%d centre=%.0f,%.0f screen=%.0fx%.0f -> %s", g_glyph_id[slot], cx, cy, g_w, g_h, hide ? "hidden" : "kept");
+    }
+    return hide;
+}
+
+/* Probe only: tells us whether the game draws anything through text buttons
+ * (they have no area function, so they can't be position-filtered yet). */
+typedef void (*fn_text_render)(const void *, void *);
+static fn_text_render g_orig_text_render = 0;
+static void hook_text_render(const void *self, void *ctx) {
     static int logged = 0;
-    if (logged < 10) { logged++; nclog("glyph button area centre %.0f,%.0f (screen %.0fx%.0f)", cx, cy, g_w, g_h); }
-    return cy > g_h * 0.22f;                            /* top bar (pause / chat) stays */
+    if (logged < 3) { logged++; nclog("text button rendered: %p", self); }
+    if (g_orig_text_render) g_orig_text_render(self, ctx);
 }
 
 static void hook_glyph_render(const void *self, void *ctx) {
@@ -3599,6 +3623,7 @@ static void nc_init(void) {
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("old buttons (build)", "_ZN23TouchGlyphButtonControlC1ESt8functionIF13RectangleAreavEES0_IFbvEEsRK12ButtonColorsiiiibifSsb", (void *)hook_glyph_ctor, (void **)&g_orig_glyph_ctor);
+    reg("old buttons (text probe)", "_ZNK22TouchTextButtonControl6renderER18InputRenderContext", (void *)hook_text_render, (void **)&g_orig_text_render);
     reg("old buttons (hide)", "_ZNK23TouchGlyphButtonControl6renderER18InputRenderContext", (void *)hook_glyph_render, (void **)&g_orig_glyph_render);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
     reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
