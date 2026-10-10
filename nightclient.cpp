@@ -1495,6 +1495,26 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
             if (mypos && epos) {
                 const float dx = epos[0] - mypos[0], dy = epos[1] - mypos[1], dz = epos[2] - mypos[2];
                 if (dx * dx + dy * dy + dz * dz < 2.5f * 2.5f) return;
+                /* Ghost check: the game also draws items through the pickup
+                 * animation, with a render position that slides toward the
+                 * player while the item itself stays put. A box drawn for that
+                 * does not match where the item really is, so compare. */
+                const float rx = render_pos[0] - dx, rz = render_pos[2] - dz;
+                if (rx * rx + rz * rz > 0.6f * 0.6f) return;
+            }
+        }
+        {   /* Data for the ghost box: any entity drawn far from where it really is. */
+            const float *mypos = entity_getPos(g_local_player);
+            const float *epos = entity_getPos(entity);
+            if (mypos && epos) {
+                const float ex = epos[0] - mypos[0], ez = epos[2] - mypos[2];
+                const float mx = render_pos[0] - ex, mz = render_pos[2] - ez;
+                static int logged = 0;
+                if (mx * mx + mz * mz > 1.5f * 1.5f && logged < 12) {
+                    logged++;
+                    nclog("box far from entity: vptr=%p entity-rel=%.2f,%.2f render=%.2f,%.2f",
+                          vptr, ex, ez, render_pos[0], render_pos[2]);
+                }
             }
         }
     }
@@ -1924,52 +1944,42 @@ static void hook_touch_render(void *self, void *ctx) {
 extern "C" float rect_centerX(const void *self) __asm__("_ZNK13RectangleArea7centerXEv");
 extern "C" float rect_centerY(const void *self) __asm__("_ZNK13RectangleArea7centerYEv");
 
-typedef void (*fn_glyph_ctor)(void *, void *, void *, short, const void *, int, int, int, int, bool, int, float, void *, bool);
 typedef void (*fn_glyph_render)(const void *, void *);
-static fn_glyph_ctor   g_orig_glyph_ctor = 0;
 static fn_glyph_render g_orig_glyph_render = 0;
-#define NC_GLYPH_MAX 64
-static const void *volatile g_glyph_obj[NC_GLYPH_MAX];
-static volatile int g_glyph_off[NC_GLYPH_MAX];
-static volatile int g_glyph_id[NC_GLYPH_MAX];
-static volatile int g_glyph_logged[NC_GLYPH_MAX];
-static int g_glyph_next = 0;
 
-static void hook_glyph_ctor(void *self, void *fArea, void *fVis, short id, const void *col,
-                            int a, int b, int c, int d, bool e, int f, float g, void *str, bool h) {
-    const uint32_t *fa = (const uint32_t *)fArea;
-    const uint32_t mgr = fa[2], inv = fa[3];          /* read BEFORE the ctor moves the argument away */
-    g_orig_glyph_ctor(self, fArea, fVis, id, col, a, b, c, d, e, f, g, str, h);
-    int found = -1;
-    if (mgr && inv) {
-        for (int off = 0; off <= 32; off += 4) {
-            const uint32_t *w = (const uint32_t *)((const char *)self + off);
-            if (w[2] == mgr && w[3] == inv) { found = off; break; }
-        }
+/* Where the area std::function sits inside a TouchGlyphButtonControl. The
+ * constructor hook never fired (the controls are built before our hooks are
+ * installed), so the offset is found at render time instead: the base class
+ * TouchControl holds the function first, so it is the lowest offset where the
+ * two words at +8 / +12 (manager, invoker) both point into the game's code. */
+static void *g_game_base = 0;
+static int   g_glyph_fn_off = -2;                 /* -2 not scanned yet, -1 failed */
+static const void *g_glyph_seen[16];
+static int   g_glyph_seen_n = 0;
+
+static bool nc_is_game_code(uint32_t p) {
+    if (!p || !g_game_base) return false;
+    Dl_info di;
+    if (!dladdr((void *)(uintptr_t)p, &di)) return false;
+    return di.dli_fbase == g_game_base;
+}
+
+static void glyph_scan_offset(const void *self) {
+    Dl_info di;
+    if (dladdr((void *)&rect_centerX, &di)) g_game_base = di.dli_fbase;
+    g_glyph_fn_off = -1;
+    if (!g_game_base) { nclog("glyph buttons: game base not found"); return; }
+    for (int off = 4; off <= 48; off += 4) {
+        const uint32_t *w = (const uint32_t *)((const char *)self + off);
+        if (nc_is_game_code(w[2]) && nc_is_game_code(w[3])) { g_glyph_fn_off = off; break; }
     }
-    if (found >= 0) {
-        int slot = -1;
-        for (int i = 0; i < NC_GLYPH_MAX; i++) if (g_glyph_obj[i] == self) { slot = i; break; }
-        if (slot < 0) { slot = g_glyph_next; g_glyph_next = (g_glyph_next + 1) % NC_GLYPH_MAX; }
-        g_glyph_obj[slot] = 0;
-        g_glyph_off[slot] = found;
-        g_glyph_id[slot] = (int)id;
-        g_glyph_logged[slot] = 0;
-        g_glyph_obj[slot] = self;
-    }
-    static int logged = 0;
-    if (logged < 8) { logged++; nclog("glyph button built: id=%d area fn offset=%d", (int)id, found); }
+    nclog("glyph buttons: area function found at +%d", g_glyph_fn_off);
 }
 
 static bool glyph_is_old_button(const void *self) {
-    int off = -1, slot = -1;
-    for (int i = 0; i < NC_GLYPH_MAX; i++) if (g_glyph_obj[i] == self) { off = g_glyph_off[i]; slot = i; break; }
-    if (off < 0) {
-        static int unk = 0;
-        if (unk < 3) { unk++; nclog("glyph button not tracked (built before the hook?): %p", self); }
-        return false;                                   /* unknown control: leave it visible */
-    }
-    const char *fn = (const char *)self + off;
+    if (g_glyph_fn_off == -2) glyph_scan_offset(self);
+    if (g_glyph_fn_off < 0) return false;               /* not found: leave everything visible */
+    const char *fn = (const char *)self + g_glyph_fn_off;
     typedef void (*inv_t)(void *sret, const void *any);
     const inv_t inv = (inv_t)(uintptr_t)(*(const uint32_t *)(fn + 12));
     if (!inv) return false;
@@ -1977,11 +1987,18 @@ static bool glyph_is_old_button(const void *self) {
     memset(buf, 0, sizeof(buf));
     inv(buf, fn);                                       /* RectangleArea comes back through the hidden return pointer */
     float cx = rect_centerX(buf), cy = rect_centerY(buf);
+    if (!(cx > -50000.0f && cx < 50000.0f && cy > -50000.0f && cy < 50000.0f)) {   /* also rejects NaN */
+        nclog("glyph buttons: area looks wrong (%f,%f) - giving up", cx, cy);
+        g_glyph_fn_off = -1;
+        return false;
+    }
     if (cx >= 0.0f && cx <= 2.0f && cy >= 0.0f && cy <= 2.0f) { cx *= g_w; cy *= g_h; }   /* normalised units */
     const bool hide = cy > g_h * 0.22f;                 /* top bar (pause / chat) stays */
-    if (!g_glyph_logged[slot]) {
-        g_glyph_logged[slot] = 1;
-        nclog("glyph button id=%d centre=%.0f,%.0f screen=%.0fx%.0f -> %s", g_glyph_id[slot], cx, cy, g_w, g_h, hide ? "hidden" : "kept");
+    bool seen = false;
+    for (int i = 0; i < g_glyph_seen_n; i++) if (g_glyph_seen[i] == self) { seen = true; break; }
+    if (!seen && g_glyph_seen_n < 16) {
+        g_glyph_seen[g_glyph_seen_n++] = self;
+        nclog("glyph button %p centre=%.0f,%.0f screen=%.0fx%.0f -> %s", self, cx, cy, g_w, g_h, hide ? "hidden" : "kept");
     }
     return hide;
 }
@@ -3622,7 +3639,6 @@ static void nc_init(void) {
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
-    reg("old buttons (build)", "_ZN23TouchGlyphButtonControlC1ESt8functionIF13RectangleAreavEES0_IFbvEEsRK12ButtonColorsiiiibifSsb", (void *)hook_glyph_ctor, (void **)&g_orig_glyph_ctor);
     reg("old buttons (text probe)", "_ZNK22TouchTextButtonControl6renderER18InputRenderContext", (void *)hook_text_render, (void **)&g_orig_text_render);
     reg("old buttons (hide)", "_ZNK23TouchGlyphButtonControl6renderER18InputRenderContext", (void *)hook_glyph_render, (void **)&g_orig_glyph_render);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
