@@ -1509,11 +1509,18 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
             if (mypos && epos) {
                 const float ex = epos[0] - mypos[0], ez = epos[2] - mypos[2];
                 const float mx = render_pos[0] - ex, mz = render_pos[2] - ez;
-                static int logged = 0;
-                if (mx * mx + mz * mz > 1.5f * 1.5f && logged < 12) {
-                    logged++;
-                    nclog("box far from entity: vptr=%p entity-rel=%.2f,%.2f render=%.2f,%.2f",
-                          vptr, ex, ez, render_pos[0], render_pos[2]);
+                if (mx * mx + mz * mz > 4.0f * 4.0f) {
+                    /* Found in the log: a Skeleton drawn at render position 0,0 while it really
+                     * stood ~25 blocks away = the spinning mob inside a mob spawner, which the
+                     * game renders through a transform of its own. Its box would land on the
+                     * camera, i.e. the "ghost box near the player". Not a real entity: skip. */
+                    static int logged = 0;
+                    if (logged < 4) {
+                        logged++;
+                        nclog("box skipped (rendered far from entity): vptr=%p entity-rel=%.2f,%.2f render=%.2f,%.2f",
+                              vptr, ex, ez, render_pos[0], render_pos[2]);
+                    }
+                    return;
                 }
             }
         }
@@ -1988,8 +1995,9 @@ static bool glyph_is_old_button(const void *self) {
     inv(buf, fn);                                       /* RectangleArea comes back through the hidden return pointer */
     float cx = rect_centerX(buf), cy = rect_centerY(buf);
     if (!(cx > -50000.0f && cx < 50000.0f && cy > -50000.0f && cy < 50000.0f)) {   /* also rejects NaN */
-        nclog("glyph buttons: area looks wrong (%f,%f) - giving up", cx, cy);
-        g_glyph_fn_off = -1;
+        /* Some controls report a huge "nowhere" area (a disabled button). Nothing to hide there. */
+        static int odd = 0;
+        if (odd < 3) { odd++; nclog("glyph button %p has no on-screen area - drawn as is", self); }
         return false;
     }
     if (cx >= 0.0f && cx <= 2.0f && cy >= 0.0f && cy <= 2.0f) { cx *= g_w; cy *= g_h; }   /* normalised units */
