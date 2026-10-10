@@ -16,6 +16,7 @@ extern "C" {
   X(armor_on,     I, 1,    0, 1) X(armor_x, F, 0.005, 0, 1) X(armor_y, F, 0.03, 0, 1) X(armor_size, F, 3.0, 1.0, 8.0) \
   X(armor_alpha, F, 1.0, 0.05, 1) X(armor_bg_alpha, F, 0.75, 0.0, 1) X(armor_bg_col, I, 0x08080E, 0, 0xFFFFFF) X(armor_bg, I, 0, 0, 1) X(armor_bar, I, 0, 0, 1) X(armor_num, I, 1, 0, 2) \
   X(armor_horiz,  I, 0,    0, 1) X(armor_col, I, 0xEBEBF5, 0, 0xFFFFFF) \
+  X(armor_snap, I, 1, 0, 1) X(armor_scale, F, 1.0, 0.5, 2.0) X(armor_dx, F, 0.0, -40.0, 40.0) X(armor_dy, F, 0.0, -40.0, 40.0) \
   X(arrow_on,     I, 0,    0, 1) X(arrow_x, F, 0.50, 0, 1) X(arrow_y, F, 0.68, 0, 1) X(arrow_size, F, 3.0, 1.0, 8.0) \
   X(arrow_alpha, F, 1.0, 0.05, 1) X(arrow_bg_alpha, F, 0.75, 0.0, 1) X(arrow_col, I, 0xEBEBF5, 0, 0xFFFFFF) X(arrow_bg_col, I, 0x08080E, 0, 0xFFFFFF) X(arrow_bg, I, 1, 0, 1) \
   X(speed_on,     I, 0,    0, 1) X(speed_x, F, 0.50, 0, 1) X(speed_y, F, 0.74, 0, 1) X(speed_size, F, 3.0, 1.0, 8.0) \
