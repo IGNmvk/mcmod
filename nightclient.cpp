@@ -70,6 +70,7 @@ extern "C" void ir_renderGuiItemNew(void *self, const void *item, int aux, float
 extern "C" bool ii_isEnchanted(const void *it) __asm__("_ZNK12ItemInstance11isEnchantedEv");
 extern "C" void *ci_getGuiData(void *ci)       __asm__("_ZN14ClientInstance10getGuiDataEv");
 extern "C" float gd_getGuiScale(void *gd)      __asm__("_ZN7GuiData11getGuiScaleEv");
+extern "C" void  gd_getSlotPos(void *gd, int slot, int *x, int *y) __asm__("_ZN7GuiData10getSlotPosEiRiS0_");
 extern "C" void cic_toggle3rd(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks38handleToggleThirdPersonViewButtonPressER14ClientInstance");
 extern "C" void cic_drop(void *self, void *ci)
@@ -808,7 +809,9 @@ static volatile int  g_item_hook_frame = -1000;    /* g_frames when the hook las
 static volatile int  g_item_hook_ever = 0;         /* the hook has run at least once this session */
 static int           g_item_hook_last = -1;
 static int           g_item_log = 0;
-static volatile float g_gui_scale = 0.0f;           /* the game's GUI scale (px per GUI unit), from the HUD hook */
+static volatile float g_gui_scale = 0.0f;
+static volatile int   g_hb_raw[4] = {0, 0, 0, 0};   /* GuiData::getSlotPos for hotbar slot 0 and 8: x0,y0,x8,y8 */
+static volatile int   g_hb_raw_ok = 0;           /* the game's GUI scale (px per GUI unit), from the HUD hook */
 #define NC_ITEM_EXTRA 0.7f    /* 5th float Toolbox passes; leave as is */
 /* The game's own item renderer likely has a different internal anchor/padding
  * convention than our old custom icons did (which were plain top-left blits),
@@ -837,6 +840,14 @@ static void armor_draw_items(void *ci) {
     void *gd = ci ? ci_getGuiData(ci) : 0;
     float gs = gd ? gd_getGuiScale(gd) : 0.0f;
     if (gs > 0.1f && gs < 32.0f) g_gui_scale = gs;
+    if (gd && gs > 0.1f && gs < 32.0f) {                 /* where the game itself puts hotbar slots 0 and 8 */
+        int ax = 0, ay = 0, bx = 0, by = 0;
+        gd_getSlotPos(gd, 0, &ax, &ay);
+        gd_getSlotPos(gd, 8, &bx, &by);
+        g_hb_raw[0] = ax; g_hb_raw[1] = ay; g_hb_raw[2] = bx; g_hb_raw[3] = by; g_hb_raw_ok = 1;
+        static int logged = 0;
+        if (logged < 3) { logged++; nclog("hotbar slot positions: slot0=(%d,%d) slot8=(%d,%d) gui scale=%.2f", ax, ay, bx, by, gs); }
+    }
     if (g_frames - g_armor_draw_stamp > 2) return;       /* HUD not showing armor right now */
     void *player = g_local_player;
     void *inst = g_ItemRendererInstance;
@@ -2517,7 +2528,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_COORDS, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_FAST_TOTEM, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_COORDS, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_FAST_TOTEM, E_OFFHAND, E_N, E_COUNT };
 
 static float fpx(float size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, float size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -2610,20 +2621,70 @@ static void armor_rows(ArmorRow rows[6], bool preview) {
     rows[5].slot = 5;
 }
 
-/* ---- Armor HUD: extra hotbar slots to the right of the hotbar ----
+/* ---- Armor HUD + offhand slot: extra hotbar slots ----
  * Vanilla layout (GUI units, 1 unit = gui scale px): the hotbar is 9 slots of
- * 20 x 22, centred, with the offhand slot on its left. The armor slots go to
- * the right of it, one per piece you actually wear, same slot size. They are
- * only drawn - nothing here takes taps. */
+ * 20 x 22, centred. The offhand slot goes to its left, the armor slots (one per
+ * piece you wear) to its right. Everything follows the game's own GUI scale and
+ * its own hotbar position (GuiData::getSlotPos), and is only drawn - no taps.
+ * Both can be dragged in "Move on screen" (stored as a nudge in GUI units). */
 static float armor_gs() { return g_gui_scale > 0.1f ? g_gui_scale : 3.0f; }
-static float armor_u()  { return armor_gs() * g_cfg.armor_scale; }          /* one GUI unit at the chosen slot size */
-static ImVec2 size_armor() { const float u = armor_u(); return V(4 * 20.0f * u, 22.0f * u); }
+
+/* Pixel edges of the hotbar frame. The game's own slot positions are used when
+ * they look sane (checked against the expected centred layout), otherwise the
+ * plain vanilla formula. */
+static void hotbar_edges(float *left, float *right, float *top, float *bottom) {
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    const float gs = armor_gs();
+    float l = ds.x * 0.5f - 90.0f * gs, t = ds.y - 22.0f * gs, pitch = 20.0f * gs;
+    static int logged = 0;
+    if (g_hb_raw_ok) {
+        float x0 = (float)g_hb_raw[0], y0 = (float)g_hb_raw[1], x8 = (float)g_hb_raw[2];
+        float pg = (x8 - x0) / 8.0f;
+        bool gu = (pg >= 12.0f && pg <= 30.0f);                      /* GUI units ... */
+        if (!gu && pg / gs >= 12.0f && pg / gs <= 30.0f) {           /* ... or pixels */
+            x0 /= gs; y0 /= gs; pg /= gs; gu = true;
+        }
+        const float exp_x0 = ds.x / gs * 0.5f - 88.0f;               /* item origin of slot 0 in a centred hotbar */
+        if (gu && fabsf(x0 - exp_x0) <= 6.0f) {
+            l = (x0 - 2.0f) * gs; pitch = pg * gs;
+            const float exp_y0 = ds.y / gs - 19.0f;
+            if (fabsf(y0 - exp_y0) <= 8.0f) t = (y0 - 3.0f) * gs;
+            if (logged < 2) { logged++; nclog("hotbar: using the game's slot positions (pitch %.1f units)", pg); }
+        } else if (logged < 2) {
+            logged++;
+            nclog("hotbar: game slot positions don't match a centred hotbar (x0=%.1f expected %.1f, pitch %.1f) - using the vanilla layout", x0, exp_x0, pg);
+        }
+    }
+    *left = l; *right = l + 9.0f * pitch; *top = t; *bottom = t + 22.0f * gs;
+}
+
+static float armor_u()   { return armor_gs() * g_cfg.armor_scale; }          /* one GUI unit at the chosen slot size */
+static float offhand_u() { return armor_gs() * g_cfg.offhand_scale; }
+static ImVec2 size_armor()   { const float u = armor_u();   return V(4 * 20.0f * u, 22.0f * u); }
+static ImVec2 size_offhand() { const float u = offhand_u(); return V(20.0f * u, 22.0f * u); }
 
 static ImVec2 armor_anchor() {
-    const ImVec2 ds = ImGui::GetIO().DisplaySize;
-    const float gs = armor_gs(), u = armor_u();
-    return V(ds.x * 0.5f + (90.0f + 8.0f + g_cfg.armor_dx) * gs,      /* hotbar right edge + the same gap the offhand slot has */
-             ds.y - 22.0f * u + g_cfg.armor_dy * gs);                 /* bottoms line up */
+    float l, r, t, b; hotbar_edges(&l, &r, &t, &b);
+    const float gs = armor_gs();
+    return V(r + (8.0f + g_cfg.armor_dx) * gs, b - 22.0f * armor_u() + g_cfg.armor_dy * gs);
+}
+static ImVec2 offhand_anchor() {
+    float l, r, t, b; hotbar_edges(&l, &r, &t, &b);
+    const float gs = armor_gs();
+    return V(l - (8.0f - g_cfg.offhand_dx) * gs - 20.0f * offhand_u(), b - 22.0f * offhand_u() + g_cfg.offhand_dy * gs);
+}
+
+/* The two HUD pieces share the list of items the game draws for us. */
+static int g_rec_n = 0;
+static void hud_items_begin() { g_rec_n = 0; }
+static void hud_items_commit() { g_armor_draw_n = g_rec_n; g_armor_draw_stamp = g_frames; }
+static bool hud_game_icons(bool preview) {
+    /* Once the game hook has fired it stays in charge, so the old embedded icons
+     * never flash in between. Only if it never fires (after ~4 s of showing the
+     * HUD) do we fall back to them. */
+    static int wait_frames = 0;
+    if (!preview && !g_item_hook_ever && wait_frames < 100000) wait_frames++;
+    return !preview && (g_item_hook_ever || wait_frames < 240);
 }
 
 static void armor_slot_frame(ImDrawList *dl, ImVec2 sp, ImVec2 ss, ImVec2 ip, float icon, float u, float a) {
@@ -2640,53 +2701,62 @@ static void armor_slot_frame(ImDrawList *dl, ImVec2 sp, ImVec2 ss, ImVec2 ip, fl
     dl->AddRect(V(x0 + t * 0.5f, y0 + t * 0.5f), V(x1 - t * 0.5f, y1 - t * 0.5f), gray, 0.0f, 0, t);
 }
 
-static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
-    ArmorRow rows[6]; armor_rows(rows, preview);
-    const float u = armor_u(), a = g_cfg.armor_alpha;
+/* One slot: frame, item (drawn by the game, or an embedded icon as fallback),
+ * durability bar and a count in the corner. */
+static void hud_slot(ImDrawList *dl, ImVec2 sp, float u, float a, const ArmorRow &row, bool game_icons, bool counts) {
     const float sw = 20.0f * u, sh = 22.0f * u, icon = 16.0f * u;
-    if (g_cfg.armor_snap) p = armor_anchor();
-    /* Once the game hook has fired it stays in charge, so the old embedded icons
-     * never flash in between. Only if it never fires (after ~4 s of showing the
-     * HUD) do we fall back to them. */
-    static int wait_frames = 0;
-    if (!preview && !g_item_hook_ever && wait_frames < 100000) wait_frames++;
-    const bool game_icons = !preview && (g_item_hook_ever || wait_frames < 240);
-    int rec_n = 0, shown = 0;
-    for (int i = 0; i < 4; i++) {                               /* helmet, chestplate, leggings, boots */
+    const ImVec2 ss = V(sw, sh), ip = V(sp.x + (sw - icon) * 0.5f, sp.y + (sh - icon) * 0.5f);
+    armor_slot_frame(dl, sp, ss, ip, icon, u, a);
+    if (!row.present) return;
+    const int id = row.id, ix = embedded_item_icon(id);
+    if (game_icons) {
+        if (g_rec_n < 6) {
+            g_armor_draw[g_rec_n].slot = row.slot;
+            g_armor_draw[g_rec_n].x_px = ip.x; g_armor_draw[g_rec_n].y_px = ip.y;
+            g_armor_draw[g_rec_n].size_px = icon; g_armor_draw[g_rec_n].alpha = a;
+            g_rec_n++;
+        }
+    } else if (ix >= 0) {
+        ImU32 tint = (id >= 298 && id <= 301) ? rgba(160, 101, 64, a) : rgba(255, 255, 255, a);
+        draw_icon(dl, ix, ip, icon, tint);
+    } else {
+        draw_item_fallback(dl, ip, icon, a, id);
+    }
+    if (!counts || row.max <= 0) return;
+    const float frac = clampf((float)row.dur / (float)row.max, 0.0f, 1.0f);
+    if (g_cfg.armor_bar) {                                    /* like the vanilla durability bar */
+        const float bx = ip.x + 2.0f * u, bw = 13.0f * u, by = ip.y + 13.0f * u;
+        dl->AddRectFilled(V(bx, by), V(bx + bw, by + 2.0f * u), rgba(0, 0, 0, a));
+        dl->AddRectFilled(V(bx, by), V(bx + bw * frac, by + 1.0f * u),
+                          rgba((int)(255.0f * (1.0f - frac)), (int)(255.0f * frac), 0, a));
+    }
+    if (g_cfg.armor_num) {                                    /* small count in the corner, like a stack size */
+        char b[16];
+        if (g_cfg.armor_num == 1) snprintf(b, sizeof b, "%d", row.dur);
+        else                      snprintf(b, sizeof b, "%d%%", (int)(frac * 100.0f + 0.5f));
+        const float ts = fmaxf(1.0f, u * 0.85f);
+        const ImVec2 tw = txt(b, ts);
+        put_text_sh(dl, V(sp.x + sw - 2.0f * u - tw.x, sp.y + sh - 2.0f * u - fpx(ts)), ts, packed(g_cfg.armor_col, a), b, true);
+    }
+}
+
+static void draw_armor(ImDrawList *dl, ImVec2 /*unused: always anchored to the hotbar*/, bool preview) {
+    ArmorRow rows[6]; armor_rows(rows, preview);
+    const float u = armor_u(), a = g_cfg.armor_alpha, sw = 20.0f * u;
+    const ImVec2 p = armor_anchor();
+    const bool game_icons = hud_game_icons(preview);
+    int shown = 0;
+    for (int i = 0; i < 4; i++) {                               /* helmet, chestplate, leggings, boots: only worn pieces */
         if (!rows[i].present) continue;
-        const ImVec2 sp = V(p.x + shown * sw, p.y), ss = V(sw, sh);
-        const ImVec2 ip = V(sp.x + (sw - icon) * 0.5f, sp.y + (sh - icon) * 0.5f);
-        armor_slot_frame(dl, sp, ss, ip, icon, u, a);
-        const int id = rows[i].id, ix = embedded_item_icon(id);
-        if (game_icons) {
-            g_armor_draw[rec_n].slot = rows[i].slot;
-            g_armor_draw[rec_n].x_px = ip.x; g_armor_draw[rec_n].y_px = ip.y;
-            g_armor_draw[rec_n].size_px = icon; g_armor_draw[rec_n].alpha = a;
-            rec_n++;
-        } else if (ix >= 0) {
-            ImU32 tint = (id >= 298 && id <= 301) ? rgba(160, 101, 64, a) : rgba(255, 255, 255, a);
-            draw_icon(dl, ix, ip, icon, tint);
-        } else {
-            draw_item_fallback(dl, ip, icon, a, id);
-        }
-        const float frac = rows[i].max > 0 ? clampf((float)rows[i].dur / (float)rows[i].max, 0.0f, 1.0f) : 1.0f;
-        if (g_cfg.armor_bar && rows[i].max > 0) {                /* like the vanilla durability bar */
-            const float bx = ip.x + 2.0f * u, bw = 13.0f * u, by = ip.y + 13.0f * u;
-            dl->AddRectFilled(V(bx, by), V(bx + bw, by + 2.0f * u), rgba(0, 0, 0, a));
-            dl->AddRectFilled(V(bx, by), V(bx + bw * frac, by + 1.0f * u),
-                              rgba((int)(255.0f * (1.0f - frac)), (int)(255.0f * frac), 0, a));
-        }
-        if (g_cfg.armor_num && rows[i].max > 0) {                /* small count in the corner, like a stack size */
-            char b[16];
-            if (g_cfg.armor_num == 1) snprintf(b, sizeof b, "%d", rows[i].dur);
-            else                      snprintf(b, sizeof b, "%d%%", (int)(frac * 100.0f + 0.5f));
-            const float ts = fmaxf(1.0f, u * 0.85f);
-            const ImVec2 tw = txt(b, ts);
-            put_text_sh(dl, V(sp.x + sw - 2.0f * u - tw.x, sp.y + sh - 2.0f * u - fpx(ts)), ts, packed(g_cfg.armor_col, a), b, true);
-        }
+        hud_slot(dl, V(p.x + shown * sw, p.y), u, a, rows[i], game_icons, true);
         shown++;
     }
-    if (game_icons) { g_armor_draw_n = rec_n; g_armor_draw_stamp = g_frames; }
+}
+
+static void draw_offhand(ImDrawList *dl, ImVec2 /*unused*/, bool preview) {
+    ArmorRow rows[6]; armor_rows(rows, preview);
+    if (!rows[5].present && !g_cfg.offhand_always && !preview) return;
+    hud_slot(dl, offhand_anchor(), offhand_u(), g_cfg.offhand_alpha, rows[5], hud_game_icons(preview), false);
 }
 
 /* ---- Elytra indicator (outline icon, text, or both) ---- */
@@ -2954,7 +3024,7 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 static int *elem_on(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
                  case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_COORDS: return &g_cfg.coords_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
-                 case E_DROP: return &g_cfg.drop_on; case E_FAST_TOTEM: return &g_cfg.fast_totem_on; default: return 0; }
+                 case E_DROP: return &g_cfg.drop_on; case E_FAST_TOTEM: return &g_cfg.fast_totem_on; case E_OFFHAND: return &g_cfg.offhand_on; default: return 0; }
 }
 static float *elem_x(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
@@ -2970,6 +3040,7 @@ static ImVec2 elem_size(int e) {
     switch (e) {
         case E_FPS: return size_fps();
         case E_ARMOR: return size_armor();
+        case E_OFFHAND: return size_offhand();
         case E_ELYTRA: return size_elytra();
         case E_ARROW: return size_arrow();
         case E_SPEED: return size_speed();
@@ -2997,13 +3068,16 @@ static void build_edit(float w, float h) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
-    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "coords", "elytra_angle", "zoom", "persp", "drop", "fast_totem", "n" };
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "coords", "elytra_angle", "zoom", "persp", "drop", "fast_totem", "offhand", "n" };
     const int e = g_edit_target;
     if (e >= 0 && e < E_COUNT) {
         ImVec2 sz = elem_size(e), pos = place(*elem_x(e), *elem_y(e), sz);
+        if (e == E_ARMOR) pos = armor_anchor();               /* these two sit on the hotbar and are moved by a nudge */
+        else if (e == E_OFFHAND) pos = offhand_anchor();
         switch (e) {
             case E_FPS:    draw_fps(dl, pos, 60.0f); break;
             case E_ARMOR:  draw_armor(dl, pos, true); break;
+            case E_OFFHAND: draw_offhand(dl, pos, true); break;
             case E_ELYTRA: draw_elytra(dl, pos); break;
             case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? 64 : g_snap.arrow_count); break;
             case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
@@ -3019,10 +3093,18 @@ static void build_edit(float w, float h) {
         ImGui::SetCursorScreenPos(pos);
         ImGui::InvisibleButton(ids[e], sz);
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0, 0.0f)) {
-            ImVec2 np = V(pos.x + io.MouseDelta.x, pos.y + io.MouseDelta.y);
-            float rx = w - sz.x, ry = h - sz.y;
-            if (rx > 1) *elem_x(e) = clampf(np.x / rx, 0.0f, 1.0f);
-            if (ry > 1) *elem_y(e) = clampf(np.y / ry, 0.0f, 1.0f);
+            if (e == E_ARMOR || e == E_OFFHAND) {
+                float *dx = (e == E_ARMOR) ? &g_cfg.armor_dx : &g_cfg.offhand_dx;
+                float *dy = (e == E_ARMOR) ? &g_cfg.armor_dy : &g_cfg.offhand_dy;
+                const float gs = armor_gs();
+                *dx = clampf(*dx + io.MouseDelta.x / gs, -800.0f, 800.0f);
+                *dy = clampf(*dy + io.MouseDelta.y / gs, -800.0f, 800.0f);
+            } else {
+                ImVec2 np = V(pos.x + io.MouseDelta.x, pos.y + io.MouseDelta.y);
+                float rx = w - sz.x, ry = h - sz.y;
+                if (rx > 1) *elem_x(e) = clampf(np.x / rx, 0.0f, 1.0f);
+                if (ry > 1) *elem_y(e) = clampf(np.y / ry, 0.0f, 1.0f);
+            }
         }
     }
 
@@ -3114,14 +3196,20 @@ static void panel_armor() {
     if (ImGui::RadioButton("Percent", g_cfg.armor_num == 2)) g_cfg.armor_num = 2;
     sl_f("Slot size", &g_cfg.armor_scale, 0.5f, 2.0f);
     sl_f("Opacity", &g_cfg.armor_alpha, 0.05f, 1.0f);
-    chk("Snap to the hotbar", &g_cfg.armor_snap);
-    if (g_cfg.armor_snap) {
-        ImGui::TextDisabled("Nudge (in game GUI units)");
-        sl_f("Right", &g_cfg.armor_dx, -40.0f, 40.0f);
-        sl_f("Down", &g_cfg.armor_dy, -40.0f, 40.0f);
-    } else {
-        hud_pos(&g_cfg.armor_x, &g_cfg.armor_y);
-    }
+    move_btn();
+    ImGui::TextDisabled("Nudge from the hotbar (game GUI units)");
+    sl_f("Right", &g_cfg.armor_dx, -100.0f, 100.0f);
+    sl_f("Down", &g_cfg.armor_dy, -100.0f, 100.0f);
+}
+static void panel_offhand() {
+    head("Offhand slot", &g_cfg.offhand_on, "Your offhand item in a slot to the left of the hotbar. Visual only.");
+    chk("Show the slot even when empty", &g_cfg.offhand_always);
+    sl_f("Slot size", &g_cfg.offhand_scale, 0.5f, 2.0f);
+    sl_f("Opacity", &g_cfg.offhand_alpha, 0.05f, 1.0f);
+    move_btn();
+    ImGui::TextDisabled("Nudge from the hotbar (game GUI units)");
+    sl_f("Right", &g_cfg.offhand_dx, -100.0f, 100.0f);
+    sl_f("Down", &g_cfg.offhand_dy, -100.0f, 100.0f);
 }
 static void panel_elytra() {
     head("Elytra indicator", &g_cfg.elytra_on, "An outline elytra icon on screen while you are gliding.");
@@ -3308,6 +3396,7 @@ static const Mod g_mods[] = {
     { "Autosprint",         &g_cfg.autosprint, panel_autosprint },
     { "FPS counter",        &g_cfg.fps_on,     panel_fps },
     { "Armor HUD",          &g_cfg.armor_on,   panel_armor },
+    { "Offhand slot",       &g_cfg.offhand_on, panel_offhand },
     { "Elytra indicator",   &g_cfg.elytra_on,  panel_elytra },
     { "Arrow HUD",          &g_cfg.arrow_on,   panel_arrow },
     { "Speed indicator",    &g_cfg.speed_on,   panel_speed },
@@ -3373,6 +3462,7 @@ static void build_menu(float w, float h, NcRect *win_rect) {
     g_edit_target = -1;
     if (!strcmp(selected_mod, "FPS counter")) g_edit_target = E_FPS;
     else if (!strcmp(selected_mod, "Armor HUD")) g_edit_target = E_ARMOR;
+    else if (!strcmp(selected_mod, "Offhand slot")) g_edit_target = E_OFFHAND;
     else if (!strcmp(selected_mod, "Elytra indicator")) g_edit_target = E_ELYTRA;
     else if (!strcmp(selected_mod, "Arrow HUD")) g_edit_target = E_ARROW;
     else if (!strcmp(selected_mod, "Speed indicator")) g_edit_target = E_SPEED;
@@ -3423,6 +3513,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool any_armor = g_snap.present[0] || g_snap.present[1] || g_snap.present[2] || g_snap.present[3];
     bool fps_vis    = g_cfg.fps_on && (g_cfg.fps_menus || in_world);
     bool armor_vis  = g_cfg.armor_on && gameplay_hud && in_world && any_armor && !g_menu_open && !g_edit;
+    bool offhand_vis = g_cfg.offhand_on && gameplay_hud && in_world && (g_snap.offhand_present || g_cfg.offhand_always) && !g_menu_open && !g_edit;
     bool elytra_vis = g_cfg.elytra_on && gameplay_hud && in_world && g_snap.gliding && !g_menu_open && !g_edit;
     bool arrow_vis  = g_cfg.arrow_on && gameplay_hud && in_world && g_snap.holding_bow && g_snap.arrow_count > 0 && !g_menu_open && !g_edit;
     bool speed_vis  = g_cfg.speed_on && gameplay_hud && in_world && !g_menu_open && !g_edit;
@@ -3438,7 +3529,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     if (!zoom_vis) g_zoom_active = 0;
 
     bool controls_vis = g_cfg.controls_mode == 1 && gameplay_hud && in_world && !g_menu_open && !g_edit;
-    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || controls_vis || menu_reach || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || offhand_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || controls_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -3505,7 +3596,12 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         wrect.visible = 1; wrect.x = 0; wrect.y = 0; wrect.w = (float)w; wrect.h = (float)h;   /* whole screen is ours */
     } else {
         if (fps_vis)    draw_fps(fg, place(g_cfg.fps_x, g_cfg.fps_y, size_fps()), fps);
-        if (armor_vis)  draw_armor(fg, place(g_cfg.armor_x, g_cfg.armor_y, size_armor()), false);
+        if (armor_vis || offhand_vis) {
+            hud_items_begin();
+            if (armor_vis)   draw_armor(fg, V(0, 0), false);
+            if (offhand_vis) draw_offhand(fg, V(0, 0), false);
+            hud_items_commit();
+        }
         if (elytra_vis) draw_elytra(fg, place(g_cfg.elytra_x, g_cfg.elytra_y, size_elytra()));
         if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), g_snap.arrow_count);
         if (speed_vis)  draw_speed(fg, place(g_cfg.speed_x, g_cfg.speed_y, size_speed()), g_snap.speed_bps);
