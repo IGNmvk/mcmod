@@ -1593,19 +1593,42 @@ static void hit_gl_draw(const float *verts, int n, const float *mvp, int line_st
 
 static bool combat_view_ray(float partial, float origin[3], float dir[3]);
 
+/* Ray (from the eyes along the view) against a box: true if it enters the box
+ * within max_t blocks. */
+static bool combat_ray_aabb(const NcAabb6 &b, const float origin[3], const float dir[3], float max_t) {
+    float tmin = 0.0f, tmax = max_t;
+    const float minv[3] = { b.minx, b.miny, b.minz };
+    const float maxv[3] = { b.maxx, b.maxy, b.maxz };
+    for (int i = 0; i < 3; ++i) {
+        const float o = origin[i], d = dir[i];
+        if (fabsf(d) < 1e-6f) {
+            if (o < minv[i] || o > maxv[i]) return false;
+            continue;
+        }
+        float a = (minv[i] - o) / d;
+        float c = (maxv[i] - o) / d;
+        if (a > c) { const float tmp = a; a = c; c = tmp; }
+        if (a > tmin) tmin = a;
+        if (c < tmax) tmax = c;
+        if (tmin > tmax) return false;
+    }
+    return true;
+}
+
 /* Combat hitboxes: a mob or player (at least 0.55 tall - no items, arrows or
- * orbs) counts as "in reach" when the nearest point of its box is within the
- * reach distance of the player's eyes. */
+ * orbs) is "in reach" only when the crosshair is on it: the view ray from the
+ * eyes hits its box within the reach distance. Something behind you or off to
+ * the side never counts. */
 static bool hit_in_reach(void *entity, const NcAabb6 &w, float partial) {
     if (!g_local_player || entity == g_local_player) return false;
     if ((w.maxy - w.miny) < 0.55f) return false;
     float o[3], d[3];
     if (!combat_view_ray(partial, o, d)) return false;
-    const float nx = fminf(fmaxf(o[0], w.minx), w.maxx) - o[0];
-    const float ny = fminf(fmaxf(o[1], w.miny), w.maxy) - o[1];
-    const float nz = fminf(fmaxf(o[2], w.minz), w.maxz) - o[2];
-    const float r = g_cfg.hit_reach;
-    return nx * nx + ny * ny + nz * nz <= r * r;
+    const float pad = 0.10f;                          /* small forgiveness, like the game's own target pick */
+    NcAabb6 b = w;
+    b.minx -= pad; b.miny -= pad; b.minz -= pad;
+    b.maxx += pad; b.maxy += pad; b.maxz += pad;
+    return combat_ray_aabb(b, o, d, g_cfg.hit_reach);
 }
 
 static void hit_draw_entity(void *entity, const float *render_pos, float partial) {
@@ -3219,7 +3242,7 @@ static void panel_hitbox() {
     if (g_cfg.hit_combat) {
         color_picker("Hitbox color", &g_cfg.hit_col);
         color_picker("In-reach color", &g_cfg.hit_in_col);
-        ImGui::TextDisabled("Boxes use the first color. A mob or player inside your reach switches to the second.");
+        ImGui::TextDisabled("Boxes use the first color. A mob or player switches to the second while your crosshair is on it and it is within reach.");
     } else {
         ImGui::TextDisabled("Turn on Combat hitboxes to choose colors.");
     }
