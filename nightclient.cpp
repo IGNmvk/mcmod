@@ -44,6 +44,7 @@ extern "C" {
 
 /* ---- game functions (found in libminecraftpe.so when the mod loads) ---- */
 extern "C" bool mih_isMovingForward(void *self) __asm__("_ZNK16MoveInputHandler15isMovingForwardEv");
+extern "C" bool entity_isRiding(const void *self) __asm__("_ZNK6Entity8isRidingEv");
 extern "C" bool mob_isSneaking(void *self)      __asm__("_ZNK3Mob10isSneakingEv");
 extern "C" void mob_setSneaking(void *self, bool on) __asm__("_ZN3Mob11setSneakingEb");
 extern "C" void mob_setJumping(void *self, bool on)  __asm__("_ZN3Mob10setJumpingEb");
@@ -1119,6 +1120,15 @@ static void hook_tick(void *self, void *player) {
     snapshot_item_slot(mob_getOffhandSlot(player), &g_snap.offhand_present, &g_snap.offhand_id,
                        &g_snap.offhand_dur, &g_snap.offhand_max);
     snapshot_totem_state(player);
+    if (g_cfg.controls_mode == 1 && entity_isRiding(player)) {       /* diagnostics for the vehicle input path */
+        static double last_log = 0.0;
+        const double t = now_s();
+        if (t - last_log > 1.5) {
+            last_log = t;
+            nclog("riding: live=%d play=%d touch_render_age=%.2f joy_id=%d joy=(%.2f,%.2f)", ctrl_input_live() ? 1 : 0,
+                  (t - g_play_time) < 0.35 ? 1 : 0, t - g_touch_render_time, (int)g_ctrl_joy_id, (float)g_ctrl_joy_x, (float)g_ctrl_joy_y);
+        }
+    }
     if (g_cfg.controls_mode == 1) ctrl_apply_player_actions();
     if (g_cfg.autosprint && g_cfg.controls_mode == 1 && nc_gameplay_input_active()) {
         const float joy_mag = sqrtf(g_ctrl_joy_x * g_ctrl_joy_x + g_ctrl_joy_y * g_ctrl_joy_y);
@@ -1991,7 +2001,12 @@ static bool nc_gameplay_input_active() {
     /* Catch-all: the game only calls TouchControlSet::render when NO overlay
      * screen is on top (inventory, chat, pause, anything else) - this catches
      * overlay screens our own per-screen hooks above might not cover. */
-    const bool overlay_free = (now - g_touch_render_time) < 0.35;
+    bool overlay_free = (now - g_touch_render_time) < 0.35;
+    /* In a boat / minecart / on a mount the game swaps in its own "rideable"
+     * touch layout, which may not go through the render call above, so the
+     * joystick would be treated as "not in gameplay" and stay dead. The
+     * per-screen checks below still catch inventory, chat, pause and settings. */
+    if (!overlay_free && g_local_player && entity_isRiding(g_local_player)) overlay_free = true;
     return play && overlay_free && !pause && !chat && !settings && !inventory && !g_menu_open && !g_edit;
 }
 
@@ -2443,37 +2458,38 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
 }
 
 /* ------------------------------------------------------------------ ImGui setup + theme */
-static const ImVec4 ACCENT(0.50f, 0.42f, 1.00f, 1.00f);
+static const ImVec4 ACCENT(0.25f, 0.58f, 1.00f, 1.00f);
 
 static void apply_theme() {
     ImGuiStyle &s = ImGui::GetStyle();
-    s.WindowRounding = 10; s.FrameRounding = 6; s.GrabRounding = 6; s.TabRounding = 6;
-    s.ScrollbarRounding = 6; s.ChildRounding = 6; s.PopupRounding = 6;
+    s.WindowRounding = 12; s.FrameRounding = 8; s.GrabRounding = 8; s.TabRounding = 8;
+    s.ScrollbarRounding = 8; s.ChildRounding = 10; s.PopupRounding = 8;
     s.WindowBorderSize = 0; s.FrameBorderSize = 0; s.ChildBorderSize = 0;
-    s.WindowPadding = V(12, 10); s.FramePadding = V(10, 6);
-    s.ItemSpacing = V(10, 10); s.ItemInnerSpacing = V(8, 6);
-    s.ScrollbarSize = 12; s.GrabMinSize = 18;
+    s.WindowPadding = V(14, 12); s.FramePadding = V(10, 7);
+    s.ItemSpacing = V(10, 12); s.ItemInnerSpacing = V(8, 6);
+    s.ScrollbarSize = 10; s.GrabMinSize = 18;
 
-    const ImVec4 accentDim(0.30f, 0.26f, 0.62f, 1.00f);
+    const ImVec4 accentDim(0.12f, 0.30f, 0.62f, 1.00f);
     ImVec4 *c = s.Colors;
-    c[ImGuiCol_Text]             = ImVec4(0.92f, 0.92f, 0.96f, 1.00f);
-    c[ImGuiCol_TextDisabled]     = ImVec4(0.52f, 0.52f, 0.64f, 1.00f);
-    c[ImGuiCol_WindowBg]         = ImVec4(0.045f, 0.045f, 0.065f, 0.97f);
-    c[ImGuiCol_ChildBg]          = ImVec4(0.075f, 0.075f, 0.105f, 1.00f);
-    c[ImGuiCol_FrameBg]          = ImVec4(0.12f, 0.12f, 0.17f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]   = ImVec4(0.16f, 0.16f, 0.23f, 1.00f);
-    c[ImGuiCol_FrameBgActive]    = ImVec4(0.19f, 0.18f, 0.30f, 1.00f);
+    c[ImGuiCol_Text]             = ImVec4(0.93f, 0.95f, 0.98f, 1.00f);
+    c[ImGuiCol_TextDisabled]     = ImVec4(0.48f, 0.54f, 0.66f, 1.00f);
+    c[ImGuiCol_WindowBg]         = ImVec4(0.012f, 0.014f, 0.022f, 0.97f);
+    c[ImGuiCol_ChildBg]          = ImVec4(0.030f, 0.036f, 0.052f, 0.92f);
+    c[ImGuiCol_Border]           = ImVec4(0.14f, 0.32f, 0.64f, 0.55f);
+    c[ImGuiCol_FrameBg]          = ImVec4(0.070f, 0.088f, 0.128f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]   = ImVec4(0.095f, 0.125f, 0.190f, 1.00f);
+    c[ImGuiCol_FrameBgActive]    = ImVec4(0.110f, 0.180f, 0.300f, 1.00f);
     c[ImGuiCol_CheckMark]        = ACCENT;
     c[ImGuiCol_SliderGrab]       = ACCENT;
-    c[ImGuiCol_SliderGrabActive] = ImVec4(0.62f, 0.55f, 1.00f, 1.00f);
+    c[ImGuiCol_SliderGrabActive] = ImVec4(0.45f, 0.72f, 1.00f, 1.00f);
     c[ImGuiCol_Button]           = accentDim;
-    c[ImGuiCol_ButtonHovered]    = ImVec4(0.38f, 0.33f, 0.75f, 1.00f);
+    c[ImGuiCol_ButtonHovered]    = ImVec4(0.16f, 0.38f, 0.78f, 1.00f);
     c[ImGuiCol_ButtonActive]     = ACCENT;
-    c[ImGuiCol_Header]           = ImVec4(0.24f, 0.21f, 0.52f, 1.00f);
-    c[ImGuiCol_HeaderHovered]    = ImVec4(0.30f, 0.26f, 0.62f, 1.00f);
-    c[ImGuiCol_HeaderActive]     = ACCENT;
-    c[ImGuiCol_Separator]        = ImVec4(0.20f, 0.20f, 0.30f, 1.00f);
-    c[ImGuiCol_ScrollbarBg]      = ImVec4(0.03f, 0.03f, 0.05f, 0.60f);
+    c[ImGuiCol_Header]           = ImVec4(0.10f, 0.26f, 0.55f, 0.50f);
+    c[ImGuiCol_HeaderHovered]    = ImVec4(0.10f, 0.26f, 0.55f, 0.28f);
+    c[ImGuiCol_HeaderActive]     = ImVec4(0.14f, 0.34f, 0.70f, 0.70f);
+    c[ImGuiCol_Separator]        = ImVec4(0.10f, 0.20f, 0.36f, 1.00f);
+    c[ImGuiCol_ScrollbarBg]      = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
     c[ImGuiCol_ScrollbarGrab]    = accentDim;
 }
 
@@ -3089,7 +3105,7 @@ static void build_edit(float w, float h) {
             case E_PERSP:      draw_button(dl, pos, sz, button_text(E_PERSP), g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col); break;
             default:           draw_button(dl, pos, sz, button_text(E_N),     g_cfg.n_alpha, g_cfg.n_text_alpha, true,  false, g_cfg.n_bg_col, g_cfg.n_col); break;
         }
-        dl->AddRect(pos, vadd(pos, sz), IM_COL32(150, 130, 255, 255), 3.0f, 0, 2.0f);
+        dl->AddRect(pos, vadd(pos, sz), IM_COL32(110, 170, 255, 255), 3.0f, 0, 2.0f);
         ImGui::SetCursorScreenPos(pos);
         ImGui::InvisibleButton(ids[e], sz);
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0, 0.0f)) {
@@ -3374,6 +3390,9 @@ static void panel_controls() {
 static void panel_client() {
     head("Client", 0, "Menu and N button.");
     sl_i("Menu text size (0 = auto)", &g_cfg.ui_font, 0, 6);
+    chk("Menu blur", &g_cfg.menu_blur);
+    if (g_cfg.menu_blur) sl_f("Blur strength", &g_cfg.menu_blur_str, 0.0f, 1.0f);
+    chk("Menu click sound", &g_cfg.menu_click);
     button_text_edit("N button text", g_cfg.n_text);
     color_picker("Text color", &g_cfg.n_col);
     color_picker("Background color", &g_cfg.n_bg_col);
@@ -3417,7 +3436,122 @@ static const Mod g_mods[] = {
 };
 #define NC_NMODS ((int)(sizeof(g_mods) / sizeof(g_mods[0])))
 
+/* ---- Menu blur: a copy of the game's frame, drawn blurred behind the menu ----
+ * The frame is copied into a texture just before our own drawing starts, then
+ * drawn several times with tiny offsets (each tap weighted so the result is an
+ * average) under a dark tint. Pure ImGui + two GL copy calls; if the copy ever
+ * errors, blur switches itself off. */
+static GLuint g_blur_tex = 0;
+static int    g_blur_w = 0, g_blur_h = 0, g_blur_frame = -1;
+static bool   g_blur_ok = false, g_blur_failed = false;
+
+static void menu_blur_capture(int w, int h) {
+    if (g_blur_failed || w <= 0 || h <= 0) return;
+    GLint prev_fbo = 0, prev_tex = 0, prev_active = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    while (glGetError() != GL_NO_ERROR) {}
+    if (!g_blur_tex) glGenTextures(1, &g_blur_tex);
+    glBindTexture(GL_TEXTURE_2D, g_blur_tex);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);                  /* the real screen */
+    if (w != g_blur_w || h != g_blur_h) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, w, h, 0);
+        g_blur_w = w; g_blur_h = h;
+    } else {
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+    }
+    const GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        g_blur_failed = true; g_blur_ok = false;
+        nclog("menu blur: copying the frame failed (0x%x) - blur turned off", (unsigned)err);
+    } else {
+        g_blur_ok = true; g_blur_frame = g_frames;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    glActiveTexture((GLenum)prev_active);
+}
+
+static bool menu_blur_active() { return g_cfg.menu_blur && g_blur_ok && g_blur_frame == g_frames; }
+
+static void menu_blur_draw(float w, float h) {
+    if (!menu_blur_active()) return;
+    ImDrawList *bg = ImGui::GetBackgroundDrawList();
+    const ImTextureID tex = (ImTextureID)(uintptr_t)g_blur_tex;
+    const int taps = 12;
+    const float r = (2.0f + 14.0f * g_cfg.menu_blur_str) * g_base;
+    bg->AddImage(tex, V(0, 0), V(w, h), V(0, 1), V(1, 0), IM_COL32_WHITE);          /* the frame is stored upside down */
+    for (int i = 1; i <= taps; i++) {
+        const float ang = (float)i * 2.399963f;                                      /* golden angle spiral */
+        const float rad = r * sqrtf((float)i / (float)taps);
+        const float ox = cosf(ang) * rad, oy = sinf(ang) * rad;
+        bg->AddImage(tex, V(ox, oy), V(w + ox, h + oy), V(0, 1), V(1, 0), IM_COL32(255, 255, 255, 255 / (i + 1)));
+    }
+    bg->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 4, 14, 120));                    /* dark blue tint */
+}
+
+/* ---- Menu click: a very short, quiet tick played through Android's AudioTrack ---- */
+static jobject   g_click_track = 0;
+static jmethodID g_click_stop = 0, g_click_play = 0, g_click_head = 0;
+static bool      g_click_failed = false;
+
+static void click_init(JNIEnv *env) {
+    const int rate = 22050, n = rate * 30 / 1000;
+    static short pcm[1024];
+    if (n > 1024) { g_click_failed = true; return; }
+    for (int i = 0; i < n; i++) {
+        const float t = (float)i / (float)rate;
+        const float e = expf(-t * 190.0f);
+        const float v = 0.65f * sinf(6.2831853f * 1700.0f * t) + 0.35f * sinf(6.2831853f * 2600.0f * t);
+        pcm[i] = (short)(v * e * 0.14f * 32767.0f);                                  /* 0.14 = quiet */
+    }
+    jclass cls = env->FindClass("android/media/AudioTrack");
+    if (!cls || env->ExceptionCheck()) { env->ExceptionClear(); g_click_failed = true; return; }
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(IIIIII)V");
+    jmethodID wr = env->GetMethodID(cls, "write", "([SII)I");
+    g_click_stop = env->GetMethodID(cls, "stop", "()V");
+    g_click_play = env->GetMethodID(cls, "play", "()V");
+    g_click_head = env->GetMethodID(cls, "setPlaybackHeadPosition", "(I)I");
+    if (!ctor || !wr || !g_click_stop || !g_click_play || !g_click_head || env->ExceptionCheck()) {
+        env->ExceptionClear(); g_click_failed = true; return;
+    }
+    /* STREAM_MUSIC = 3, CHANNEL_OUT_MONO = 4, ENCODING_PCM_16BIT = 2, MODE_STATIC = 0 */
+    jobject tr = env->NewObject(cls, ctor, 3, rate, 4, 2, n * 2, 0);
+    if (!tr || env->ExceptionCheck()) { env->ExceptionClear(); g_click_failed = true; return; }
+    jshortArray arr = env->NewShortArray(n);
+    env->SetShortArrayRegion(arr, 0, n, pcm);
+    env->CallIntMethod(tr, wr, arr, 0, n);
+    env->DeleteLocalRef(arr);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); g_click_failed = true; return; }
+    g_click_track = env->NewGlobalRef(tr);
+    nclog("menu click sound ready");
+}
+
+static void menu_click_play() {
+    if (g_click_failed) return;
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return;
+    if (!g_click_track) click_init(env);
+    if (g_click_track) {
+        env->CallVoidMethod(g_click_track, g_click_stop);
+        env->CallIntMethod(g_click_track, g_click_head, 0);
+        env->CallVoidMethod(g_click_track, g_click_play);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); g_click_failed = true; nclog("menu click sound failed - turned off"); }
+    }
+    kb_release(env, attached);
+}
+
 static void build_menu(float w, float h, NcRect *win_rect) {
+    menu_blur_draw(w, h);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.012f, 0.014f, 0.022f, menu_blur_active() ? 0.80f : 0.97f));
     ImGui::SetNextWindowPos(V(w * 0.5f, h * 0.5f), ImGuiCond_Always, V(0.5f, 0.5f));
     ImGui::SetNextWindowSize(V(w * 0.84f, h * 0.88f), ImGuiCond_Always);
     ImGui::Begin("##night_menu", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -3429,7 +3563,7 @@ static void build_menu(float w, float h, NcRect *win_rect) {
     /* header: title + X (top right) */
     ImGui::TextColored(ACCENT, "NIGHT CLIENT");
     ImGui::SameLine();
-    ImGui::TextDisabled("%s  MCPE 1.1.5", NC_VERSION);
+    ImGui::TextDisabled("%s", NC_VERSION);
     float xw = ImGui::GetFrameHeight() * 1.5f;
     ImGui::SameLine(ImGui::GetWindowWidth() - xw - ImGui::GetStyle().WindowPadding.x);
     if (ImGui::Button("X", V(xw, 0))) { g_menu_open = false; nclog("menu closed"); }
@@ -3446,10 +3580,14 @@ static void build_menu(float w, float h, NcRect *win_rect) {
         ImVec2 rp = ImGui::GetCursorScreenPos();
         float rw = ImGui::GetContentRegionAvail().x;
         if (ImGui::Selectable(g_mods[i].name, g_sel == i, 0, V(rw, rowh))) g_sel = i;
+        if (g_sel == i) {                                                       /* accent bar on the selected row */
+            ImGui::GetWindowDrawList()->AddRectFilled(V(rp.x, rp.y + rowh * 0.20f), V(rp.x + 3.0f * g_base * 0.75f, rp.y + rowh * 0.80f),
+                                                      ImGui::GetColorU32(ACCENT), 3.0f);
+        }
         if (g_mods[i].on) {
-            float r = rowh * 0.14f;
+            float r = rowh * 0.12f;
             ImGui::GetWindowDrawList()->AddCircleFilled(V(rp.x + rw - r * 2.5f, rp.y + rowh * 0.5f), r,
-                                                        *g_mods[i].on ? IM_COL32(90, 230, 130, 255) : IM_COL32(90, 90, 110, 255));
+                                                        *g_mods[i].on ? IM_COL32(70, 170, 255, 255) : IM_COL32(62, 70, 90, 255));
         }
     }
     ImGui::PopStyleVar();
@@ -3476,6 +3614,8 @@ static void build_menu(float w, float h, NcRect *win_rect) {
     g_mods[g_sel].panel();
     ImGui::EndChild();
     ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
 }
 
 /* ------------------------------------------------------------------ per-frame entry (eglSwapBuffers) */
@@ -3571,6 +3711,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     if (dt <= 0.0f) dt = 1.0f / 60.0f;
     if (dt > 0.25f) dt = 0.25f;
 
+    if (g_menu_open && g_cfg.menu_blur) menu_blur_capture((int)w, (int)h);       /* the game's frame, before we draw on it */
     ImGui_ImplOpenGL3_NewFrame();
     if (!g_tex_done) {           /* crisp pixel font: no smoothing when the texture is enlarged */
         g_tex_done = true;
@@ -3647,6 +3788,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         }
         if (g_menu_open) build_menu((float)w, (float)h, &wrect);
     }
+    if (g_menu_open && g_cfg.menu_click && ImGui::IsMouseClicked(0) && ImGui::IsAnyItemHovered()) menu_click_play();
 
     if (!nc_cfg_equal(&g_cfg, &g_saved) && !ImGui::IsMouseDown(0)) {
         if (nc_cfg_save(&g_cfg, NC_CFG)) g_saved = g_cfg;

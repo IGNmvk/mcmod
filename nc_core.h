@@ -17,6 +17,7 @@ extern "C" {
   X(armor_alpha, F, 1.0, 0.05, 1) X(armor_bg_alpha, F, 0.75, 0.0, 1) X(armor_bg_col, I, 0x08080E, 0, 0xFFFFFF) X(armor_bg, I, 0, 0, 1) X(armor_bar, I, 0, 0, 1) X(armor_num, I, 1, 0, 2) \
   X(armor_horiz,  I, 0,    0, 1) X(armor_col, I, 0xEBEBF5, 0, 0xFFFFFF) \
   X(armor_scale, F, 1.0, 0.5, 2.0) X(armor_dx, F, 0.0, -800.0, 800.0) X(armor_dy, F, 0.0, -800.0, 800.0) \
+  X(menu_blur, I, 1, 0, 1) X(menu_blur_str, F, 0.5, 0.0, 1.0) X(menu_click, I, 1, 0, 1) \
   X(offhand_on, I, 1, 0, 1) X(offhand_always, I, 0, 0, 1) X(offhand_scale, F, 1.0, 0.5, 2.0) X(offhand_alpha, F, 1.0, 0.05, 1.0) \
   X(offhand_dx, F, 0.0, -800.0, 800.0) X(offhand_dy, F, 0.0, -800.0, 800.0) \
   X(arrow_on,     I, 0,    0, 1) X(arrow_x, F, 0.50, 0, 1) X(arrow_y, F, 0.68, 0, 1) X(arrow_size, F, 3.0, 1.0, 8.0) \
@@ -49,7 +50,7 @@ extern "C" {
   X(perf_gfx,     I, 0,    0, 1) X(perf_light, I, 0, 0, 1) X(perf_skies, I, 0, 0, 1) X(perf_bob, I, 0, 0, 1) \
   X(perf_view_on, I, 0,    0, 1) X(perf_view, I, 6, 2, 16) \
   X(ui_font,      I, 0,    0, 6) \
-  X(n_x,          F, 0.92, 0, 1) X(n_y, F, 0.80, 0, 1) X(n_btn, F, 3.0, 1.0, 8.0) X(n_alpha, F, 1.0, 0.0, 1) X(n_text_alpha, F, 1.0, 0.0, 1) X(n_col, I, 0xF0F0FA, 0, 0xFFFFFF) X(n_bg_col, I, 0x38306E, 0, 0xFFFFFF) \
+  X(n_x,          F, 0.92, 0, 1) X(n_y, F, 0.80, 0, 1) X(n_btn, F, 3.0, 1.0, 8.0) X(n_alpha, F, 1.0, 0.0, 1) X(n_text_alpha, F, 1.0, 0.0, 1) X(n_col, I, 0xF0F0FA, 0, 0xFFFFFF) X(n_bg_col, I, 0x1A3A78, 0, 0xFFFFFF) \
   X(n_always,     I, 0,    0, 1) X(n_label, I, 0, 0, 7) \
   X(hitbox_on,    I, 0,    0, 1) X(hook_hitbox, I, 1, 0, 1) \
   X(hit_combat, I, 0, 0, 1) X(hit_col, I, 0xFF3030, 0, 0xFFFFFF) X(hit_in_col, I, 0x33FF55, 0, 0xFFFFFF) X(hit_ray_on, I, 1, 0, 1) X(hit_ray_col, I, 0x268CFF, 0, 0xFFFFFF) X(hit_reach, F, 3.0, 1.0, 8.0) \
