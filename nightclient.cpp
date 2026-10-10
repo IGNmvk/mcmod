@@ -1469,62 +1469,134 @@ static void hit_draw_lines(float *verts, int n, const float *mvp) {
     glDrawArrays(GL_LINES, 0, n - 2);
 }
 
+static void hit_rgb(int rgb, float *o) {
+    o[0] = ((rgb >> 16) & 0xff) / 255.0f;
+    o[1] = ((rgb >> 8) & 0xff) / 255.0f;
+    o[2] = (rgb & 0xff) / 255.0f;
+}
+
+/* Some things are rendered by the game through a transform of their own, so the
+ * position it hands the dispatcher is nowhere near the entity's real position -
+ * the spinning mob inside a mob spawner (found in the log: a Skeleton drawn at
+ * 0,0 while it stood ~25 blocks away). Their boxes would land on the camera
+ * (the "ghost box"), and they must not count for the combat crosshair either. */
+static bool hit_render_mismatch(void *entity, const float *render_pos) {
+    if (!g_local_player || !entity || entity == g_local_player) return false;
+    const float *mypos = entity_getPos(g_local_player);
+    const float *epos = entity_getPos(entity);
+    if (!mypos || !epos) return false;
+    const float ex = epos[0] - mypos[0], ez = epos[2] - mypos[2];
+    const float mx = render_pos[0] - ex, mz = render_pos[2] - ez;
+    if (mx * mx + mz * mz <= 16.0f) return false;
+    static int logged = 0;
+    if (logged < 4) {
+        logged++;
+        nclog("box skipped (rendered far from entity): vptr=%p entity-rel=%.2f,%.2f render=%.2f,%.2f",
+              *(void **)entity, ex, ez, render_pos[0], render_pos[2]);
+    }
+    return true;
+}
+
+/* Draws line vertices [0, line_start) in colour A and [line_start, n) in colour B,
+ * with depth test on (blocks occlude), no depth writes, and all GL state restored. */
+static void hit_gl_draw(const float *verts, int n, const float *mvp, int line_start,
+                        const float *colA, const float *colB) {
+    /* The vertices above are already in camera-relative coordinates. */
+    GLint old_prog = 0, old_array = 0, old_active_tex = GL_TEXTURE0, old_tex2d = 0;
+    GLint old_depth_func = GL_LEQUAL, old_blend_src_rgb = GL_ONE, old_blend_dst_rgb = GL_ZERO;
+    GLint old_blend_src_a = GL_ONE, old_blend_dst_a = GL_ZERO;
+    GLint old_cull_face = GL_BACK;
+    GLint old_scissor[4] = {0,0,0,0};
+    GLint old_viewport[4] = {0,0,0,0};
+    GLint old_elem = 0;
+    GLboolean old_depth = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean old_depth_mask = GL_TRUE;
+    GLboolean old_blend = glIsEnabled(GL_BLEND);
+    GLboolean old_cull = glIsEnabled(GL_CULL_FACE);
+    GLboolean old_scissor_en = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean old_color[4] = {GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE};
+
+    glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &old_elem);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active_tex);
+    glGetIntegerv(GL_DEPTH_FUNC, &old_depth_func);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &old_depth_mask);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &old_blend_src_rgb);
+    glGetIntegerv(GL_BLEND_DST_RGB, &old_blend_dst_rgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &old_blend_src_a);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &old_blend_dst_a);
+    glGetIntegerv(GL_CULL_FACE, &old_cull_face);
+    glGetIntegerv(GL_SCISSOR_BOX, old_scissor);
+    glGetIntegerv(GL_VIEWPORT, old_viewport);
+    glGetBooleanv(GL_COLOR_WRITEMASK, old_color);
+
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex2d);
+
+    GLint old_attr_buf=0, old_attr_size=4, old_attr_type=GL_FLOAT, old_attr_stride=0, old_attr_norm=GL_FALSE;
+    GLint old_attr_enabled=0;
+    void *old_attr_ptr = 0;
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &old_attr_enabled);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &old_attr_buf);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &old_attr_size);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &old_attr_type);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &old_attr_stride);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &old_attr_norm);
+    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &old_attr_ptr);
+
+    glUseProgram(g_hit_prog);
+    glUniformMatrix4fv(g_hit_mvp, 1, GL_FALSE, mvp);
+    glBindBuffer(GL_ARRAY_BUFFER, g_hit_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(float) * n * 3), verts, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (const void *)0);
+
+    /* Depth test ON, depth writes OFF. No blending: crisp white/red lines. */
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+
+    glUniform4f(g_hit_col, colA[0], colA[1], colA[2], 1.0f);
+    if (line_start > 0) glDrawArrays(GL_LINES, 0, line_start);
+    if (n - line_start >= 2) {
+        glUniform4f(g_hit_col, colB[0], colB[1], colB[2], 1.0f);
+        glDrawArrays(GL_LINES, line_start, n - line_start);
+    }
+
+    /* Restore EVERYTHING we touched. */
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_attr_buf);
+    if (old_attr_enabled) glEnableVertexAttribArray(0);
+    else glDisableVertexAttribArray(0);
+    glVertexAttribPointer(0, old_attr_size, (GLenum)old_attr_type,
+                          (GLboolean)old_attr_norm, old_attr_stride, old_attr_ptr);
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_array);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)old_elem);
+    glUseProgram((GLuint)old_prog);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex2d);
+    glActiveTexture((GLenum)old_active_tex);
+    glDepthFunc((GLenum)old_depth_func);
+    glDepthMask(old_depth_mask);
+    if (old_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glBlendFuncSeparate((GLenum)old_blend_src_rgb, (GLenum)old_blend_dst_rgb,
+                        (GLenum)old_blend_src_a, (GLenum)old_blend_dst_a);
+    if (old_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    glCullFace((GLenum)old_cull_face);
+    if (old_cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    glScissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3]);
+    if (old_scissor_en) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    glViewport(old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3]);
+    glColorMask(old_color[0], old_color[1], old_color[2], old_color[3]);
+}
+
 static void hit_draw_entity(void *entity, const float *render_pos, float partial) {
     if (!g_cfg.hitbox_on || !entity || !render_pos) return;
     if (hit_seen_entity(entity)) return;
-    /* Item-entity exclusion removed (2026-09) - testing showed it wasn't the
-     * cause of the rare stray-box bug, so item hitboxes are back. The vtable
-     * pointer is still grabbed below for the diagnostic log. */
-    void *vptr = *(void **)entity;
-
-    /* The "stray box next to the player" was identified from the log: a dropped
-     * item (ItemEntity vtable) 0.8 blocks away, drawn for two frames - the pickup
-     * animation (or an item just thrown). Skip item boxes within 2.5 blocks of
-     * the local player; items further away still get their box. */
-    if (g_local_player && entity != g_local_player) {
-        static uintptr_t item_vt = 0;
-        static bool item_vt_ready = false;
-        if (!item_vt_ready) {
-            void *vt = hit_dlsym("_ZTV10ItemEntity");
-            if (vt) item_vt = (uintptr_t)vt + sizeof(void *) * 2;     /* object vptr = vtable + 8 */
-            item_vt_ready = true;
-        }
-        if (item_vt && (uintptr_t)vptr == item_vt) {
-            const float *mypos = entity_getPos(g_local_player);
-            const float *epos = entity_getPos(entity);
-            if (mypos && epos) {
-                const float dx = epos[0] - mypos[0], dy = epos[1] - mypos[1], dz = epos[2] - mypos[2];
-                if (dx * dx + dy * dy + dz * dz < 2.5f * 2.5f) return;
-                /* Ghost check: the game also draws items through the pickup
-                 * animation, with a render position that slides toward the
-                 * player while the item itself stays put. A box drawn for that
-                 * does not match where the item really is, so compare. */
-                const float rx = render_pos[0] - dx, rz = render_pos[2] - dz;
-                if (rx * rx + rz * rz > 0.6f * 0.6f) return;
-            }
-        }
-        {   /* Data for the ghost box: any entity drawn far from where it really is. */
-            const float *mypos = entity_getPos(g_local_player);
-            const float *epos = entity_getPos(entity);
-            if (mypos && epos) {
-                const float ex = epos[0] - mypos[0], ez = epos[2] - mypos[2];
-                const float mx = render_pos[0] - ex, mz = render_pos[2] - ez;
-                if (mx * mx + mz * mz > 4.0f * 4.0f) {
-                    /* Found in the log: a Skeleton drawn at render position 0,0 while it really
-                     * stood ~25 blocks away = the spinning mob inside a mob spawner, which the
-                     * game renders through a transform of its own. Its box would land on the
-                     * camera, i.e. the "ghost box near the player". Not a real entity: skip. */
-                    static int logged = 0;
-                    if (logged < 4) {
-                        logged++;
-                        nclog("box skipped (rendered far from entity): vptr=%p entity-rel=%.2f,%.2f render=%.2f,%.2f",
-                              vptr, ex, ez, render_pos[0], render_pos[2]);
-                    }
-                    return;
-                }
-            }
-        }
-    }
+    /* Item boxes are drawn like everything else. Boxes the game draws far from
+     * the entity's real position (mob spawner cage mob) are skipped. */
+    if (hit_render_mismatch(entity, render_pos)) return;
 
     if (!hit_resolve_symbols() || !hit_init_gl()) return;
 
@@ -1596,95 +1668,11 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     hit_mul(vm, view, model);
     hit_mul(mvp, proj, vm);
 
-    /* The vertices above are already in camera-relative coordinates. */
-    GLint old_prog = 0, old_array = 0, old_active_tex = GL_TEXTURE0, old_tex2d = 0;
-    GLint old_depth_func = GL_LEQUAL, old_blend_src_rgb = GL_ONE, old_blend_dst_rgb = GL_ZERO;
-    GLint old_blend_src_a = GL_ONE, old_blend_dst_a = GL_ZERO;
-    GLint old_cull_face = GL_BACK;
-    GLint old_scissor[4] = {0,0,0,0};
-    GLint old_viewport[4] = {0,0,0,0};
-    GLint old_elem = 0;
-    GLboolean old_depth = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean old_depth_mask = GL_TRUE;
-    GLboolean old_blend = glIsEnabled(GL_BLEND);
-    GLboolean old_cull = glIsEnabled(GL_CULL_FACE);
-    GLboolean old_scissor_en = glIsEnabled(GL_SCISSOR_TEST);
-    GLboolean old_color[4] = {GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE};
-
-    glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array);
-    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &old_elem);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active_tex);
-    glGetIntegerv(GL_DEPTH_FUNC, &old_depth_func);
-    glGetBooleanv(GL_DEPTH_WRITEMASK, &old_depth_mask);
-    glGetIntegerv(GL_BLEND_SRC_RGB, &old_blend_src_rgb);
-    glGetIntegerv(GL_BLEND_DST_RGB, &old_blend_dst_rgb);
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &old_blend_src_a);
-    glGetIntegerv(GL_BLEND_DST_ALPHA, &old_blend_dst_a);
-    glGetIntegerv(GL_CULL_FACE, &old_cull_face);
-    glGetIntegerv(GL_SCISSOR_BOX, old_scissor);
-    glGetIntegerv(GL_VIEWPORT, old_viewport);
-    glGetBooleanv(GL_COLOR_WRITEMASK, old_color);
-
-    glActiveTexture(GL_TEXTURE0);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex2d);
-
-    GLint old_attr_buf=0, old_attr_size=4, old_attr_type=GL_FLOAT, old_attr_stride=0, old_attr_norm=GL_FALSE;
-    GLint old_attr_enabled=0;
-    void *old_attr_ptr = 0;
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &old_attr_enabled);
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &old_attr_buf);
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &old_attr_size);
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &old_attr_type);
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &old_attr_stride);
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &old_attr_norm);
-    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &old_attr_ptr);
-
-    glUseProgram(g_hit_prog);
-    glUniformMatrix4fv(g_hit_mvp, 1, GL_FALSE, mvp);
-    glBindBuffer(GL_ARRAY_BUFFER, g_hit_vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(float) * n * 3), verts, GL_STREAM_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (const void *)0);
-
-    /* Depth test ON, depth writes OFF. No blending: crisp white/red lines. */
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_FALSE);
-    glDisable(GL_BLEND);
-    glDisable(GL_CULL_FACE);
-
-    int line_start = n - 2;
-    glUniform4f(g_hit_col, 1.0f, 1.0f, 1.0f, 1.0f);
-    glDrawArrays(GL_LINES, 0, line_start);
-    glUniform4f(g_hit_col, 0.15f, 0.55f, 1.0f, 1.0f);
-    glDrawArrays(GL_LINES, line_start, 2);
-
-    /* Restore EVERYTHING we touched. */
-    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_attr_buf);
-    if (old_attr_enabled) glEnableVertexAttribArray(0);
-    else glDisableVertexAttribArray(0);
-    glVertexAttribPointer(0, old_attr_size, (GLenum)old_attr_type,
-                          (GLboolean)old_attr_norm, old_attr_stride, old_attr_ptr);
-    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_array);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)old_elem);
-    glUseProgram((GLuint)old_prog);
-    glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex2d);
-    glActiveTexture((GLenum)old_active_tex);
-    glDepthFunc((GLenum)old_depth_func);
-    glDepthMask(old_depth_mask);
-    if (old_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    glBlendFuncSeparate((GLenum)old_blend_src_rgb, (GLenum)old_blend_dst_rgb,
-                        (GLenum)old_blend_src_a, (GLenum)old_blend_dst_a);
-    if (old_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-    glCullFace((GLenum)old_cull_face);
-    if (old_cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
-    glScissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3]);
-    if (old_scissor_en) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-    glViewport(old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3]);
-    glColorMask(old_color[0], old_color[1], old_color[2], old_color[3]);
+    float boxc[3], linec[3];
+    hit_rgb(g_cfg.hit_col, boxc);
+    hit_rgb(g_cfg.hit_ray_col, linec);
+    hit_gl_draw(verts, n, mvp, n - 2, boxc, linec);       /* box in the box colour, look line in the ray colour */
 }
-
 
 static bool combat_ray_aabb(const NcAabb6 &b, const float origin[3], const float dir[3], float max_t, float *out_t) {
     float tmin = 0.0f, tmax = max_t;
@@ -1707,11 +1695,38 @@ static bool combat_ray_aabb(const NcAabb6 &b, const float origin[3], const float
     return tmin <= max_t && tmax >= 0.0f;
 }
 
-static void combat_consider_entity(void *entity, float partial) {
-    if (!g_cfg.combat_crosshair_on || !g_local_player || !entity || entity == g_local_player) return;
+/* Local player's render position this frame (only drawn by the game in third
+ * person), used as the reach ray's start so it follows the player correctly. */
+static bool  g_local_drawn = false;
+static float g_local_rp[3] = {0, 0, 0};
+static int   g_ray_drawn_frame = 0;      /* set once the ray was drawn this frame (two world-pass hooks) */
 
-    const float *pp = entity_getPos(g_local_player);
-    if (!pp) return;
+static bool combat_view_ray(float partial, float origin[3], float dir[3]) {
+    const NcAabb6 *me = (const NcAabb6 *)((const unsigned char *)g_local_player + 0x104);
+    if (!isfinite(me->minx) || !isfinite(me->maxx) || !isfinite(me->miny) ||
+        !isfinite(me->minz) || !isfinite(me->maxz)) return false;
+    NcVec2 rot = {0.0f, 0.0f};
+    entity_getInterpolatedRotation(&rot, g_local_player, partial);
+    if (!isfinite(rot.x) || !isfinite(rot.y)) entity_getRotation(&rot, g_local_player);
+    if (!isfinite(rot.x) || !isfinite(rot.y)) return false;
+    const float deg = 0.01745329251994329577f;
+    const float pitch = rot.x * deg, yaw = rot.y * deg;
+    const float cp = cosf(pitch), sp = sinf(pitch), sy = sinf(yaw), cyaw = cosf(yaw);
+    const float eye = mob_isSneaking(g_local_player) ? 1.54f : 1.62f;
+    /* feet come from the player's own box, so it doesn't matter where the game puts its origin */
+    origin[0] = (me->minx + me->maxx) * 0.5f;
+    origin[1] = me->miny + eye;
+    origin[2] = (me->minz + me->maxz) * 0.5f;
+    dir[0] = -sy * cp; dir[1] = -sp; dir[2] = cyaw * cp;
+    return true;
+}
+
+/* Crosshair turns red while the thing under it is inside reach: a mob / player
+ * (anything at least 0.55 tall, so no items, arrows or orbs) whose box the view
+ * ray hits within the same reach distance the reach ray shows. */
+static void combat_consider_entity(void *entity, const float *render_pos, float partial) {
+    if (!g_cfg.combat_crosshair_on || !g_local_player || !entity || entity == g_local_player) return;
+    if (render_pos && hit_render_mismatch(entity, render_pos)) return;
 
     const NcAabb6 *raw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
     NcAabb6 b = *raw;
@@ -1720,37 +1735,68 @@ static void combat_consider_entity(void *entity, float partial) {
     if (b.maxx <= b.minx || b.maxy <= b.miny || b.maxz <= b.minz) return;
     if ((b.maxy - b.miny) < 0.55f) return;
 
-    const float cx = (b.minx + b.maxx) * 0.5f;
-    const float cy = (b.miny + b.maxy) * 0.5f;
-    const float cz = (b.minz + b.maxz) * 0.5f;
-    const float dx = cx - pp[0], dy = cy - (pp[1] + 1.2f), dz = cz - pp[2];
-    if ((dx * dx + dy * dy + dz * dz) > (3.45f * 3.45f)) return;
+    float origin[3], dir[3];
+    if (!combat_view_ray(partial, origin, dir)) return;
+    const float reach = g_cfg.hit_reach;
 
-    NcVec2 rot = {0.0f, 0.0f};
-    entity_getInterpolatedRotation(&rot, g_local_player, partial);
-    if (!isfinite(rot.x) || !isfinite(rot.y))
-        entity_getRotation(&rot, g_local_player);
-    if (!isfinite(rot.x) || !isfinite(rot.y)) return;
+    const float cx = (b.minx + b.maxx) * 0.5f, cy = (b.miny + b.maxy) * 0.5f, cz = (b.minz + b.maxz) * 0.5f;
+    const float dx = cx - origin[0], dy = cy - origin[1], dz = cz - origin[2];
+    const float half = 0.5f * ((b.maxx - b.minx) + (b.maxy - b.miny) + (b.maxz - b.minz));
+    const float far_lim = reach + half + 1.0f;
+    if ((dx * dx + dy * dy + dz * dz) > far_lim * far_lim) return;
 
-    const float deg = 0.01745329251994329577f;
-    const float pitch = rot.x * deg, yaw = rot.y * deg;
-    const float cp = cosf(pitch), sp = sinf(pitch), sy = sinf(yaw), cyaw = cosf(yaw);
-    const float eye = mob_isSneaking(g_local_player) ? 1.54f : 1.62f;
-    float origin[3] = { pp[0], pp[1] + eye, pp[2] };
-    float dir[3] = { -sy * cp, -sp, cyaw * cp };
-
-    const float pad = 0.14f;
+    const float pad = 0.10f;                          /* small forgiveness, like the game's own target pick */
     b.minx -= pad; b.miny -= pad; b.minz -= pad;
     b.maxx += pad; b.maxy += pad; b.maxz += pad;
 
     float hit_t = 0.0f;
-    if (!combat_ray_aabb(b, origin, dir, 3.15f, &hit_t)) return;
+    if (!combat_ray_aabb(b, origin, dir, reach, &hit_t)) return;
     if (!g_snap.combat_target || hit_t < g_snap.combat_target_t) {
         g_snap.combat_target = 1;
         g_snap.combat_target_t = hit_t;
     }
     g_snap.combat_target_until = now_s() + 0.045;
 }
+
+/* Reach ray: a line from the eyes along the view, exactly reach long, with a
+ * small cross at the end. Drawn once per frame at the end of the game's own
+ * entity pass, so depth testing hides it behind blocks. In first person the
+ * line itself points straight away from the camera, so the end cross is what
+ * you see; in third person you see the whole line leave the player's head. */
+static void hit_draw_reach_ray(float partial) {
+    if (!g_local_player || !hit_resolve_symbols() || !hit_init_gl()) return;
+    if (!g_projection_slot || !g_view_slot || *g_projection_slot == 0 || *g_view_slot == 0) return;
+    float origin[3], dir[3];
+    if (!combat_view_ray(partial, origin, dir)) return;
+
+    float o[3] = {0.0f, 0.0f, 0.0f};                  /* first person: the camera is at the eyes */
+    if (g_local_drawn) {                              /* third person: eyes = the player's render position + eye height */
+        const float *cp = entity_getPos(g_local_player);
+        const NcAabb6 *me = (const NcAabb6 *)((const unsigned char *)g_local_player + 0x104);
+        if (!cp) return;
+        const float feet_off = me->miny - cp[1];
+        const float eye = origin[1] - me->miny;
+        o[0] = g_local_rp[0]; o[1] = g_local_rp[1] + feet_off + eye; o[2] = g_local_rp[2];
+    }
+    const float reach = g_cfg.hit_reach;
+    const float e[3] = { o[0] + dir[0] * reach, o[1] + dir[1] * reach, o[2] + dir[2] * reach };
+    const float k = 0.12f;
+    float v[64];
+    int n = 0;
+    hit_line(v, &n, o[0], o[1], o[2], e[0], e[1], e[2]);
+    hit_line(v, &n, e[0] - k, e[1], e[2], e[0] + k, e[1], e[2]);
+    hit_line(v, &n, e[0], e[1] - k, e[2], e[0], e[1] + k, e[2]);
+    hit_line(v, &n, e[0], e[1], e[2] - k, e[0], e[1], e[2] + k);
+
+    float proj[16], view[16], mvp[16];
+    hit_copy_matrix(*g_projection_slot, proj);
+    hit_copy_matrix(*g_view_slot, view);
+    hit_mul(mvp, proj, view);
+    float col[3];
+    hit_rgb(g_cfg.hit_ray_col, col);
+    hit_gl_draw(v, n, mvp, n, col, col);
+}
+
 /* FOUND IT (2026-09): comparing against the original ChatGPT source showed it
  * drew every entity's hitbox unconditionally, local player included, using
  * nothing but the plain +0x104 read below - no perspective check, no
@@ -1762,8 +1808,36 @@ static void combat_consider_entity(void *entity, float partial) {
 static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
     if (g_orig_entity_render)
         g_orig_entity_render(self, entity, pos, yaw, partial);
-    if (g_cfg.hitbox_on && entity && pos)
-        hit_draw_entity(entity, (const float *)pos, partial);
+    if (!entity || !pos) return;
+    const float *rp = (const float *)pos;
+    if (entity == g_local_player) {                   /* only drawn in third person */
+        g_local_rp[0] = rp[0]; g_local_rp[1] = rp[1]; g_local_rp[2] = rp[2];
+        g_local_drawn = true;
+    }
+    combat_consider_entity(entity, rp, partial);      /* crosshair works with hitboxes off too */
+    if (g_cfg.hitbox_on) hit_draw_entity(entity, rp, partial);
+}
+
+/* End of the game's entity pass: draw the reach ray. The Player and Camera
+ * renderers both have this function, so hook both and draw only once per frame. */
+typedef void (*fn_render_entities)(void *, float);
+static fn_render_entities g_orig_render_entities_cam = 0, g_orig_render_entities_plr = 0;
+static void reach_ray_pass(float partial) {
+    if (!g_cfg.hitbox_on || !g_cfg.hit_ray_on || g_ray_drawn_frame) return;
+    g_ray_drawn_frame = 1;
+    static bool logged = false;
+    if (!logged) { logged = true; nclog("reach ray: world pass reached"); }
+    hit_draw_reach_ray(partial);
+}
+static void hook_render_entities_cam(void *self, float partial) {
+    g_local_drawn = false;
+    if (g_orig_render_entities_cam) g_orig_render_entities_cam(self, partial);
+    reach_ray_pass(partial);
+}
+static void hook_render_entities_plr(void *self, float partial) {
+    g_local_drawn = false;
+    if (g_orig_render_entities_plr) g_orig_render_entities_plr(self, partial);
+    reach_ray_pass(partial);
 }
 
 
@@ -3194,11 +3268,14 @@ static void panel_particles() {
     }
 }
 static void panel_hitbox() {
-    head("Hitboxes", &g_cfg.hitbox_on, "Turns on the game's own developer bounding-box renderer.");
-    ImGui::TextDisabled("This shows every entity's and block's box, drawn by the game itself, so it renders");
-    ImGui::TextDisabled("correctly through everything the game already handles (distance, walls, etc).");
-    ImGui::TextDisabled("There is no separate colour for a thrown ender pearl yet - tell me what it looks");
-    ImGui::TextDisabled("like once you can see it and I will try to single it out next.");
+    head("Hitboxes", &g_cfg.hitbox_on, "Draws a box around every entity (items included), through the game's own camera.");
+    color_picker("Hitbox color", &g_cfg.hit_col);
+    chk("Reach ray", &g_cfg.hit_ray_on);
+    if (g_cfg.hit_ray_on) color_picker("Ray color", &g_cfg.hit_ray_col);
+    sl_f("Reach (blocks)", &g_cfg.hit_reach, 1.0f, 8.0f);
+    ImGui::TextDisabled("The ray starts at your eyes and is exactly one reach long, with a cross at the end.");
+    ImGui::TextDisabled("In first person you mostly see the cross; in third person the whole line.");
+    ImGui::TextDisabled("The same reach decides when the combat crosshair turns red.");
 }
 static void panel_perf() {
     head("FPS optimizer", 0, "Lower some graphics settings for more FPS. Each one is separate.");
@@ -3225,7 +3302,8 @@ static void panel_drop() {
 static void panel_combat_crosshair() {
     head("Combat crosshair", &g_cfg.combat_crosshair_on,
          "Changes the normal crosshair to red when a player or mob is in combat reach.");
-    ImGui::TextDisabled("Fixed vanilla-style red crosshair. No extra overlay controls.");
+    ImGui::TextDisabled("Turns red when a mob or player is under the crosshair within your reach.");
+    sl_f("Reach (blocks)", &g_cfg.hit_reach, 1.0f, 8.0f);
 }
 static void panel_fast_totem() {
     head("Fast Totem", &g_cfg.fast_totem_on,
@@ -3569,6 +3647,7 @@ static swap_fn g_orig_swap = 0;
 static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     nc_frame(d, s);
     g_hit_seen_n = 0;
+    g_ray_drawn_frame = 0;
     g_snap.combat_target = 0;
     g_snap.combat_target_t = 999.0f;
     return g_orig_swap(d, s);
@@ -3667,6 +3746,8 @@ static void nc_init(void) {
         reg("End Crystal render optimizer", "_ZN20EnderCrystalRenderer6renderER6EntityRK4Vec3ff", (void *)hook_crystal_render, (void **)&g_orig_crystal_render);
         reg("End Crystal effects optimizer", "_ZN20EnderCrystalRenderer13renderEffectsER6EntityRK4Vec3ff", (void *)hook_crystal_effects, (void **)&g_orig_crystal_effects);
     }
+    reg("reach ray (camera pass)", "_ZN19LevelRendererCamera14renderEntitiesEf", (void *)hook_render_entities_cam, (void **)&g_orig_render_entities_cam);
+    reg("reach ray (player pass)", "_ZN19LevelRendererPlayer14renderEntitiesEf", (void *)hook_render_entities_plr, (void **)&g_orig_render_entities_plr);
     reg("entity render hitboxes/combat crosshair", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff", (void *)hook_entity_render, (void **)&g_orig_entity_render);
     if (g_cfg.hook_perf) {
         reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
