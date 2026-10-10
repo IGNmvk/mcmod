@@ -1479,7 +1479,7 @@ static void hit_rgb(int rgb, float *o) {
  * position it hands the dispatcher is nowhere near the entity's real position -
  * the spinning mob inside a mob spawner (found in the log: a Skeleton drawn at
  * 0,0 while it stood ~25 blocks away). Their boxes would land on the camera
- * (the "ghost box"), and they must not count for the combat crosshair either. */
+ * (the "ghost box"), and they must not count as "in reach" either. */
 static bool hit_render_mismatch(void *entity, const float *render_pos) {
     if (!g_local_player || !entity || entity == g_local_player) return false;
     const float *mypos = entity_getPos(g_local_player);
@@ -1591,6 +1591,23 @@ static void hit_gl_draw(const float *verts, int n, const float *mvp, int line_st
     glColorMask(old_color[0], old_color[1], old_color[2], old_color[3]);
 }
 
+static bool combat_view_ray(float partial, float origin[3], float dir[3]);
+
+/* Combat hitboxes: a mob or player (at least 0.55 tall - no items, arrows or
+ * orbs) counts as "in reach" when the nearest point of its box is within the
+ * reach distance of the player's eyes. */
+static bool hit_in_reach(void *entity, const NcAabb6 &w, float partial) {
+    if (!g_local_player || entity == g_local_player) return false;
+    if ((w.maxy - w.miny) < 0.55f) return false;
+    float o[3], d[3];
+    if (!combat_view_ray(partial, o, d)) return false;
+    const float nx = fminf(fmaxf(o[0], w.minx), w.maxx) - o[0];
+    const float ny = fminf(fmaxf(o[1], w.miny), w.maxy) - o[1];
+    const float nz = fminf(fmaxf(o[2], w.minz), w.maxz) - o[2];
+    const float r = g_cfg.hit_reach;
+    return nx * nx + ny * ny + nz * nz <= r * r;
+}
+
 static void hit_draw_entity(void *entity, const float *render_pos, float partial) {
     if (!g_cfg.hitbox_on || !entity || !render_pos) return;
     if (hit_seen_entity(entity)) return;
@@ -1669,30 +1686,10 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     hit_mul(mvp, proj, vm);
 
     float boxc[3], linec[3];
-    hit_rgb(g_cfg.hit_col, boxc);
+    if (!g_cfg.hit_combat) { boxc[0] = boxc[1] = boxc[2] = 1.0f; }            /* normal: always white */
+    else hit_rgb(hit_in_reach(entity, *aw, partial) ? g_cfg.hit_in_col : g_cfg.hit_col, boxc);
     hit_rgb(g_cfg.hit_ray_col, linec);
     hit_gl_draw(verts, n, mvp, n - 2, boxc, linec);       /* box in the box colour, look line in the ray colour */
-}
-
-static bool combat_ray_aabb(const NcAabb6 &b, const float origin[3], const float dir[3], float max_t, float *out_t) {
-    float tmin = 0.0f, tmax = max_t;
-    const float minv[3] = { b.minx, b.miny, b.minz };
-    const float maxv[3] = { b.maxx, b.maxy, b.maxz };
-    for (int i = 0; i < 3; ++i) {
-        float o = origin[i], d = dir[i];
-        if (fabsf(d) < 1e-6f) {
-            if (o < minv[i] || o > maxv[i]) return false;
-            continue;
-        }
-        float a = (minv[i] - o) / d;
-        float c = (maxv[i] - o) / d;
-        if (a > c) { float tmp = a; a = c; c = tmp; }
-        if (a > tmin) tmin = a;
-        if (c < tmax) tmax = c;
-        if (tmin > tmax) return false;
-    }
-    if (out_t) *out_t = tmin;
-    return tmin <= max_t && tmax >= 0.0f;
 }
 
 /* Local player's render position this frame (only drawn by the game in third
@@ -1719,43 +1716,6 @@ static bool combat_view_ray(float partial, float origin[3], float dir[3]) {
     origin[2] = (me->minz + me->maxz) * 0.5f;
     dir[0] = -sy * cp; dir[1] = -sp; dir[2] = cyaw * cp;
     return true;
-}
-
-/* Crosshair turns red while the thing under it is inside reach: a mob / player
- * (anything at least 0.55 tall, so no items, arrows or orbs) whose box the view
- * ray hits within the same reach distance the reach ray shows. */
-static void combat_consider_entity(void *entity, const float *render_pos, float partial) {
-    if (!g_cfg.combat_crosshair_on || !g_local_player || !entity || entity == g_local_player) return;
-    if (render_pos && hit_render_mismatch(entity, render_pos)) return;
-
-    const NcAabb6 *raw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
-    NcAabb6 b = *raw;
-    if (!isfinite(b.minx) || !isfinite(b.miny) || !isfinite(b.minz) ||
-        !isfinite(b.maxx) || !isfinite(b.maxy) || !isfinite(b.maxz)) return;
-    if (b.maxx <= b.minx || b.maxy <= b.miny || b.maxz <= b.minz) return;
-    if ((b.maxy - b.miny) < 0.55f) return;
-
-    float origin[3], dir[3];
-    if (!combat_view_ray(partial, origin, dir)) return;
-    const float reach = g_cfg.hit_reach;
-
-    const float cx = (b.minx + b.maxx) * 0.5f, cy = (b.miny + b.maxy) * 0.5f, cz = (b.minz + b.maxz) * 0.5f;
-    const float dx = cx - origin[0], dy = cy - origin[1], dz = cz - origin[2];
-    const float half = 0.5f * ((b.maxx - b.minx) + (b.maxy - b.miny) + (b.maxz - b.minz));
-    const float far_lim = reach + half + 1.0f;
-    if ((dx * dx + dy * dy + dz * dz) > far_lim * far_lim) return;
-
-    const float pad = 0.10f;                          /* small forgiveness, like the game's own target pick */
-    b.minx -= pad; b.miny -= pad; b.minz -= pad;
-    b.maxx += pad; b.maxy += pad; b.maxz += pad;
-
-    float hit_t = 0.0f;
-    if (!combat_ray_aabb(b, origin, dir, reach, &hit_t)) return;
-    if (!g_snap.combat_target || hit_t < g_snap.combat_target_t) {
-        g_snap.combat_target = 1;
-        g_snap.combat_target_t = hit_t;
-    }
-    g_snap.combat_target_until = now_s() + 0.045;
 }
 
 /* Reach ray: a line from the eyes along the view, exactly reach long, with a
@@ -1814,7 +1774,6 @@ static void hook_entity_render(void *self, void *entity, const void *pos, float 
         g_local_rp[0] = rp[0]; g_local_rp[1] = rp[1]; g_local_rp[2] = rp[2];
         g_local_drawn = true;
     }
-    combat_consider_entity(entity, rp, partial);      /* crosshair works with hitboxes off too */
     if (g_cfg.hitbox_on) hit_draw_entity(entity, rp, partial);
 }
 
@@ -3027,19 +2986,6 @@ static ImVec2 elem_size(int e) {
 }
 
 
-static void draw_combat_crosshair(ImDrawList *dl, float w, float h) {
-    if (!g_cfg.combat_crosshair_on || !g_snap.combat_target) return;
-    if (g_snap.combat_target_until > 0.0 && now_s() > g_snap.combat_target_until) return;
-    const float cx = floorf(w * 0.5f), cy = floorf(h * 0.5f);
-    const ImU32 red = IM_COL32(255, 48, 48, 255);
-    /* Same small fixed footprint as the vanilla 1.1.x center crosshair. */
-    const float gap = 1.0f, len = 3.0f;
-    dl->AddLine(V(cx - gap - len, cy), V(cx - gap, cy), red, 1.0f);
-    dl->AddLine(V(cx + gap, cy), V(cx + gap + len, cy), red, 1.0f);
-    dl->AddLine(V(cx, cy - gap - len), V(cx, cy - gap), red, 1.0f);
-    dl->AddLine(V(cx, cy + gap), V(cx, cy + gap + len), red, 1.0f);
-}
-
 /* ------------------------------------------------------------------ "Move on screen" */
 static void build_edit(float w, float h) {
     ImGuiIO &io = ImGui::GetIO();
@@ -3268,14 +3214,19 @@ static void panel_particles() {
     }
 }
 static void panel_hitbox() {
-    head("Hitboxes", &g_cfg.hitbox_on, "Draws a box around every entity (items included), through the game's own camera.");
-    color_picker("Hitbox color", &g_cfg.hit_col);
+    head("Hitboxes", &g_cfg.hitbox_on, "Draws a white box around every entity (items included).");
+    chk("Combat hitboxes", &g_cfg.hit_combat);
+    if (g_cfg.hit_combat) {
+        color_picker("Hitbox color", &g_cfg.hit_col);
+        color_picker("In-reach color", &g_cfg.hit_in_col);
+        ImGui::TextDisabled("Boxes use the first color. A mob or player inside your reach switches to the second.");
+    } else {
+        ImGui::TextDisabled("Turn on Combat hitboxes to choose colors.");
+    }
+    sl_f("Reach (blocks)", &g_cfg.hit_reach, 1.0f, 8.0f);
     chk("Reach ray", &g_cfg.hit_ray_on);
     if (g_cfg.hit_ray_on) color_picker("Ray color", &g_cfg.hit_ray_col);
-    sl_f("Reach (blocks)", &g_cfg.hit_reach, 1.0f, 8.0f);
-    ImGui::TextDisabled("The ray starts at your eyes and is exactly one reach long, with a cross at the end.");
-    ImGui::TextDisabled("In first person you mostly see the cross; in third person the whole line.");
-    ImGui::TextDisabled("The same reach decides when the combat crosshair turns red.");
+    ImGui::TextDisabled("The ray starts at your eyes and is one reach long, with a cross at the end.");
 }
 static void panel_perf() {
     head("FPS optimizer", 0, "Lower some graphics settings for more FPS. Each one is separate.");
@@ -3298,12 +3249,6 @@ static void panel_drop() {
     sl_f("Text opacity", &g_cfg.drop_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.drop_x, &g_cfg.drop_y);
     ImGui::TextDisabled("Works after you have touched the screen in a world once.");
-}
-static void panel_combat_crosshair() {
-    head("Combat crosshair", &g_cfg.combat_crosshair_on,
-         "Changes the normal crosshair to red when a player or mob is in combat reach.");
-    ImGui::TextDisabled("Turns red when a mob or player is under the crosshair within your reach.");
-    sl_f("Reach (blocks)", &g_cfg.hit_reach, 1.0f, 8.0f);
 }
 static void panel_fast_totem() {
     head("Fast Totem", &g_cfg.fast_totem_on,
@@ -3368,7 +3313,6 @@ static const Mod g_mods[] = {
     { "Crystal optimizer",   &g_cfg.crystal_opt_on, panel_crystal_optimizer },
     { "Elytra angle",       &g_cfg.elytra_angle_on, panel_elytra_angle },
     { "Quick drop",         &g_cfg.drop_on,    panel_drop },
-    { "Combat crosshair",    &g_cfg.combat_crosshair_on, panel_combat_crosshair },
     { "Fast Totem",         &g_cfg.fast_totem_on, panel_fast_totem },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
@@ -3491,9 +3435,8 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool fast_totem_vis = g_cfg.fast_totem_on && hud_btns && g_snap.totem_present;
     if (!zoom_vis) g_zoom_active = 0;
 
-    bool combat_vis = g_cfg.combat_crosshair_on && in_world && !g_menu_open && !g_edit;
     bool controls_vis = g_cfg.controls_mode == 1 && gameplay_hud && in_world && !g_menu_open && !g_edit;
-    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || combat_vis || controls_vis || menu_reach || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || controls_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -3597,8 +3540,6 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
                           false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col, &hud[3]))
                 fast_totem_move();
         }
-        if (in_world && !g_menu_open)
-            draw_combat_crosshair(fg, (float)w, (float)h);
         if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
             if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, button_text(E_N),
@@ -3648,8 +3589,6 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     nc_frame(d, s);
     g_hit_seen_n = 0;
     g_ray_drawn_frame = 0;
-    g_snap.combat_target = 0;
-    g_snap.combat_target_t = 999.0f;
     return g_orig_swap(d, s);
 }
 
