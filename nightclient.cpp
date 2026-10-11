@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <float.h>
@@ -45,6 +46,7 @@ extern "C" {
 /* ---- game functions (found in libminecraftpe.so when the mod loads) ---- */
 extern "C" bool mih_isMovingForward(void *self) __asm__("_ZNK16MoveInputHandler15isMovingForwardEv");
 extern "C" bool entity_isRiding(const void *self) __asm__("_ZNK6Entity8isRidingEv");
+extern "C" void *entity_getRide(const void *self) __asm__("_ZNK6Entity7getRideEv");
 extern "C" bool mob_isSneaking(void *self)      __asm__("_ZNK3Mob10isSneakingEv");
 extern "C" void mob_setSneaking(void *self, bool on) __asm__("_ZN3Mob11setSneakingEb");
 extern "C" void mob_setJumping(void *self, bool on)  __asm__("_ZN3Mob10setJumpingEb");
@@ -2167,6 +2169,49 @@ static void ctrl_apply_player_actions() {
     }
     prev_attack = cur_attack;
     prev_interact = cur_interact;
+
+    /* Boats: vanilla touch steers them with two paddle buttons, which the new
+     * controls don't have (and the old ones are hidden). So the joystick drives
+     * the paddles through the game's own paddle callbacks, with the same rule
+     * as Java: forward = both paddles, steering left = right paddle only,
+     * steering right = left paddle only. */
+    typedef void (*fn_cic_ci_side)(void *, void *, int);
+    static bool pad_resolved = false;
+    static fn_cic_ci_side paddle_press = 0, paddle_release = 0;
+    static int pad_l = 0, pad_r = 0;
+    static uintptr_t boat_vt = 0;
+    if (!pad_resolved) {
+        pad_resolved = true;
+        paddle_press   = (fn_cic_ci_side)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks23handlePaddleButtonPressER14ClientInstance4Side");
+        paddle_release = (fn_cic_ci_side)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks25handlePaddleButtonReleaseER14ClientInstance4Side");
+        void *vt = hit_dlsym("_ZTV4Boat");
+        if (vt) boat_vt = (uintptr_t)vt + sizeof(void *) * 2;
+        nclog("boat paddles: press=%p release=%p boat vtable=%p", (void *)paddle_press, (void *)paddle_release, (void *)boat_vt);
+    }
+    bool in_boat = false;
+    if (boat_vt && entity_isRiding(g_local_player)) {
+        void *ride = entity_getRide(g_local_player);
+        in_boat = ride && *(const uintptr_t *)ride == boat_vt;
+    }
+    int want_l = 0, want_r = 0;
+    if (in_boat && g_ctrl_joy_id >= 0) {
+        const float th = 0.35f, jx = (float)g_ctrl_joy_x, fwd = -(float)g_ctrl_joy_y;
+        const bool f = fwd > th, lt = jx < -th, rt = jx > th;
+        want_l = (rt || f) ? 1 : 0;
+        want_r = (lt || f) ? 1 : 0;
+    }
+    if (g_cic && g_ci && paddle_press && paddle_release && (want_l != pad_l || want_r != pad_r)) {
+        g_ctrl_internal++;
+        /* Side: 0 = left, 1 = right (assumed; the log shows every change so a swap is easy to spot) */
+        if (want_l && !pad_l) paddle_press(g_cic, g_ci, 0);
+        if (!want_l && pad_l) paddle_release(g_cic, g_ci, 0);
+        if (want_r && !pad_r) paddle_press(g_cic, g_ci, 1);
+        if (!want_r && pad_r) paddle_release(g_cic, g_ci, 1);
+        g_ctrl_internal--;
+        static int logged = 0;
+        if (logged < 20) { logged++; nclog("boat paddles: left=%d right=%d (stick %.2f,%.2f)", want_l, want_r, (float)g_ctrl_joy_x, (float)g_ctrl_joy_y); }
+        pad_l = want_l; pad_r = want_r;
+    }
 }
 static void ctrl_consume_touch(int action, int id, float x, float y) {
     if (g_cfg.controls_mode != 1) return;
@@ -3147,9 +3192,78 @@ static void touch_scroll() {
     if (ImGui::IsWindowHovered() && !ImGui::IsAnyItemActive() && ImGui::IsMouseDragging(0))
         ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
 }
-static void chk(const char *label, int *v) { bool b = *v != 0; if (ImGui::Checkbox(label, &b)) *v = b ? 1 : 0; }
-static void sl_f(const char *label, float *v, float lo, float hi) { ImGui::SliderFloat(label, v, lo, hi, "%.2f"); }
-static void sl_i(const char *label, int *v, int lo, int hi) { ImGui::SliderInt(label, v, lo, hi, "%d"); }
+/* ---- widgets in the new look: switches, choice buttons, sliders with a value box ---- */
+static void draw_switch(ImDrawList *dl, ImVec2 p, float h, bool on) {
+    const float w = h * 1.85f, r = h * 0.5f;
+    dl->AddRectFilled(p, V(p.x + w, p.y + h), on ? IM_COL32(40, 100, 225, 255) : IM_COL32(78, 84, 100, 255), r);
+    const float kx = on ? p.x + w - r : p.x + r;
+    dl->AddCircleFilled(V(kx, p.y + r), r * 0.80f, on ? IM_COL32(236, 244, 255, 255) : IM_COL32(205, 210, 220, 255));
+}
+static void chk(const char *label, int *v) {
+    ImGui::PushID(label);
+    const float fh = ImGui::GetFrameHeight(), sh = fh * 0.82f, sw = sh * 1.85f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    if (ImGui::InvisibleButton("##sw", V(avail, fh))) *v = *v ? 0 : 1;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    draw_switch(dl, V(p.x, p.y + (fh - sh) * 0.5f), sh, *v != 0);
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    dl->AddText(V(p.x + sw + fh * 0.45f, p.y + (fh - ts.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_Text), label);
+    ImGui::PopID();
+}
+static bool choice(const char *label, bool active) {
+    ImGui::PushID(label);
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    const float padx = ImGui::GetStyle().FramePadding.x * 1.5f, hh = ImGui::GetFrameHeight() * 1.1f;
+    const ImVec2 p = ImGui::GetCursorScreenPos(), sz = V(ts.x + padx * 2.0f, hh);
+    const bool clicked = ImGui::InvisibleButton("##ch", sz);
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImU32 bg = active ? IM_COL32(40, 100, 225, 255) : (hov ? IM_COL32(52, 60, 82, 255) : IM_COL32(40, 46, 62, 255));
+    dl->AddRectFilled(p, V(p.x + sz.x, p.y + sz.y), bg, hh * 0.32f);
+    dl->AddText(V(p.x + padx, p.y + (hh - ts.y) * 0.5f), active ? IM_COL32(245, 250, 255, 255) : IM_COL32(190, 198, 215, 255), label);
+    ImGui::PopID();
+    return clicked;
+}
+static void value_box(const char *text, float w) {
+    const float fh = ImGui::GetFrameHeight();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, V(p.x + w, p.y + fh), IM_COL32(14, 18, 28, 255), fh * 0.28f);
+    dl->AddRect(p, V(p.x + w, p.y + fh), IM_COL32(40, 70, 130, 255), fh * 0.28f, 0, 1.0f);
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    dl->AddText(V(p.x + (w - ts.x) * 0.5f, p.y + (fh - ts.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_Text), text);
+    ImGui::Dummy(V(w, fh));
+}
+static void slider_label(const char *label) {
+    ImGuiStyle &st = ImGui::GetStyle();
+    const float keep = st.ItemSpacing.y;
+    st.ItemSpacing.y = 3.0f;                                   /* label sits right on its slider */
+    ImGui::TextUnformatted(label);
+    st.ItemSpacing.y = keep;
+}
+static void sl_f(const char *label, float *v, float lo, float hi) {
+    slider_label(label);
+    ImGui::PushID(label);
+    const float boxw = ImGui::GetFrameHeight() * 2.7f;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - boxw - ImGui::GetStyle().ItemSpacing.x);
+    ImGui::SliderFloat("##s", v, lo, hi, "");
+    ImGui::SameLine();
+    char b[24]; snprintf(b, sizeof b, "%.2f", *v);
+    value_box(b, boxw);
+    ImGui::PopID();
+}
+static void sl_i(const char *label, int *v, int lo, int hi) {
+    slider_label(label);
+    ImGui::PushID(label);
+    const float boxw = ImGui::GetFrameHeight() * 2.7f;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - boxw - ImGui::GetStyle().ItemSpacing.x);
+    ImGui::SliderInt("##s", v, lo, hi, "");
+    ImGui::SameLine();
+    char b[24]; snprintf(b, sizeof b, "%d", *v);
+    value_box(b, boxw);
+    ImGui::PopID();
+}
 static void move_btn() {
     if (ImGui::Button("Move on screen")) {
         g_edit = true;
@@ -3157,11 +3271,10 @@ static void move_btn() {
         nclog("edit mode target=%d", g_edit_target);
     }
 }
-static void head(const char *title, int *on, const char *desc) {
-    ImGui::TextColored(ACCENT, "%s", title);
+static void head(const char * /*title: shown in the header bar now*/, int *on, const char *desc) {
+    if (desc) { ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled)); ImGui::TextWrapped("%s", desc); ImGui::PopStyleColor(); }
     if (on) chk("Enabled", on);
-    if (desc) ImGui::TextDisabled("%s", desc);
-    ImGui::Separator();
+    ImGui::Spacing();
 }
 static void button_text_edit(const char *label, char *text) {
     char id[48];
@@ -3205,11 +3318,11 @@ static void panel_armor() {
     head("Armor HUD", &g_cfg.armor_on, "Your armor as extra slots to the right of the hotbar - only the pieces you wear. Visual only.");
     chk("Durability bar", &g_cfg.armor_bar);
     color_picker("Text color", &g_cfg.armor_col);
-    if (ImGui::RadioButton("No text", g_cfg.armor_num == 0)) g_cfg.armor_num = 0;
+    if (choice("No text", g_cfg.armor_num == 0)) g_cfg.armor_num = 0;
     ImGui::SameLine();
-    if (ImGui::RadioButton("Durability", g_cfg.armor_num == 1)) g_cfg.armor_num = 1;
+    if (choice("Durability", g_cfg.armor_num == 1)) g_cfg.armor_num = 1;
     ImGui::SameLine();
-    if (ImGui::RadioButton("Percent", g_cfg.armor_num == 2)) g_cfg.armor_num = 2;
+    if (choice("Percent", g_cfg.armor_num == 2)) g_cfg.armor_num = 2;
     sl_f("Slot size", &g_cfg.armor_scale, 0.5f, 2.0f);
     sl_f("Opacity", &g_cfg.armor_alpha, 0.05f, 1.0f);
     move_btn();
@@ -3229,11 +3342,11 @@ static void panel_offhand() {
 }
 static void panel_elytra() {
     head("Elytra indicator", &g_cfg.elytra_on, "An outline elytra icon on screen while you are gliding.");
-    if (ImGui::RadioButton("Icon", g_cfg.elytra_style == 0)) g_cfg.elytra_style = 0;
+    if (choice("Icon", g_cfg.elytra_style == 0)) g_cfg.elytra_style = 0;
     ImGui::SameLine();
-    if (ImGui::RadioButton("Text", g_cfg.elytra_style == 1)) g_cfg.elytra_style = 1;
+    if (choice("Text", g_cfg.elytra_style == 1)) g_cfg.elytra_style = 1;
     ImGui::SameLine();
-    if (ImGui::RadioButton("Both", g_cfg.elytra_style == 2)) g_cfg.elytra_style = 2;
+    if (choice("Both", g_cfg.elytra_style == 2)) g_cfg.elytra_style = 2;
     color_picker("Text / icon color", &g_cfg.elytra_col);
     color_picker("Background color", &g_cfg.elytra_bg_col);
     hud_look(&g_cfg.elytra_size, &g_cfg.elytra_alpha, &g_cfg.elytra_bg_alpha);
@@ -3370,9 +3483,9 @@ static void panel_fast_totem() {
 static void panel_controls() {
     ImGui::TextColored(ACCENT,"Controls");
     ImGui::Separator();
-    if (ImGui::RadioButton("Legacy", g_cfg.controls_mode == 0)) g_cfg.controls_mode = 0;
+    if (choice("Legacy", g_cfg.controls_mode == 0)) g_cfg.controls_mode = 0;
     ImGui::SameLine();
-    if (ImGui::RadioButton("New", g_cfg.controls_mode == 1)) g_cfg.controls_mode = 1;
+    if (choice("New", g_cfg.controls_mode == 1)) g_cfg.controls_mode = 1;
     ImGui::TextDisabled("New uses the 1.21-style joystick and separate touch buttons.");
     if (g_cfg.controls_mode == 1) {
         if (ImGui::Button("Edit controls",V(180,0))) {
@@ -3408,6 +3521,55 @@ static void panel_client() {
     ImGui::Spacing();
     ImGui::TextDisabled("Night Client " NC_VERSION);
     ImGui::TextDisabled("Settings: games/com.mojang/NightClient/config.txt");
+}
+
+/* Reset: restore one module's settings to their defaults. Fields are matched by
+ * name prefix against the config table, so a new setting is covered by adding it
+ * to the table with a matching name. */
+static bool reset_match(const char *name, const char *const *prefixes) {
+    for (int i = 0; prefixes[i]; i++)
+        if (!strncmp(name, prefixes[i], strlen(prefixes[i]))) return true;
+    return false;
+}
+static void reset_module(const char *mod) {
+    static const char *const p_auto[]   = { "autosprint", 0 };
+    static const char *const p_fps[]    = { "fps_", 0 };
+    static const char *const p_armor[]  = { "armor_", 0 };
+    static const char *const p_off[]    = { "offhand_", 0 };
+    static const char *const p_ely[]    = { "elytra_on", "elytra_x", "elytra_y", "elytra_size", "elytra_style", "elytra_alpha", "elytra_bg", "elytra_col", 0 };
+    static const char *const p_arrow[]  = { "arrow_", 0 };
+    static const char *const p_speed[]  = { "speed_", 0 };
+    static const char *const p_coords[] = { "coords_", 0 };
+    static const char *const p_xp[]     = { "xp_opt_", 0 };
+    static const char *const p_crys[]   = { "crystal_opt_", 0 };
+    static const char *const p_elya[]   = { "elytra_angle_", 0 };
+    static const char *const p_drop[]   = { "drop_", 0 };
+    static const char *const p_totem[]  = { "fast_totem_", 0 };
+    static const char *const p_hurt[]   = { "nohurt", 0 };
+    static const char *const p_zoom[]   = { "zoom_", 0 };
+    static const char *const p_persp[]  = { "persp_", 0 };
+    static const char *const p_hit[]    = { "hitbox_on", "hit_", 0 };
+    static const char *const p_ptcl[]   = { "particle_remover_", "ptcl_", 0 };
+    static const char *const p_perf[]   = { "perf_", 0 };
+    static const char *const p_ctrl[]   = { "ctrl_", 0 };
+    static const char *const p_client[] = { "ui_font", "n_", "menu_", 0 };
+    static const struct { const char *name; const char *const *pre; } table[] = {
+        { "Autosprint", p_auto }, { "FPS counter", p_fps }, { "Armor HUD", p_armor }, { "Offhand slot", p_off },
+        { "Elytra indicator", p_ely }, { "Arrow HUD", p_arrow }, { "Speed indicator", p_speed }, { "Coordinates", p_coords },
+        { "XP optimizer", p_xp }, { "Crystal optimizer", p_crys }, { "Elytra angle", p_elya }, { "Quick drop", p_drop },
+        { "Fast Totem", p_totem }, { "No hurt cam", p_hurt }, { "Zoom", p_zoom }, { "Perspective button", p_persp },
+        { "Hitboxes", p_hit }, { "Particle Remover", p_ptcl }, { "FPS optimizer", p_perf }, { "Controls", p_ctrl },
+        { "Client", p_client },
+    };
+    const char *const *pre = 0;
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) if (!strcmp(table[i].name, mod)) pre = table[i].pre;
+    if (!pre) return;
+    NcConfig d;
+    nc_cfg_defaults(&d);
+#define NC_RESET_ONE(n, t, def, mn, mx) if (reset_match(#n, pre)) g_cfg.n = d.n;
+    NC_FIELDS(NC_RESET_ONE)
+#undef NC_RESET_ONE
+    nclog("reset module: %s", mod);
 }
 
 struct Mod { const char *name; int *on; void (*panel)(); };
@@ -3548,10 +3710,23 @@ static void menu_click_play() {
     kb_release(env, attached);
 }
 
+static char g_search[17] = "";
+static bool menu_name_matches(const char *name, const char *needle) {
+    if (!needle[0]) return true;
+    const size_t n = strlen(needle), m = strlen(name);
+    for (size_t i = 0; i + n <= m; i++) {
+        size_t j = 0;
+        while (j < n && tolower((unsigned char)name[i + j]) == tolower((unsigned char)needle[j])) j++;
+        if (j == n) return true;
+    }
+    return false;
+}
+
 static void build_menu(float w, float h, NcRect *win_rect) {
     menu_blur_draw(w, h);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.012f, 0.014f, 0.022f, menu_blur_active() ? 0.80f : 0.97f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 20.0f * g_base * 0.5f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.010f, 0.012f, 0.020f, menu_blur_active() ? 0.78f : 0.97f));
     ImGui::SetNextWindowPos(V(w * 0.5f, h * 0.5f), ImGuiCond_Always, V(0.5f, 0.5f));
     ImGui::SetNextWindowSize(V(w * 0.84f, h * 0.88f), ImGuiCond_Always);
     ImGui::Begin("##night_menu", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -3559,43 +3734,120 @@ static void build_menu(float w, float h, NcRect *win_rect) {
                                        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
     win_rect->visible = 1; win_rect->x = p.x; win_rect->y = p.y; win_rect->w = s.x; win_rect->h = s.y;
+    if (g_sel < 0 || g_sel >= NC_NMODS) g_sel = 0;
 
-    /* header: title + X (top right) */
-    ImGui::TextColored(ACCENT, "NIGHT CLIENT");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", NC_VERSION);
-    float xw = ImGui::GetFrameHeight() * 1.5f;
-    ImGui::SameLine(ImGui::GetWindowWidth() - xw - ImGui::GetStyle().WindowPadding.x);
-    if (ImGui::Button("X", V(xw, 0))) { g_menu_open = false; nclog("menu closed"); }
-    ImGui::Separator();
+    const ImVec2 body = ImGui::GetContentRegionAvail();
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    const float side_w = body.x * 0.36f;
+    const float bar_h = ImGui::GetFrameHeight() * 1.8f;
+    const ImU32 line_col = IM_COL32(28, 44, 78, 255);
 
-    /* left: mod list, right: config of the selected mod (like your sketch) */
-    ImVec2 body = ImGui::GetContentRegionAvail();
-    float side_w = body.x * 0.30f;
-    ImGui::BeginChild("##side", V(side_w, body.y), false, 0);
+    /* ---------- left: logo + search, then the module cards ---------- */
+    ImGui::BeginChild("##side", V(side_w, body.y), false, ImGuiWindowFlags_NoScrollbar);
+    {
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 sp = ImGui::GetCursorScreenPos();
+        const float sw = ImGui::GetContentRegionAvail().x;
+        /* logo: a blue N */
+        const float lg = bar_h * 0.42f, lx = sp.x + lg * 0.2f, ly = sp.y + (bar_h - lg) * 0.5f;
+        const ImU32 ac = ImGui::GetColorU32(ACCENT);
+        const float th = fmaxf(2.0f, lg * 0.16f);
+        dl->AddLine(V(lx, ly + lg), V(lx, ly), ac, th);
+        dl->AddLine(V(lx, ly), V(lx + lg * 0.8f, ly + lg), ac, th);
+        dl->AddLine(V(lx + lg * 0.8f, ly + lg), V(lx + lg * 0.8f, ly), ac, th);
+        /* search bar */
+        const float bx = sp.x + lg * 1.6f, bw = sw - lg * 1.6f;
+        ImGui::SetCursorScreenPos(V(bx, sp.y));
+        ImGui::PushID("search");
+        if (ImGui::InvisibleButton("##sbtn", V(bw, bar_h)) && !g_kb_open) kb_start(5, g_search);
+        ImGui::PopID();
+        dl->AddRectFilled(V(bx, sp.y), V(bx + bw, sp.y + bar_h), IM_COL32(18, 24, 38, 255), bar_h * 0.5f);
+        const float ir = bar_h * 0.16f, ix = bx + bar_h * 0.45f, iy = sp.y + bar_h * 0.46f;
+        dl->AddCircle(V(ix, iy), ir, IM_COL32(150, 162, 188, 255), 16, 2.0f);
+        dl->AddLine(V(ix + ir * 0.75f, iy + ir * 0.75f), V(ix + ir * 1.9f, iy + ir * 1.9f), IM_COL32(150, 162, 188, 255), 2.0f);
+        const char *shown = g_search[0] ? g_search : "Search modules";
+        const ImVec2 ts = ImGui::CalcTextSize(shown);
+        dl->AddText(V(bx + bar_h * 0.95f, sp.y + (bar_h - ts.y) * 0.5f),
+                    g_search[0] ? IM_COL32(235, 240, 250, 255) : IM_COL32(112, 122, 146, 255), shown);
+        ImGui::SetCursorScreenPos(V(sp.x, sp.y + bar_h + ImGui::GetStyle().ItemSpacing.y * 0.5f));
+    }
+    ImGui::BeginChild("##list", V(0, 0), false, 0);
     touch_scroll();
-    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, V(0.0f, 0.5f));
-    float rowh = ImGui::GetFrameHeight() * 1.7f;
-    for (int i = 0; i < NC_NMODS; i++) {
-        ImVec2 rp = ImGui::GetCursorScreenPos();
-        float rw = ImGui::GetContentRegionAvail().x;
-        if (ImGui::Selectable(g_mods[i].name, g_sel == i, 0, V(rw, rowh))) g_sel = i;
-        if (g_sel == i) {                                                       /* accent bar on the selected row */
-            ImGui::GetWindowDrawList()->AddRectFilled(V(rp.x, rp.y + rowh * 0.20f), V(rp.x + 3.0f * g_base * 0.75f, rp.y + rowh * 0.80f),
-                                                      ImGui::GetColorU32(ACCENT), 3.0f);
-        }
-        if (g_mods[i].on) {
-            float r = rowh * 0.12f;
-            ImGui::GetWindowDrawList()->AddCircleFilled(V(rp.x + rw - r * 2.5f, rp.y + rowh * 0.5f), r,
-                                                        *g_mods[i].on ? IM_COL32(70, 170, 255, 255) : IM_COL32(62, 70, 90, 255));
+    {
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const float ch = ImGui::GetFrameHeight() * 1.9f;
+        const ImGuiIO &io = ImGui::GetIO();
+        for (int i = 0; i < NC_NMODS; i++) {
+            if (!menu_name_matches(g_mods[i].name, g_search)) continue;
+            ImGui::PushID(i);
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            const float rw = ImGui::GetContentRegionAvail().x;
+            const bool clicked = ImGui::InvisibleButton("##card", V(rw, ch));
+            const bool hov = ImGui::IsItemHovered();
+            const bool sel = (g_sel == i);
+            dl->AddRectFilled(rp, V(rp.x + rw, rp.y + ch), sel ? IM_COL32(18, 34, 66, 255) : (hov ? IM_COL32(20, 26, 40, 255) : IM_COL32(15, 19, 30, 255)), ch * 0.26f);
+            if (sel) dl->AddRect(rp, V(rp.x + rw, rp.y + ch), IM_COL32(48, 110, 235, 255), ch * 0.26f, 0, 1.5f);
+            float tx = rp.x + ch * 0.32f, sw_right = tx;
+            if (g_mods[i].on) {
+                const float shh = ch * 0.42f;
+                draw_switch(dl, V(tx, rp.y + (ch - shh) * 0.5f), shh, *g_mods[i].on != 0);
+                sw_right = tx + shh * 1.85f;
+                tx = sw_right + ch * 0.28f;
+            }
+            const ImVec2 ts = ImGui::CalcTextSize(g_mods[i].name);
+            dl->AddText(V(tx, rp.y + (ch - ts.y) * 0.5f), IM_COL32(236, 240, 248, 255), g_mods[i].name);
+            const float cx = rp.x + rw - ch * 0.42f, cy = rp.y + ch * 0.5f, cs = ch * 0.13f;       /* chevron > */
+            dl->AddLine(V(cx - cs * 0.6f, cy - cs), V(cx + cs * 0.6f, cy), IM_COL32(210, 216, 230, 255), 2.0f);
+            dl->AddLine(V(cx + cs * 0.6f, cy), V(cx - cs * 0.6f, cy + cs), IM_COL32(210, 216, 230, 255), 2.0f);
+            if (clicked) {
+                if (g_mods[i].on && io.MouseClickedPos[0].x < sw_right + ch * 0.12f) *g_mods[i].on = *g_mods[i].on ? 0 : 1;   /* the switch */
+                else g_sel = i;
+            }
+            ImGui::PopID();
         }
     }
-    ImGui::PopStyleVar();
+    ImGui::EndChild();
     ImGui::EndChild();
     ImGui::SameLine();
-    ImGui::BeginChild("##panel", V(0, body.y), false, 0);
+
+    /* ---------- right: Reset + title + X, then the module's settings ---------- */
+    ImGui::BeginChild("##right", V(0, body.y), false, ImGuiWindowFlags_NoScrollbar);
+    {
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 rp = ImGui::GetCursorScreenPos();
+        const float rw = ImGui::GetContentRegionAvail().x;
+        const char *selected_mod = g_mods[g_sel].name;
+        /* Reset (tap twice) */
+        static double reset_armed_until = 0.0;
+        const bool armed = now_s() < reset_armed_until;
+        const char *rl = armed ? "Tap again" : "Reset";
+        const ImVec2 rts = ImGui::CalcTextSize(rl);
+        const float rbw = rts.x + bar_h * 0.7f;
+        ImGui::PushID("reset");
+        if (ImGui::InvisibleButton("##rb", V(rbw, bar_h))) {
+            if (armed) { reset_module(selected_mod); reset_armed_until = 0.0; }
+            else reset_armed_until = now_s() + 2.5;
+        }
+        ImGui::PopID();
+        dl->AddRectFilled(rp, V(rp.x + rbw, rp.y + bar_h), armed ? IM_COL32(90, 24, 30, 255) : IM_COL32(40, 20, 26, 255), bar_h * 0.3f);
+        dl->AddRect(rp, V(rp.x + rbw, rp.y + bar_h), IM_COL32(205, 70, 80, 255), bar_h * 0.3f, 0, 1.5f);
+        dl->AddText(V(rp.x + (rbw - rts.x) * 0.5f, rp.y + (bar_h - rts.y) * 0.5f), IM_COL32(240, 120, 125, 255), rl);
+        /* title */
+        const ImVec2 tts = ImGui::CalcTextSize(selected_mod);
+        dl->AddText(V(rp.x + rbw + bar_h * 0.45f, rp.y + (bar_h - tts.y) * 0.5f), IM_COL32(236, 240, 248, 255), selected_mod);
+        /* X */
+        ImGui::SetCursorScreenPos(V(rp.x + rw - bar_h, rp.y));
+        ImGui::PushID("close");
+        if (ImGui::InvisibleButton("##x", V(bar_h, bar_h))) { g_menu_open = false; nclog("menu closed"); }
+        ImGui::PopID();
+        const float xc = rp.x + rw - bar_h * 0.5f, yc = rp.y + bar_h * 0.5f, xs = bar_h * 0.16f;
+        dl->AddLine(V(xc - xs, yc - xs), V(xc + xs, yc + xs), IM_COL32(236, 240, 248, 255), 2.5f);
+        dl->AddLine(V(xc - xs, yc + xs), V(xc + xs, yc - xs), IM_COL32(236, 240, 248, 255), 2.5f);
+        dl->AddLine(V(rp.x, rp.y + bar_h + 2.0f), V(rp.x + rw, rp.y + bar_h + 2.0f), line_col, 1.0f);
+        ImGui::SetCursorScreenPos(V(rp.x, rp.y + bar_h + ImGui::GetStyle().ItemSpacing.y));
+    }
+    ImGui::BeginChild("##panel", V(0, 0), false, 0);
     touch_scroll();
-    if (g_sel < 0 || g_sel >= NC_NMODS) g_sel = 0;
     const char *selected_mod = g_mods[g_sel].name;
     g_edit_target = -1;
     if (!strcmp(selected_mod, "FPS counter")) g_edit_target = E_FPS;
@@ -3613,9 +3865,10 @@ static void build_menu(float w, float h, NcRect *win_rect) {
     else if (!strcmp(selected_mod, "Client")) g_edit_target = E_N;
     g_mods[g_sel].panel();
     ImGui::EndChild();
+    ImGui::EndChild();
     ImGui::End();
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
 }
 
 /* ------------------------------------------------------------------ per-frame entry (eglSwapBuffers) */
