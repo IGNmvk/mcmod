@@ -47,6 +47,7 @@ extern "C" {
 extern "C" bool mih_isMovingForward(void *self) __asm__("_ZNK16MoveInputHandler15isMovingForwardEv");
 extern "C" bool entity_isRiding(const void *self) __asm__("_ZNK6Entity8isRidingEv");
 extern "C" void *entity_getRide(const void *self) __asm__("_ZNK6Entity7getRideEv");
+extern "C" void  boat_setPaddleState(void *boat, int side, bool on) __asm__("_ZN4Boat14setPaddleStateE4Sideb");
 extern "C" bool mob_isSneaking(void *self)      __asm__("_ZNK3Mob10isSneakingEv");
 extern "C" void mob_setSneaking(void *self, bool on) __asm__("_ZN3Mob11setSneakingEb");
 extern "C" void mob_setJumping(void *self, bool on)  __asm__("_ZN3Mob10setJumpingEb");
@@ -2118,6 +2119,16 @@ static void hook_glyph_render(const void *self, void *ctx) {
  * old buttons' TAPS (not just their icons) needs a more surgical fix that
  * targets just the movement/jump/attack bindings, which is in the dump. */
 
+/* MinecraftInputHandler::canPaddle() is the game's own gate for the paddle
+ * buttons. The new controls swap the touch layout it expects, so while riding
+ * with the new controls it is forced open. */
+typedef bool (*fn_can_paddle)(void *);
+static fn_can_paddle g_orig_can_paddle = 0;
+static bool hook_can_paddle(void *self) {
+    if (g_cfg.controls_mode == 1 && g_local_player && entity_isRiding(g_local_player)) return true;
+    return g_orig_can_paddle ? g_orig_can_paddle(self) : false;
+}
+
 static void ctrl_apply_player_actions() {
     if (!g_local_player || g_cfg.controls_mode != 1 || !nc_gameplay_input_active()) {
         if (!nc_gameplay_input_active()) ctrl_reset_states();
@@ -2213,16 +2224,24 @@ static void ctrl_apply_player_actions() {
         want_l = (rt || f) ? 1 : 0;
         want_r = (lt || f) ? 1 : 0;
     }
-    if (g_cic && g_ci && paddle_press && paddle_release && (want_l || want_r || pad_l || pad_r)) {
-        g_ctrl_internal++;
-        /* Side: 0 = left, 1 = right (assumed; the log shows every change so a swap is easy to spot).
+    if (want_l || want_r || pad_l || pad_r) {
+        /* Route 1: the game's own paddle callbacks (these also do whatever networking the game needs).
+         * Side: 0 = left, 1 = right (assumed; the log shows every change so a swap is easy to spot).
          * A wanted paddle is pressed again on every tick, so it stays down even if the game
          * clears its paddle state between presses. */
-        if (want_l) paddle_press(g_cic, g_ci, 0);
-        else if (pad_l) paddle_release(g_cic, g_ci, 0);
-        if (want_r) paddle_press(g_cic, g_ci, 1);
-        else if (pad_r) paddle_release(g_cic, g_ci, 1);
-        g_ctrl_internal--;
+        if (g_cic && g_ci && paddle_press && paddle_release) {
+            g_ctrl_internal++;
+            if (want_l) paddle_press(g_cic, g_ci, 0);
+            else if (pad_l) paddle_release(g_cic, g_ci, 0);
+            if (want_r) paddle_press(g_cic, g_ci, 1);
+            else if (pad_r) paddle_release(g_cic, g_ci, 1);
+            g_ctrl_internal--;
+        }
+        /* Route 2: set the boat's paddle state directly, in case the callbacks are ignored. */
+        if (in_boat && ride) {
+            if (want_l || pad_l) boat_setPaddleState(ride, 0, want_l != 0);
+            if (want_r || pad_r) boat_setPaddleState(ride, 1, want_r != 0);
+        }
         static int logged = 0;
         if ((want_l != pad_l || want_r != pad_r) && logged < 30) {
             logged++;
@@ -4176,6 +4195,7 @@ static void nc_init(void) {
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
+    reg("boat paddle gate", "_ZNK21MinecraftInputHandler9canPaddleEv", (void *)hook_can_paddle, (void **)&g_orig_can_paddle);
     reg("old buttons (text probe)", "_ZNK22TouchTextButtonControl6renderER18InputRenderContext", (void *)hook_text_render, (void **)&g_orig_text_render);
     reg("old buttons (hide)", "_ZNK23TouchGlyphButtonControl6renderER18InputRenderContext", (void *)hook_glyph_render, (void **)&g_orig_glyph_render);
     reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
