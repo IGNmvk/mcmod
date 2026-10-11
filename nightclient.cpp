@@ -2189,9 +2189,22 @@ static void ctrl_apply_player_actions() {
         nclog("boat paddles: press=%p release=%p boat vtable=%p", (void *)paddle_press, (void *)paddle_release, (void *)boat_vt);
     }
     bool in_boat = false;
-    if (boat_vt && entity_isRiding(g_local_player)) {
-        void *ride = entity_getRide(g_local_player);
-        in_boat = ride && *(const uintptr_t *)ride == boat_vt;
+    void *ride = 0;
+    uintptr_t ride_vt = 0;
+    if (entity_isRiding(g_local_player)) {
+        ride = entity_getRide(g_local_player);
+        if (ride) ride_vt = *(const uintptr_t *)ride;
+        in_boat = boat_vt && ride_vt == boat_vt;
+    }
+    if (ride) {                                              /* what the code sees while riding, for the log */
+        static double last_diag = 0.0;
+        const double t = now_s();
+        if (t - last_diag > 2.0) {
+            last_diag = t;
+            nclog("riding: ride=%p vptr=%p boat_vptr=%p in_boat=%d cic=%p ci=%p paddle=%p/%p stick=(%.2f,%.2f) joy_id=%d",
+                  ride, (void *)ride_vt, (void *)boat_vt, in_boat ? 1 : 0, g_cic, g_ci,
+                  (void *)paddle_press, (void *)paddle_release, (float)g_ctrl_joy_x, (float)g_ctrl_joy_y, (int)g_ctrl_joy_id);
+        }
     }
     int want_l = 0, want_r = 0;
     if (in_boat && g_ctrl_joy_id >= 0) {
@@ -2200,16 +2213,21 @@ static void ctrl_apply_player_actions() {
         want_l = (rt || f) ? 1 : 0;
         want_r = (lt || f) ? 1 : 0;
     }
-    if (g_cic && g_ci && paddle_press && paddle_release && (want_l != pad_l || want_r != pad_r)) {
+    if (g_cic && g_ci && paddle_press && paddle_release && (want_l || want_r || pad_l || pad_r)) {
         g_ctrl_internal++;
-        /* Side: 0 = left, 1 = right (assumed; the log shows every change so a swap is easy to spot) */
-        if (want_l && !pad_l) paddle_press(g_cic, g_ci, 0);
-        if (!want_l && pad_l) paddle_release(g_cic, g_ci, 0);
-        if (want_r && !pad_r) paddle_press(g_cic, g_ci, 1);
-        if (!want_r && pad_r) paddle_release(g_cic, g_ci, 1);
+        /* Side: 0 = left, 1 = right (assumed; the log shows every change so a swap is easy to spot).
+         * A wanted paddle is pressed again on every tick, so it stays down even if the game
+         * clears its paddle state between presses. */
+        if (want_l) paddle_press(g_cic, g_ci, 0);
+        else if (pad_l) paddle_release(g_cic, g_ci, 0);
+        if (want_r) paddle_press(g_cic, g_ci, 1);
+        else if (pad_r) paddle_release(g_cic, g_ci, 1);
         g_ctrl_internal--;
         static int logged = 0;
-        if (logged < 20) { logged++; nclog("boat paddles: left=%d right=%d (stick %.2f,%.2f)", want_l, want_r, (float)g_ctrl_joy_x, (float)g_ctrl_joy_y); }
+        if ((want_l != pad_l || want_r != pad_r) && logged < 30) {
+            logged++;
+            nclog("boat paddles: left=%d right=%d (stick %.2f,%.2f)", want_l, want_r, (float)g_ctrl_joy_x, (float)g_ctrl_joy_y);
+        }
         pad_l = want_l; pad_r = want_r;
     }
 }
