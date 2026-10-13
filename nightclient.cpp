@@ -177,6 +177,7 @@ static bool g_kb_open = false;
 static int g_kb_status = -1;
 static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N, 5 menu search */
 static bool g_kb_native = false;   /* the keyboard was shown through the game's own AppPlatform */
+static bool g_kb_got_full = false;
 static volatile int g_kb_enter = 0;  /* Enter pressed in the keyboard (set from the Java thread) */
 static char *g_kb_text = 0;
 
@@ -322,6 +323,7 @@ static bool kb_start(int target, char *text) {
     g_kb_target = target;
     g_kb_text = text;
     if (kb_native_show(text)) {                         /* preferred: the game's own keyboard */
+        g_kb_got_full = false;
         g_kb_native = true;
         g_kb_status = -1;
         g_kb_open = true;
@@ -515,6 +517,42 @@ static void hook_backspace(JNIEnv *env, jobject thiz) {
     }
     if (g_orig_backspace) g_orig_backspace(env, thiz);
 }
+/* The same text also reaches the game itself, whichever Java callback delivered it:
+ * MinecraftGame::setTextboxText(string) gets the whole text, Keyboard::feedText(string,...)
+ * gets typed characters. Hooking these is independent of the Java callbacks, so it works
+ * even if the keyboard uses one that is not hooked above. (libstdc++ string: the object is
+ * a single pointer to the characters.) */
+typedef void (*fn_mg_settext)(void *, const void *);
+typedef void (*fn_feed_text)(const void *, bool, unsigned char);
+static fn_mg_settext g_orig_mg_settext = 0;
+static fn_feed_text  g_orig_feed_text = 0;
+/* g_kb_got_full: the whole-text callback is in use: ignore single characters */
+static void hook_mg_settext(void *self, const void *str) {
+    if (kb_capturing() && str) {
+        const char *u = *(const char *const *)str;
+        if (u) {
+            static int logged = 0;
+            if (logged < 12) { logged++; nclog("keyboard: game text \"%s\"", u); }
+            strncpy(g_kb_text, u, 16); g_kb_text[16] = 0;
+            g_kb_got_full = true;
+        }
+        return;
+    }
+    if (g_orig_mg_settext) g_orig_mg_settext(self, str);
+}
+static void hook_feed_text(const void *str, bool b, unsigned char id) {
+    if (kb_capturing() && str) {
+        const char *u = *(const char *const *)str;
+        if (u) {
+            static int logged = 0;
+            if (logged < 12) { logged++; nclog("keyboard: typed character(s) \"%s\" (%d,%d)", u, (int)b, (int)id); }
+            if (!g_kb_got_full) kb_append(u);
+        }
+        return;
+    }
+    if (g_orig_feed_text) g_orig_feed_text(str, b, id);
+}
+
 /* nativeTypeCharacter: the argument type is not known for certain, so it is only
  * logged (raw value) and forwarded untouched; reading it as a string could crash. */
 static void hook_type_char(JNIEnv *env, jobject thiz, intptr_t a, intptr_t b) {
@@ -4388,6 +4426,8 @@ static void nc_init(void) {
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("keyboard text", "Java_com_mojang_minecraftpe_MainActivity_nativeSetTextboxText", (void *)hook_set_textbox, (void **)&g_orig_set_textbox);
+    reg("keyboard game text", "_ZN13MinecraftGame14setTextboxTextERKSs", (void *)hook_mg_settext, (void **)&g_orig_mg_settext);
+    reg("keyboard game chars", "_ZN8Keyboard8feedTextERKSsbh", (void *)hook_feed_text, (void **)&g_orig_feed_text);
     reg("keyboard enter", "Java_com_mojang_minecraftpe_MainActivity_nativeReturnKeyPressed", (void *)hook_return_key, (void **)&g_orig_return_key);
     reg("keyboard type character", "Java_com_mojang_minecraftpe_MainActivity_nativeTypeCharacter", (void *)hook_type_char, (void **)&g_orig_type_char);
     reg("keyboard key handler", "Java_com_mojang_minecraftpe_MainActivity_nativeKeyHandler", (void *)hook_key_handler, (void **)&g_orig_key_handler);
