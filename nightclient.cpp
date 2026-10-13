@@ -175,7 +175,9 @@ static JavaVM *g_jvm = 0;
 static jobject g_kb_activity = 0;
 static bool g_kb_open = false;
 static int g_kb_status = -1;
-static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N */
+static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N, 5 menu search */
+static bool g_kb_native = false;   /* the keyboard was shown through the game's own AppPlatform */
+static volatile int g_kb_enter = 0;  /* Enter pressed in the keyboard (set from the Java thread) */
 static char *g_kb_text = 0;
 
 /* Forward declaration: the keyboard bridge is above the logger definition. */
@@ -265,7 +267,68 @@ static jobject kb_find_activity(JNIEnv *env) {
     return result;
 }
 
+/* ---- Keyboard through the game's own AppPlatform ----
+ * The old route found the Activity through a hidden Android API (ActivityThread),
+ * which newer Android versions block - then nothing ever pops up. The game shows
+ * its own keyboard with AppPlatform::showKeyboard, so call exactly that. The
+ * typed text comes back through the game's Java->native callbacks, which are
+ * hooked below and copy it into our buffer instead of the game's text box. */
+typedef void *(*fn_ap_singleton)();
+typedef void (*fn_ap_show)(void *, const void *, int, bool, bool, bool, const float *);
+typedef void (*fn_ap_hide)(void *);
+static struct { uint32_t len, cap; int32_t refc; char data[48]; } g_fake_rep;   /* libstdc++ copy-on-write string: header + chars */
+static const char *g_fake_str = 0;
+
+static bool kb_native_show(const char *text) {
+    static bool resolved = false;
+    static fn_ap_singleton singleton = 0;
+    static fn_ap_show show = 0;
+    if (!resolved) {
+        resolved = true;
+        singleton = (fn_ap_singleton)dlsym(RTLD_DEFAULT, "_ZN11AppPlatform9singletonEv");
+        show = (fn_ap_show)dlsym(RTLD_DEFAULT, "_ZN19AppPlatform_android12showKeyboardERKSsibbbRK4Vec2");
+        nclog("keyboard: native route singleton=%p show=%p", (void *)singleton, (void *)show);
+    }
+    if (!singleton || !show) return false;
+    void *app = singleton();
+    if (!app) { nclog("keyboard: AppPlatform singleton is null"); return false; }
+    size_t n = text ? strlen(text) : 0;
+    if (n > 32) n = 32;
+    g_fake_rep.len = (uint32_t)n;
+    g_fake_rep.cap = 40;
+    g_fake_rep.refc = 1 << 28;                          /* shared forever, so the game never frees it */
+    if (n) memcpy(g_fake_rep.data, text, n);
+    g_fake_rep.data[n] = 0;
+    g_fake_str = g_fake_rep.data;
+    const float pos[2] = {0.0f, 0.0f};
+    show(app, &g_fake_str, 16, false, false, false, pos);
+    nclog("keyboard: showKeyboard called through AppPlatform");
+    return true;
+}
+
+static void kb_native_hide() {
+    static fn_ap_singleton singleton = 0;
+    static fn_ap_hide hide = 0;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        singleton = (fn_ap_singleton)dlsym(RTLD_DEFAULT, "_ZN11AppPlatform9singletonEv");
+        hide = (fn_ap_hide)dlsym(RTLD_DEFAULT, "_ZN19AppPlatform_android12hideKeyboardEv");
+    }
+    if (singleton && hide) { void *app = singleton(); if (app) hide(app); }
+}
+
 static bool kb_start(int target, char *text) {
+    g_kb_target = target;
+    g_kb_text = text;
+    if (kb_native_show(text)) {                         /* preferred: the game's own keyboard */
+        g_kb_native = true;
+        g_kb_status = -1;
+        g_kb_open = true;
+        return true;
+    }
+    g_kb_native = false;
+    nclog("keyboard: native route unavailable, trying the Java route");
     bool attached = false;
     JNIEnv *env = kb_env(&attached);
     if (!env) return false;
@@ -327,7 +390,10 @@ static bool kb_start(int target, char *text) {
     return g_kb_open;
 }
 
+static void kb_stop();
 static void kb_poll() {
+    if (g_kb_enter) { g_kb_enter = 0; if (g_kb_open) kb_stop(); return; }   /* Enter closes the keyboard */
+    if (g_kb_native) return;                            /* text arrives through the hooked callbacks */
     if (!g_kb_open || !g_kb_text || !g_kb_activity) return;
 
     bool attached = false;
@@ -368,6 +434,11 @@ static void kb_poll() {
 }
 
 static void kb_stop() {
+    if (g_kb_native) {
+        if (g_kb_open) kb_native_hide();
+        g_kb_native = false; g_kb_open = false; g_kb_status = -1; g_kb_target = 0; g_kb_text = 0;
+        return;
+    }
     if (!g_kb_open || !g_kb_activity) {
         g_kb_open = false;
         g_kb_status = -1;
@@ -388,6 +459,32 @@ static void kb_stop() {
     g_kb_target = 0;
     g_kb_text = 0;
     kb_release(env, attached);
+}
+
+
+/* The game's Java side reports typed text through these native functions. While one of
+ * our text fields owns the keyboard they feed our buffer and are not passed on. */
+typedef void (*fn_jni_text)(JNIEnv *, jobject, jstring);
+typedef void (*fn_jni_void)(JNIEnv *, jobject);
+static fn_jni_text g_orig_set_textbox = 0;
+static fn_jni_void g_orig_return_key = 0, g_orig_backspace = 0;
+static void hook_set_textbox(JNIEnv *env, jobject thiz, jstring js) {
+    if (g_kb_open && g_kb_native && g_kb_text) {
+        if (js) {
+            const char *u = env->GetStringUTFChars(js, 0);
+            if (u) { strncpy(g_kb_text, u, 16); g_kb_text[16] = 0; env->ReleaseStringUTFChars(js, u); }
+        }
+        return;
+    }
+    if (g_orig_set_textbox) g_orig_set_textbox(env, thiz, js);
+}
+static void hook_return_key(JNIEnv *env, jobject thiz) {
+    if (g_kb_open && g_kb_native) { g_kb_enter = 1; return; }
+    if (g_orig_return_key) g_orig_return_key(env, thiz);
+}
+static void hook_backspace(JNIEnv *env, jobject thiz) {
+    if (g_kb_open && g_kb_native) return;
+    if (g_orig_backspace) g_orig_backspace(env, thiz);
 }
 
 /* ---------------- New 1.21-style touch controls ---------------- */
@@ -3354,7 +3451,7 @@ static void button_text_edit(const char *label, char *text) {
             else if (text == g_cfg.persp_text) target = 2;
             else if (text == g_cfg.drop_text) target = 3;
         } else if (!strcmp(label, "N button text")) target = 4;
-        if (target && !g_kb_open) kb_start(target, text);
+        if (target) kb_start(target, text);
     }
 }
 static void hud_look(float *size, float *alpha, float *bg_alpha) {
@@ -3826,7 +3923,7 @@ static void build_menu(float w, float h, NcRect *win_rect) {
         const float bx = sp.x + lg * 1.6f, bw = sw - lg * 1.6f;
         ImGui::SetCursorScreenPos(V(bx, sp.y));
         ImGui::PushID("search");
-        if (ImGui::InvisibleButton("##sbtn", V(bw, bar_h)) && !g_kb_open) kb_start(5, g_search);
+        if (ImGui::InvisibleButton("##sbtn", V(bw, bar_h))) kb_start(5, g_search);
         ImGui::PopID();
         dl->AddRectFilled(V(bx, sp.y), V(bx + bw, sp.y + bar_h), IM_COL32(18, 24, 38, 255), bar_h * 0.5f);
         const float ir = bar_h * 0.16f, ix = bx + bar_h * 0.45f, iy = sp.y + bar_h * 0.46f;
@@ -4225,6 +4322,9 @@ static void nc_init(void) {
     reg("tap blocker (mining start)", "_ZN12SurvivalMode17startDestroyBlockER6Player8BlockPosaRb", (void *)hook_start_destroy, (void **)&g_orig_start_destroy);
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
+    reg("keyboard text", "Java_com_mojang_minecraftpe_MainActivity_nativeSetTextboxText", (void *)hook_set_textbox, (void **)&g_orig_set_textbox);
+    reg("keyboard enter", "Java_com_mojang_minecraftpe_MainActivity_nativeReturnKeyPressed", (void *)hook_return_key, (void **)&g_orig_return_key);
+    reg("keyboard backspace", "Java_com_mojang_minecraftpe_MainActivity_nativeBackSpacePressed", (void *)hook_backspace, (void **)&g_orig_backspace);
     reg("boat paddle gate", "_ZNK21MinecraftInputHandler9canPaddleEv", (void *)hook_can_paddle, (void **)&g_orig_can_paddle);
     reg("old buttons (text probe)", "_ZNK22TouchTextButtonControl6renderER18InputRenderContext", (void *)hook_text_render, (void **)&g_orig_text_render);
     reg("old buttons (hide)", "_ZNK23TouchGlyphButtonControl6renderER18InputRenderContext", (void *)hook_glyph_render, (void **)&g_orig_glyph_render);
