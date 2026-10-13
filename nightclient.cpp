@@ -403,6 +403,15 @@ enum {
 };
 
 static volatile int g_ctrl_pressed[NC_CTRL_COUNT] = {0};
+/* Double-tap Sneak (the fly-down button while flying) = stop flying. Detected
+ * where the touch arrives, not in the 20 Hz tick, so a quick tap is never missed. */
+static volatile double g_sneak_last_down = 0.0;
+static volatile int    g_ctrl_sneak_double = 0;
+static void ctrl_sneak_tap() {
+    const double t = now_s();
+    if (t - g_sneak_last_down < 0.35) { g_ctrl_sneak_double = 1; g_sneak_last_down = 0.0; }
+    else g_sneak_last_down = t;
+}
 static volatile int g_ctrl_flying = 0;      /* local player is flying (Creative): jump/sneak become fly up/down */
 static int g_ctrl_internal = 0;
 static volatile int g_ctrl_mining_ours = 0;   /* true for the whole time OUR Attack button is held */             /* >0 while WE call the game's attack/interact callbacks */
@@ -2181,6 +2190,26 @@ static void ctrl_apply_player_actions() {
     prev_attack = cur_attack;
     prev_interact = cur_interact;
 
+    /* Double-tap Sneak while flying: the game's own "toggle fly" callback, which
+     * turns flying off. (On the ground a double tap does nothing.) */
+    typedef void (*fn_cic_ci_t)(void *, void *);
+    static bool fly_resolved = false;
+    static fn_cic_ci_t toggle_fly = 0;
+    if (!fly_resolved) {
+        fly_resolved = true;
+        toggle_fly = (fn_cic_ci_t)dlsym(RTLD_DEFAULT, "_ZN20ClientInputCallbacks31handleToggleFlyFlastButtonPressER14ClientInstance");
+        nclog("double-tap sneak: toggle-fly callback=%p", (void *)toggle_fly);
+    }
+    if (g_ctrl_sneak_double) {
+        g_ctrl_sneak_double = 0;
+        if (g_ctrl_flying && g_cic && g_ci && toggle_fly) {
+            g_ctrl_internal++;
+            toggle_fly(g_cic, g_ci);
+            g_ctrl_internal--;
+            nclog("double-tap sneak: stop flying (was flying=%d)", lp_isFlying(g_local_player) ? 1 : 0);
+        }
+    }
+
     /* Boats: vanilla touch steers them with two paddle buttons, which the new
      * controls don't have (and the old ones are hidden). So the joystick drives
      * the paddles through the game's own paddle callbacks, with the same rule
@@ -2262,6 +2291,7 @@ static void ctrl_consume_touch(int action, int id, float x, float y) {
                 ctrl_set_joy_from_touch(g_ctrl_rects[i], x, y);
             } else {
                 g_ctrl_pressed[i] = 1;
+                if (i == NC_CTRL_SNEAK || i == NC_CTRL_DOWN) ctrl_sneak_tap();
             }
             g_ctrl_touch_id = id;
             return;
