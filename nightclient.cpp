@@ -462,29 +462,80 @@ static void kb_stop() {
 }
 
 
-/* The game's Java side reports typed text through these native functions. While one of
- * our text fields owns the keyboard they feed our buffer and are not passed on. */
+/* The game's Java side reports typing through these native functions. While one of our
+ * text fields owns the keyboard they feed our buffer and are not passed on. Every one
+ * of them logs its first few calls, so it is visible which of them the keyboard uses. */
 typedef void (*fn_jni_text)(JNIEnv *, jobject, jstring);
 typedef void (*fn_jni_void)(JNIEnv *, jobject);
+typedef void (*fn_jni_two)(JNIEnv *, jobject, intptr_t, intptr_t);
+typedef uint8_t (*fn_jni_key)(JNIEnv *, jobject, int, int);
 static fn_jni_text g_orig_set_textbox = 0;
 static fn_jni_void g_orig_return_key = 0, g_orig_backspace = 0;
+static fn_jni_two  g_orig_type_char = 0;
+static fn_jni_key  g_orig_key_handler = 0;
+
+static bool kb_capturing() { return g_kb_open && g_kb_native && g_kb_text; }
+static void kb_append(const char *u) {                  /* append text, max 16 bytes */
+    size_t n = strlen(g_kb_text);
+    for (; *u && n < 16; ++u) g_kb_text[n++] = *u;
+    g_kb_text[n] = 0;
+}
+static void kb_backspace() {                            /* drop the last character (UTF-8 aware) */
+    size_t n = strlen(g_kb_text);
+    while (n > 0 && (((unsigned char)g_kb_text[n - 1]) & 0xC0) == 0x80) n--;
+    if (n > 0) n--;
+    g_kb_text[n] = 0;
+}
+
 static void hook_set_textbox(JNIEnv *env, jobject thiz, jstring js) {
-    if (g_kb_open && g_kb_native && g_kb_text) {
+    static int logged = 0;
+    if (kb_capturing()) {
         if (js) {
             const char *u = env->GetStringUTFChars(js, 0);
-            if (u) { strncpy(g_kb_text, u, 16); g_kb_text[16] = 0; env->ReleaseStringUTFChars(js, u); }
+            if (u) {
+                if (logged < 12) { logged++; nclog("keyboard: text callback \"%s\"", u); }
+                strncpy(g_kb_text, u, 16); g_kb_text[16] = 0;
+                env->ReleaseStringUTFChars(js, u);
+            }
         }
         return;
     }
     if (g_orig_set_textbox) g_orig_set_textbox(env, thiz, js);
 }
 static void hook_return_key(JNIEnv *env, jobject thiz) {
-    if (g_kb_open && g_kb_native) { g_kb_enter = 1; return; }
+    if (kb_capturing()) { nclog("keyboard: Enter"); g_kb_enter = 1; return; }
     if (g_orig_return_key) g_orig_return_key(env, thiz);
 }
 static void hook_backspace(JNIEnv *env, jobject thiz) {
-    if (g_kb_open && g_kb_native) return;
+    if (kb_capturing()) {
+        static int logged = 0;
+        if (logged < 6) { logged++; nclog("keyboard: backspace callback"); }
+        kb_backspace();
+        return;
+    }
     if (g_orig_backspace) g_orig_backspace(env, thiz);
+}
+/* nativeTypeCharacter: the argument type is not known for certain, so it is only
+ * logged (raw value) and forwarded untouched; reading it as a string could crash. */
+static void hook_type_char(JNIEnv *env, jobject thiz, intptr_t a, intptr_t b) {
+    static int logged = 0;
+    if (kb_capturing() && logged < 12) { logged++; nclog("keyboard: type-character callback raw=%ld", (long)a); }
+    if (g_orig_type_char) g_orig_type_char(env, thiz, a, b);
+}
+/* nativeKeyHandler(keyCode, action): letter / digit / space / delete keys are turned
+ * into text while a field owns the keyboard (Android key codes). */
+static uint8_t hook_key_handler(JNIEnv *env, jobject thiz, int key, int action) {
+    if (kb_capturing()) {
+        static int logged = 0;
+        if (logged < 12) { logged++; nclog("keyboard: key callback key=%d action=%d", key, action); }
+        const bool down = (action == 0);
+        if (key >= 29 && key <= 54) { if (down) { char c[2] = { (char)('a' + (key - 29)), 0 }; kb_append(c); } return 1; }
+        if (key >= 7 && key <= 16)  { if (down) { char c[2] = { (char)('0' + (key - 7)), 0 };  kb_append(c); } return 1; }
+        if (key == 62) { if (down) kb_append(" "); return 1; }
+        if (key == 67) { if (down) kb_backspace(); return 1; }
+        if (key == 66) { if (down) g_kb_enter = 1; return 1; }
+    }
+    return g_orig_key_handler ? g_orig_key_handler(env, thiz, key, action) : 0;
 }
 
 /* ---------------- New 1.21-style touch controls ---------------- */
@@ -3441,18 +3492,32 @@ static void head(const char * /*title: shown in the header bar now*/, int *on, c
     ImGui::Spacing();
 }
 static void button_text_edit(const char *label, char *text) {
-    char id[48];
-    snprintf(id, sizeof id, "%s##btntext", label);
-    ImGui::InputText(id, text, 17, ImGuiInputTextFlags_CharsNoBlank);
-    if (ImGui::IsItemActivated()) {
-        int target = 0;
-        if (!strcmp(label, "Button text")) {
-            if (text == g_cfg.zoom_text) target = 1;
-            else if (text == g_cfg.persp_text) target = 2;
-            else if (text == g_cfg.drop_text) target = 3;
-        } else if (!strcmp(label, "N button text")) target = 4;
-        if (target) kb_start(target, text);
+    /* A plain drawn field (not an ImGui InputText, which keeps its own copy of the
+     * text while active and would not show what the keyboard types). Tap it to type. */
+    int target = 0;
+    if (!strcmp(label, "Button text")) {
+        if (text == g_cfg.zoom_text) target = 1;
+        else if (text == g_cfg.persp_text) target = 2;
+        else if (text == g_cfg.drop_text) target = 3;
+    } else if (!strcmp(label, "N button text")) target = 4;
+    slider_label(label);
+    ImGui::PushID(label);
+    const float fh = ImGui::GetFrameHeight() * 1.2f;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    if (ImGui::InvisibleButton("##field", V(w, fh)) && target) kb_start(target, text);
+    const bool active = g_kb_open && g_kb_text == text;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, V(p.x + w, p.y + fh), IM_COL32(14, 18, 28, 255), fh * 0.28f);
+    dl->AddRect(p, V(p.x + w, p.y + fh), active ? IM_COL32(48, 110, 235, 255) : IM_COL32(40, 70, 130, 255), fh * 0.28f, 0, active ? 2.0f : 1.0f);
+    const char *shown = text[0] ? text : "tap to type";
+    const ImVec2 ts = ImGui::CalcTextSize(shown);
+    dl->AddText(V(p.x + fh * 0.4f, p.y + (fh - ts.y) * 0.5f), text[0] ? IM_COL32(236, 240, 248, 255) : IM_COL32(112, 122, 146, 255), shown);
+    if (active && ((int)(now_s() * 2.0) & 1)) {                                    /* blinking cursor */
+        const float cx = p.x + fh * 0.4f + (text[0] ? ts.x : 0.0f) + 2.0f;
+        dl->AddLine(V(cx, p.y + fh * 0.2f), V(cx, p.y + fh * 0.8f), IM_COL32(236, 240, 248, 255), 2.0f);
     }
+    ImGui::PopID();
 }
 static void hud_look(float *size, float *alpha, float *bg_alpha) {
     sl_f("Size", size, 0.5f, 12.0f);
@@ -4324,6 +4389,8 @@ static void nc_init(void) {
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("keyboard text", "Java_com_mojang_minecraftpe_MainActivity_nativeSetTextboxText", (void *)hook_set_textbox, (void **)&g_orig_set_textbox);
     reg("keyboard enter", "Java_com_mojang_minecraftpe_MainActivity_nativeReturnKeyPressed", (void *)hook_return_key, (void **)&g_orig_return_key);
+    reg("keyboard type character", "Java_com_mojang_minecraftpe_MainActivity_nativeTypeCharacter", (void *)hook_type_char, (void **)&g_orig_type_char);
+    reg("keyboard key handler", "Java_com_mojang_minecraftpe_MainActivity_nativeKeyHandler", (void *)hook_key_handler, (void **)&g_orig_key_handler);
     reg("keyboard backspace", "Java_com_mojang_minecraftpe_MainActivity_nativeBackSpacePressed", (void *)hook_backspace, (void **)&g_orig_backspace);
     reg("boat paddle gate", "_ZNK21MinecraftInputHandler9canPaddleEv", (void *)hook_can_paddle, (void **)&g_orig_can_paddle);
     reg("old buttons (text probe)", "_ZNK22TouchTextButtonControl6renderER18InputRenderContext", (void *)hook_text_render, (void **)&g_orig_text_render);
