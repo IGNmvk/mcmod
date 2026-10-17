@@ -47,6 +47,10 @@ extern "C" {
 extern "C" bool mih_isMovingForward(void *self) __asm__("_ZNK16MoveInputHandler15isMovingForwardEv");
 extern "C" bool entity_isRiding(const void *self) __asm__("_ZNK6Entity8isRidingEv");
 extern "C" void *entity_getRide(const void *self) __asm__("_ZNK6Entity7getRideEv");
+extern "C" int  entity_getDimensionId(const void *self) __asm__("_ZNK6Entity14getDimensionIdEv");
+extern "C" int  dmg_getCause(const void *src) __asm__("_ZNK18EntityDamageSource8getCauseEv");
+extern "C" int  mob_getHealth(const void *self) __asm__("_ZNK3Mob9getHealthEv");
+extern "C" bool mob_isAlive(const void *self) __asm__("_ZNK3Mob7isAliveEv");
 extern "C" void  boat_setPaddleState(void *boat, int side, bool on) __asm__("_ZN4Boat14setPaddleStateE4Sideb");
 extern "C" bool mob_isSneaking(void *self)      __asm__("_ZNK3Mob10isSneakingEv");
 extern "C" void mob_setSneaking(void *self, bool on) __asm__("_ZN3Mob11setSneakingEb");
@@ -156,6 +160,10 @@ static struct {
     float combat_target_t;
     double combat_target_until;
 } g_snap;
+static volatile int   g_debug_on = 0;                  /* F3 overlay visible */
+static volatile float g_dbg_yaw = 0.0f, g_dbg_pitch = 0.0f;
+static FILE *g_rec_file = 0;                            /* open while recording */
+static void rec_sample(void *player, const float *pos);
 static float g_last_px = 0.0f, g_last_py = 0.0f, g_last_pz = 0.0f;
 static double g_last_pos_time = 0.0;
 static bool g_have_last_pos = false;
@@ -178,6 +186,10 @@ static int g_kb_status = -1;
 static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N, 5 menu search */
 static bool g_kb_native = false;   /* the keyboard was shown through the game's own AppPlatform */
 static bool g_kb_got_full = false;
+/* how many times each text path fired while the keyboard was open (shown on screen while typing):
+ * 0 java text, 1 java enter, 2 java backspace, 3 java type-char, 4 java key, 5 game text, 6 game feed, 7 key events from the input queue */
+static volatile int g_kb_dbg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+#define KB_COUNT(i) do { if (g_kb_open) g_kb_dbg[i]++; } while (0)
 static volatile int g_kb_enter = 0;  /* Enter pressed in the keyboard (set from the Java thread) */
 static char *g_kb_text = 0;
 
@@ -324,6 +336,7 @@ static bool kb_start(int target, char *text) {
     g_kb_text = text;
     if (kb_native_show(text)) {                         /* preferred: the game's own keyboard */
         g_kb_got_full = false;
+        for (int i = 0; i < 8; i++) g_kb_dbg[i] = 0;
         g_kb_native = true;
         g_kb_status = -1;
         g_kb_open = true;
@@ -491,6 +504,7 @@ static void kb_backspace() {                            /* drop the last charact
 
 static void hook_set_textbox(JNIEnv *env, jobject thiz, jstring js) {
     static int logged = 0;
+    KB_COUNT(0);
     if (kb_capturing()) {
         if (js) {
             const char *u = env->GetStringUTFChars(js, 0);
@@ -505,10 +519,12 @@ static void hook_set_textbox(JNIEnv *env, jobject thiz, jstring js) {
     if (g_orig_set_textbox) g_orig_set_textbox(env, thiz, js);
 }
 static void hook_return_key(JNIEnv *env, jobject thiz) {
+    KB_COUNT(1);
     if (kb_capturing()) { nclog("keyboard: Enter"); g_kb_enter = 1; return; }
     if (g_orig_return_key) g_orig_return_key(env, thiz);
 }
 static void hook_backspace(JNIEnv *env, jobject thiz) {
+    KB_COUNT(2);
     if (kb_capturing()) {
         static int logged = 0;
         if (logged < 6) { logged++; nclog("keyboard: backspace callback"); }
@@ -528,6 +544,7 @@ static fn_mg_settext g_orig_mg_settext = 0;
 static fn_feed_text  g_orig_feed_text = 0;
 /* g_kb_got_full: the whole-text callback is in use: ignore single characters */
 static void hook_mg_settext(void *self, const void *str) {
+    KB_COUNT(5);
     if (kb_capturing() && str) {
         const char *u = *(const char *const *)str;
         if (u) {
@@ -541,6 +558,7 @@ static void hook_mg_settext(void *self, const void *str) {
     if (g_orig_mg_settext) g_orig_mg_settext(self, str);
 }
 static void hook_feed_text(const void *str, bool b, unsigned char id) {
+    KB_COUNT(6);
     if (kb_capturing() && str) {
         const char *u = *(const char *const *)str;
         if (u) {
@@ -557,12 +575,14 @@ static void hook_feed_text(const void *str, bool b, unsigned char id) {
  * logged (raw value) and forwarded untouched; reading it as a string could crash. */
 static void hook_type_char(JNIEnv *env, jobject thiz, intptr_t a, intptr_t b) {
     static int logged = 0;
+    KB_COUNT(3);
     if (kb_capturing() && logged < 12) { logged++; nclog("keyboard: type-character callback raw=%ld", (long)a); }
     if (g_orig_type_char) g_orig_type_char(env, thiz, a, b);
 }
 /* nativeKeyHandler(keyCode, action): letter / digit / space / delete keys are turned
  * into text while a field owns the keyboard (Android key codes). */
 static uint8_t hook_key_handler(JNIEnv *env, jobject thiz, int key, int action) {
+    KB_COUNT(4);
     if (kb_capturing()) {
         static int logged = 0;
         if (logged < 12) { logged++; nclog("keyboard: key callback key=%d action=%d", key, action); }
@@ -1265,7 +1285,12 @@ static void hook_tick(void *self, void *player) {
     if (pos) {
         g_snap.x = pos[0]; g_snap.y = pos[1]; g_snap.z = pos[2];
     }
-    if (g_cfg.speed_on) {
+    {
+        NcVec2 r = {0.0f, 0.0f};
+        entity_getRotation(&r, player);
+        if (isfinite(r.x) && isfinite(r.y)) { g_dbg_pitch = r.x; g_dbg_yaw = r.y; }
+    }
+    if (g_cfg.speed_on || g_debug_on || g_rec_file) {
         double t = g_tick_time;
         if (pos) {
             float px = pos[0], py = pos[1], pz = pos[2];
@@ -1286,6 +1311,7 @@ static void hook_tick(void *self, void *player) {
         g_snap.speed_bps = 0.0f;
         g_have_last_pos = false;
     }
+    if (g_rec_file && pos) rec_sample(player, pos);
     if (g_cfg.elytra_angle_on) {
         NcVec2 rot = {0.0f, 0.0f};
         entity_getRotation(&rot, player);
@@ -2629,6 +2655,20 @@ static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
         int32_t r = g_orig_getEvent(q, out);
         if (r < 0 || !out || !*out) return r;
         AInputEvent *ev = *out;
+        if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_KEY && kb_capturing()) {
+            /* Some keyboards deliver typing as ordinary Android key events. */
+            KB_COUNT(7);
+            const int key = AKeyEvent_getKeyCode(ev), act = AKeyEvent_getAction(ev), meta = AKeyEvent_getMetaState(ev);
+            const bool down = (act == AKEY_EVENT_ACTION_DOWN), shift = (meta & AMETA_SHIFT_ON) != 0;
+            bool used = true;
+            if (key >= 29 && key <= 54) { if (down) { char c[2] = { (char)((shift ? 'A' : 'a') + (key - 29)), 0 }; kb_append(c); } }
+            else if (key >= 7 && key <= 16) { if (down) { char c[2] = { (char)('0' + (key - 7)), 0 }; kb_append(c); } }
+            else if (key == 62) { if (down) kb_append(" "); }
+            else if (key == 67) { if (down) kb_backspace(); }
+            else if (key == 66) { if (down) g_kb_enter = 1; }
+            else used = false;
+            if (used) { AInputQueue_finishEvent(q, ev, 1); continue; }
+        }
         if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_MOTION) {
             NcMotion m;
             int32_t raw = AMotionEvent_getAction(ev);
@@ -2842,7 +2882,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_COORDS, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_FAST_TOTEM, E_OFFHAND, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_COORDS, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_FAST_TOTEM, E_OFFHAND, E_F3, E_N, E_COUNT };
 
 static float fpx(float size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, float size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -3338,17 +3378,17 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 static int *elem_on(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
                  case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_COORDS: return &g_cfg.coords_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
-                 case E_DROP: return &g_cfg.drop_on; case E_FAST_TOTEM: return &g_cfg.fast_totem_on; case E_OFFHAND: return &g_cfg.offhand_on; default: return 0; }
+                 case E_DROP: return &g_cfg.drop_on; case E_FAST_TOTEM: return &g_cfg.fast_totem_on; case E_OFFHAND: return &g_cfg.offhand_on; case E_F3: return &g_cfg.f3_on; default: return 0; }
 }
 static float *elem_x(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
                  case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_COORDS: return &g_cfg.coords_x; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
-                 case E_DROP: return &g_cfg.drop_x; case E_FAST_TOTEM: return &g_cfg.fast_totem_x; default: return &g_cfg.n_x; }
+                 case E_DROP: return &g_cfg.drop_x; case E_FAST_TOTEM: return &g_cfg.fast_totem_x; case E_F3: return &g_cfg.f3_x; default: return &g_cfg.n_x; }
 }
 static float *elem_y(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
                  case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_COORDS: return &g_cfg.coords_y; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
-                 case E_DROP: return &g_cfg.drop_y; case E_FAST_TOTEM: return &g_cfg.fast_totem_y; default: return &g_cfg.n_y; }
+                 case E_DROP: return &g_cfg.drop_y; case E_FAST_TOTEM: return &g_cfg.fast_totem_y; case E_F3: return &g_cfg.f3_y; default: return &g_cfg.n_y; }
 }
 static ImVec2 elem_size(int e) {
     switch (e) {
@@ -3364,6 +3404,7 @@ static ImVec2 elem_size(int e) {
         case E_ZOOM:  return btn_size(button_text(E_ZOOM),  g_cfg.zoom_btn);
         case E_PERSP:      return btn_size(button_text(E_PERSP), g_cfg.persp_btn);
         case E_FAST_TOTEM: return btn_size("TOTEM", g_cfg.fast_totem_btn);
+        case E_F3:         return btn_size("F3", g_cfg.f3_btn);
         default:           return btn_size(button_text(E_N), g_cfg.n_btn);
     }
 }
@@ -3398,6 +3439,7 @@ static void build_edit(float w, float h) {
             case E_COORDS: draw_coords(dl, pos); break;
             case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
             case E_DROP:       draw_button(dl, pos, sz, button_text(E_DROP),  g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col); break;
+            case E_F3: draw_button(dl, pos, sz, "F3", g_cfg.f3_alpha, g_cfg.f3_text_alpha, false, false, g_cfg.f3_bg_col, g_cfg.f3_col); break;
             case E_FAST_TOTEM: draw_button(dl, pos, sz, "TOTEM", g_cfg.fast_totem_alpha, g_cfg.fast_totem_text_alpha, false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col); break;
             case E_ZOOM:       draw_button(dl, pos, sz, button_text(E_ZOOM),  g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_bg_col, g_cfg.zoom_col); break;
             case E_PERSP:      draw_button(dl, pos, sz, button_text(E_PERSP), g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col); break;
@@ -3567,6 +3609,301 @@ static void hud_pos(float *x, float *y) {
     ImGui::TextDisabled("Fine tune");
     sl_f("X", x, 0.0f, 1.0f);
     sl_f("Y", y, 0.0f, 1.0f);
+}
+
+/* ================================================================== tools
+ * Death log, chat commands (/!...), F3 debug overlay, session recording. */
+
+static void nc_stamp(char *o, size_t n, bool compact) {
+    time_t t = time(0);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    strftime(o, n, compact ? "%Y%m%d_%H%M%S" : "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+/* ---- messages on screen (command output) ---- */
+struct NcToast { char text[160]; double until; };
+static NcToast g_toasts[8];
+static pthread_mutex_t g_toast_mu = PTHREAD_MUTEX_INITIALIZER;
+static void nc_say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void nc_say(const char *fmt, ...) {
+    char b[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    pthread_mutex_lock(&g_toast_mu);
+    memmove(&g_toasts[0], &g_toasts[1], sizeof(NcToast) * 7);
+    snprintf(g_toasts[7].text, sizeof g_toasts[7].text, "%s", b);
+    g_toasts[7].until = now_s() + 9.0;
+    pthread_mutex_unlock(&g_toast_mu);
+    nclog("cmd: %s", b);
+}
+static bool nc_toasts_active() {
+    const double t = now_s();
+    bool any = false;
+    pthread_mutex_lock(&g_toast_mu);
+    for (int i = 0; i < 8; i++) if (g_toasts[i].until > t) any = true;
+    pthread_mutex_unlock(&g_toast_mu);
+    return any;
+}
+static void draw_toasts(ImDrawList *dl, float w, float h) {
+    const double t = now_s();
+    const float s = fmaxf(1.0f, g_base * 0.95f), pad = 3.0f * s;
+    float y = h * 0.08f;
+    pthread_mutex_lock(&g_toast_mu);
+    for (int i = 0; i < 8; i++) {
+        if (g_toasts[i].until <= t || !g_toasts[i].text[0]) continue;
+        const float left = (float)(g_toasts[i].until - t);
+        const int a = (int)(255.0f * fminf(1.0f, left));                       /* fades in the last second */
+        const ImVec2 ts = txt(g_toasts[i].text, s);
+        const float x = (w - ts.x) * 0.5f;
+        dl->AddRectFilled(V(x - pad, y - pad * 0.5f), V(x + ts.x + pad, y + ts.y + pad * 0.5f), IM_COL32(4, 10, 24, (int)(170.0f * a / 255.0f)), pad);
+        put_text_sh(dl, V(x, y), s, IM_COL32(220, 236, 255, a), g_toasts[i].text, true);
+        y += ts.y + pad * 2.2f;
+    }
+    pthread_mutex_unlock(&g_toast_mu);
+}
+
+/* ---- death log ---- */
+struct NcDeath { char when[24]; float x, y, z; int dim, cause; };
+static NcDeath g_deaths[8];
+static int g_death_n = 0;
+static volatile int g_death_active = 0;                 /* the death screen is up */
+static NcDeath g_death_cur;
+static double g_death_time = 0.0;
+static const char *death_cause_name(int c) {
+    static const char *names[] = { "override", "contact", "entity attack", "projectile", "suffocation", "fall", "fire",
+        "burning", "lava", "drowning", "block explosion", "entity explosion", "void", "suicide", "magic", "wither",
+        "starvation", "anvil", "thorns", "falling block", "piston", "flew into wall", "magma", "fireworks",
+        "lightning", "charging", "temperature" };
+    return (c >= 0 && c < (int)(sizeof(names) / sizeof(names[0]))) ? names[c] : "unknown";
+}
+static void nc_record_death(void *player, const void *src) {
+    if (!g_cfg.deaths_on) return;
+    const float *pos = entity_getPos(player);
+    NcDeath d;
+    memset(&d, 0, sizeof d);
+    nc_stamp(d.when, sizeof d.when, false);
+    if (pos) { d.x = pos[0]; d.y = pos[1]; d.z = pos[2]; }
+    d.dim = entity_getDimensionId(player);
+    d.cause = src ? dmg_getCause(src) : -1;
+    memmove(&g_deaths[1], &g_deaths[0], sizeof(NcDeath) * 7);
+    g_deaths[0] = d;
+    if (g_death_n < 8) g_death_n++;
+    g_death_cur = d;
+    g_death_time = now_s();
+    g_death_active = 1;
+    mkdir(NC_DIR, 0777);
+    FILE *f = fopen(NC_DIR "deaths.txt", "a");
+    if (f) {
+        fprintf(f, "[%s] died at %.1f %.1f %.1f (block %d %d %d) dimension=%d cause=%d (%s)\n", d.when, d.x, d.y, d.z,
+                (int)floorf(d.x), (int)floorf(d.y), (int)floorf(d.z), d.dim, d.cause, death_cause_name(d.cause));
+        fclose(f);
+    }
+    nclog("death: %.1f %.1f %.1f cause=%d", d.x, d.y, d.z, d.cause);
+}
+static void draw_death_screen(ImDrawList *dl, float w, float h) {
+    char b[96];
+    snprintf(b, sizeof b, "Died at  %.0f  %.0f  %.0f", g_death_cur.x, g_death_cur.y, g_death_cur.z);
+    const float s = fmaxf(1.0f, g_base * 1.25f);
+    const ImVec2 ts = txt(b, s);
+    const float x = (w - ts.x) * 0.5f, y = h * 0.37f, pad = 5.0f * s;
+    dl->AddRectFilled(V(x - pad, y - pad * 0.5f), V(x + ts.x + pad, y + ts.y + pad * 0.5f), IM_COL32(4, 10, 24, 150), pad);
+    put_text_sh(dl, V(x, y), s, IM_COL32(120, 190, 255, 255), b, true);
+    if (g_death_cur.cause >= 0) {
+        char c[64];
+        snprintf(c, sizeof c, "cause: %s", death_cause_name(g_death_cur.cause));
+        const float s2 = s * 0.7f;
+        const ImVec2 t2 = txt(c, s2);
+        put_text_sh(dl, V((w - t2.x) * 0.5f, y + ts.y + pad), s2, IM_COL32(190, 205, 225, 230), c, true);
+    }
+}
+
+/* ---- session recording: a timeline file (not video) ---- */
+static char   g_rec_path[200] = "";
+static double g_rec_t0 = 0.0;
+static int    g_rec_rows = 0;
+static void rec_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void rec_event(const char *fmt, ...) {
+    if (!g_rec_file) return;
+    char b[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    fprintf(g_rec_file, "#event,%.2f,%s\n", now_s() - g_rec_t0, b);
+}
+static bool rec_start() {
+    if (g_rec_file) return false;
+    mkdir(NC_DIR, 0777);
+    mkdir(NC_DIR "recordings", 0777);
+    char st[24];
+    nc_stamp(st, sizeof st, true);
+    snprintf(g_rec_path, sizeof g_rec_path, NC_DIR "recordings/rec_%s.csv", st);
+    FILE *f = fopen(g_rec_path, "w");
+    if (!f) { nclog("recording: could not create %s", g_rec_path); return false; }
+    fputs("t,x,y,z,yaw,pitch,health,held_item,sneaking,flying,gliding,riding\n", f);
+    g_rec_rows = 0;
+    g_rec_t0 = now_s();
+    g_rec_file = f;
+    nclog("recording started: %s", g_rec_path);
+    return true;
+}
+static void rec_stop() {
+    if (!g_rec_file) return;
+    FILE *f = g_rec_file;
+    g_rec_file = 0;
+    fclose(f);
+    nclog("recording stopped: %d rows -> %s", g_rec_rows, g_rec_path);
+}
+static void rec_sample(void *player, const float *pos) {
+    if (!g_rec_file) return;
+    fprintf(g_rec_file, "%.2f,%.3f,%.3f,%.3f,%.1f,%.1f,%d,%d,%d,%d,%d,%d\n", now_s() - g_rec_t0, pos[0], pos[1], pos[2],
+            (float)g_dbg_yaw, (float)g_dbg_pitch, mob_getHealth(player), g_snap.held_present ? g_snap.held_id : 0,
+            mob_isSneaking(player) ? 1 : 0, lp_isFlying(player) ? 1 : 0, (int)g_snap.gliding, entity_isRiding(player) ? 1 : 0);
+    if ((++g_rec_rows % 40) == 0) fflush(g_rec_file);
+}
+static void draw_rec_indicator(ImDrawList *dl, float w, float h) {
+    (void)h;
+    const int secs = (int)(now_s() - g_rec_t0);
+    char b[32];
+    snprintf(b, sizeof b, "REC %02d:%02d", secs / 60, secs % 60);
+    const float s = fmaxf(1.0f, g_base * 0.95f);
+    const ImVec2 ts = txt(b, s);
+    const float x = w - ts.x - 14.0f * s, y = 8.0f * s;
+    const bool blink = ((int)(now_s() * 2.0) & 1) == 0;
+    dl->AddCircleFilled(V(x - 7.0f * s, y + ts.y * 0.5f), 3.2f * s, blink ? IM_COL32(235, 50, 60, 255) : IM_COL32(120, 25, 30, 255));
+    put_text_sh(dl, V(x, y), s, IM_COL32(240, 240, 250, 255), b, true);
+}
+
+/* ---- F3 debug overlay ---- */
+static int nc_rss_mb() {
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    long size = 0, rss = 0;
+    if (fscanf(f, "%ld %ld", &size, &rss) != 2) rss = 0;
+    fclose(f);
+    return (int)(rss * 4096L / (1024L * 1024L));
+}
+static void draw_debug_overlay(ImDrawList *dl, float w, float h, float fps) {
+    const float s = fmaxf(1.0f, g_base * 0.62f), pad = 2.0f * s, lh = fpx(s) + pad * 2.0f;
+    char b[160];
+    const float yaw = g_dbg_yaw, pitch = g_dbg_pitch;
+    float yn = fmodf(yaw, 360.0f); if (yn < 0.0f) yn += 360.0f;
+    const char *face = "south (towards +Z)";
+    if (yn >= 45.0f && yn < 135.0f) face = "west (towards -X)";
+    else if (yn >= 135.0f && yn < 225.0f) face = "north (towards -Z)";
+    else if (yn >= 225.0f && yn < 315.0f) face = "east (towards +X)";
+    const int bx = (int)floorf(g_snap.x), by = (int)floorf(g_snap.y), bz = (int)floorf(g_snap.z);
+    auto cmod = [](int v) { int m = v % 16; return m < 0 ? m + 16 : m; };
+    const char *dim = "?";
+    static const char *dims[] = { "overworld", "nether", "the end" };
+    int dimv = g_local_player ? entity_getDimensionId(g_local_player) : -1;
+    if (dimv >= 0 && dimv < 3) dim = dims[dimv];
+
+    char left[16][120];
+    int n = 0;
+    snprintf(left[n++], 120, "Night Client %s (MCPE 1.1.5)", NC_VERSION);
+    snprintf(left[n++], 120, "%d fps  (%.1f ms)", (int)(fps + 0.5f), fps > 1.0f ? 1000.0f / fps : 0.0f);
+    snprintf(left[n++], 120, "XYZ: %.3f / %.5f / %.3f", g_snap.x, g_snap.y, g_snap.z);
+    snprintf(left[n++], 120, "Block: %d %d %d", bx, by, bz);
+    snprintf(left[n++], 120, "Chunk: %d %d  (in chunk %d %d %d)", (int)floorf(g_snap.x / 16.0f), (int)floorf(g_snap.z / 16.0f), cmod(bx), by, cmod(bz));
+    snprintf(left[n++], 120, "Facing: %s  (yaw %.1f / pitch %.1f)", face, yaw, pitch);
+    snprintf(left[n++], 120, "Speed: %.2f blocks/s", g_snap.speed_bps);
+    snprintf(left[n++], 120, "Dimension: %s", dim);
+    if (g_local_player) {
+        snprintf(left[n++], 120, "Health: %d", mob_getHealth(g_local_player));
+        snprintf(left[n++], 120, "Held item id: %d", g_snap.held_present ? g_snap.held_id : 0);
+        snprintf(left[n++], 120, "Flying: %d  Gliding: %d  Sneaking: %d  Riding: %d", g_ctrl_flying ? 1 : 0, (int)g_snap.gliding,
+                 mob_isSneaking(g_local_player) ? 1 : 0, entity_isRiding(g_local_player) ? 1 : 0);
+    }
+    float y = pad;
+    for (int i = 0; i < n; i++) {
+        const ImVec2 ts = txt(left[i], s);
+        dl->AddRectFilled(V(pad, y), V(pad * 3.0f + ts.x, y + lh - pad * 0.5f), IM_COL32(60, 60, 64, 150));
+        put_text_sh(dl, V(pad * 2.0f, y + pad), s, IM_COL32(235, 235, 240, 255), left[i], true);
+        y += lh;
+    }
+
+    static const GLubyte *gpu = 0, *glv = 0;
+    if (!gpu) { gpu = glGetString(GL_RENDERER); glv = glGetString(GL_VERSION); }
+    char right[8][140];
+    int m = 0;
+    snprintf(right[m++], 140, "Display: %dx%d  (gui scale %.1f)", (int)w, (int)h, armor_gs());
+    snprintf(right[m++], 140, "Memory: %d MB", nc_rss_mb());
+    snprintf(right[m++], 140, "GPU: %s", gpu ? (const char *)gpu : "?");
+    snprintf(right[m++], 140, "GL: %s", glv ? (const char *)glv : "?");
+    snprintf(right[m++], 140, "Controls: %s", g_cfg.controls_mode == 1 ? "new" : "vanilla");
+    if (g_rec_file) snprintf(right[m++], 140, "Recording: %d rows", g_rec_rows);
+    y = pad;
+    for (int i = 0; i < m; i++) {
+        const ImVec2 ts = txt(right[i], s);
+        const float x = w - ts.x - pad * 3.0f;
+        dl->AddRectFilled(V(x - pad, y), V(w - pad, y + lh - pad * 0.5f), IM_COL32(60, 60, 64, 150));
+        put_text_sh(dl, V(x, y + pad), s, IM_COL32(235, 235, 240, 255), right[i], true);
+        y += lh;
+    }
+    (void)b;
+}
+
+/* ---- panels for the new modules ---- */
+static void panel_deaths() {
+    head("Death log", &g_cfg.deaths_on, "Every death is written to deaths.txt in the NightClient folder: time, coordinates, dimension and cause.");
+    chk("Show the coordinates on the death screen", &g_cfg.deaths_screen);
+    ImGui::Spacing();
+    ImGui::TextDisabled("File: games/com.mojang/NightClient/deaths.txt");
+    ImGui::TextDisabled("In chat: /!deaths");
+    if (g_death_n > 0) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Latest deaths");
+        for (int i = 0; i < g_death_n && i < 4; i++)
+            ImGui::TextDisabled("%s  %.0f %.0f %.0f", g_deaths[i].when + 11, g_deaths[i].x, g_deaths[i].y, g_deaths[i].z);
+    }
+}
+static void panel_f3() {
+    head("Debug (F3)", &g_cfg.f3_on, "A button on screen that shows or hides a debug overlay, like F3 in Java: position, facing, speed, FPS, memory.");
+    sl_f("Button size", &g_cfg.f3_btn, 0.5f, 12.0f);
+    sl_f("Background opacity", &g_cfg.f3_alpha, 0.0f, 1.0f);
+    sl_f("Text opacity", &g_cfg.f3_text_alpha, 0.0f, 1.0f);
+    color_picker("Text color", &g_cfg.f3_col);
+    color_picker("Background color", &g_cfg.f3_bg_col);
+    hud_pos(&g_cfg.f3_x, &g_cfg.f3_y);
+    chk("Overlay visible now", (int *)&g_debug_on);
+    ImGui::TextDisabled("In chat: /!debug");
+}
+static void panel_recording() {
+    head("Recording", 0, "Records a timeline of your session (position, view direction, health, held item, state and key events) to a file. It is data for later use, not a video.");
+    if (g_rec_file) {
+        const int secs = (int)(now_s() - g_rec_t0);
+        ImGui::TextColored(ACCENT, "Recording  %02d:%02d   %d rows", secs / 60, secs % 60, g_rec_rows);
+        if (choice("Stop recording", true)) { rec_stop(); nc_say("recording saved: %s", g_rec_path); }
+    } else {
+        if (choice("Start recording", false)) { if (rec_start()) nc_say("recording started"); else nc_say("could not start recording"); }
+        if (g_rec_path[0]) ImGui::TextDisabled("Last file: %s", g_rec_path + strlen(NC_DIR));
+    }
+    ImGui::Spacing();
+    ImGui::TextDisabled("Folder: games/com.mojang/NightClient/recordings");
+    ImGui::TextDisabled("In chat: /!record start | stop");
+    ImGui::TextDisabled("For video, use Android's own screen recorder.");
+}
+static void panel_commands() {
+    head("Commands", 0, "Type these in the game chat. Messages starting with /! never reach the server; the answer appears at the top of the screen.");
+    static const char *lines[] = {
+        "/!help                 list the commands",
+        "/!list                 all modules and their state",
+        "/!<module> [on|off]    switch a module (e.g. /!armor off)",
+        "/!set <field> <value>  change any setting",
+        "/!get <field>          read any setting",
+        "/!reset <module>       module back to defaults",
+        "/!debug [on|off]       the F3 overlay",
+        "/!record start|stop    session recording",
+        "/!deaths [clear]       death log",
+        "/!pos                  your coordinates",
+        "/!log [n]              last lines of the client log",
+        "/!save  /!clear  /!version",
+    };
+    for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) ImGui::TextDisabled("%s", lines[i]);
 }
 
 static void panel_autosprint() {
@@ -3820,13 +4157,15 @@ static void reset_module(const char *mod) {
     static const char *const p_perf[]   = { "perf_", 0 };
     static const char *const p_ctrl[]   = { "ctrl_", 0 };
     static const char *const p_client[] = { "ui_font", "n_", "menu_", 0 };
+    static const char *const p_deaths[] = { "deaths_", 0 };
+    static const char *const p_f3[]     = { "f3_", 0 };
     static const struct { const char *name; const char *const *pre; } table[] = {
         { "Autosprint", p_auto }, { "FPS counter", p_fps }, { "Armor HUD", p_armor }, { "Offhand slot", p_off },
         { "Elytra indicator", p_ely }, { "Arrow HUD", p_arrow }, { "Speed indicator", p_speed }, { "Coordinates", p_coords },
         { "XP optimizer", p_xp }, { "Crystal optimizer", p_crys }, { "Elytra angle", p_elya }, { "Quick drop", p_drop },
         { "Fast Totem", p_totem }, { "No hurt cam", p_hurt }, { "Zoom", p_zoom }, { "Perspective button", p_persp },
         { "Hitboxes", p_hit }, { "Particle Remover", p_ptcl }, { "FPS optimizer", p_perf }, { "Controls", p_ctrl },
-        { "Client", p_client },
+        { "Client", p_client }, { "Death log", p_deaths }, { "Debug (F3)", p_f3 },
     };
     const char *const *pre = 0;
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) if (!strcmp(table[i].name, mod)) pre = table[i].pre;
@@ -3860,6 +4199,10 @@ static const Mod g_mods[] = {
     { "Hitboxes",           &g_cfg.hitbox_on,  panel_hitbox },
     { "Particle Remover",   &g_cfg.particle_remover_on, panel_particles },
     { "FPS optimizer",      0,                 panel_perf },
+    { "Death log",          &g_cfg.deaths_on,  panel_deaths },
+    { "Debug (F3)",         &g_cfg.f3_on,      panel_f3 },
+    { "Recording",          0,                 panel_recording },
+    { "Commands",           0,                 panel_commands },
     { "Controls",            0,                 panel_controls },
     { "Client",             0,                 panel_client },
 };
@@ -3975,6 +4318,200 @@ static void menu_click_play() {
         if (env->ExceptionCheck()) { env->ExceptionClear(); g_click_failed = true; nclog("menu click sound failed - turned off"); }
     }
     kb_release(env, attached);
+}
+
+/* ---- chat commands: /!<command> ---- */
+static void nc_norm(const char *in, char *out, size_t n) {
+    size_t k = 0;
+    for (; *in && k + 1 < n; ++in)
+        if (isalnum((unsigned char)*in)) out[k++] = (char)tolower((unsigned char)*in);
+    out[k] = 0;
+}
+/* returns the module index, -1 if none, -2 if several match */
+static int nc_find_module(const char *token) {
+    char t[48]; nc_norm(token, t, sizeof t);
+    if (!t[0]) return -1;
+    int exact = -1, prefix = -1, np = 0, sub = -1, ns = 0;
+    for (int i = 0; i < NC_NMODS; i++) {
+        char m[48]; nc_norm(g_mods[i].name, m, sizeof m);
+        if (!strcmp(m, t)) exact = i;
+        if (!strncmp(m, t, strlen(t))) { prefix = i; np++; }
+        if (strstr(m, t)) { sub = i; ns++; }
+    }
+    if (exact >= 0) return exact;
+    if (np == 1) return prefix;
+    if (np > 1) return -2;
+    if (ns == 1) return sub;
+    if (ns > 1) return -2;
+    return -1;
+}
+static bool nc_parse_bool(const char *v, int *out) {
+    if (!strcmp(v, "on") || !strcmp(v, "true") || !strcmp(v, "1") || !strcmp(v, "yes")) { *out = 1; return true; }
+    if (!strcmp(v, "off") || !strcmp(v, "false") || !strcmp(v, "0") || !strcmp(v, "no")) { *out = 0; return true; }
+    return false;
+}
+static bool nc_set_field(const char *name, const char *val) {
+    int found = 0;
+#define NC_SET_ONE(f, ty, def, mn, mx) \
+    if (!strcmp(name, #f)) { \
+        double dv; int b; char *end = 0; \
+        if (nc_parse_bool(val, &b)) dv = b; else { dv = strtod(val, &end); if (end == val) { nc_say("%s: \"%s\" is not a number", name, val); return true; } } \
+        if (dv < (double)(mn)) dv = (double)(mn); \
+        if (dv > (double)(mx)) dv = (double)(mx); \
+        if (!strcmp(#ty, "I")) dv = floor(dv + 0.5); \
+        g_cfg.f = (decltype(g_cfg.f))dv; \
+        nc_say("%s = %g", name, dv); found = 1; }
+    NC_FIELDS(NC_SET_ONE)
+#undef NC_SET_ONE
+    return found != 0;
+}
+static bool nc_get_field(const char *name) {
+    int found = 0;
+#define NC_GET_ONE(f, ty, def, mn, mx) \
+    if (!strcmp(name, #f)) { nc_say("%s = %g   (default %g, range %g..%g)", name, (double)g_cfg.f, (double)(def), (double)(mn), (double)(mx)); found = 1; }
+    NC_FIELDS(NC_GET_ONE)
+#undef NC_GET_ONE
+    return found != 0;
+}
+static void nc_tail_log(int n) {
+    FILE *f = fopen(NC_LOG, "r");
+    if (!f) { nc_say("no log file"); return; }
+    static char lines[8][160];
+    int count = 0;
+    char buf[400];
+    while (fgets(buf, sizeof buf, f)) {
+        size_t l = strlen(buf);
+        while (l && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
+        if (strncmp(buf, "cmd:", 4) == 0) continue;                 /* don't echo our own output */
+        snprintf(lines[count % 8], sizeof lines[0], "%s", buf);
+        count++;
+    }
+    fclose(f);
+    if (n > 8) n = 8;
+    if (n > count) n = count;
+    for (int i = count - n; i < count; i++) nc_say("%s", lines[i % 8]);
+}
+
+static void nc_command(const char *line) {
+    char buf[200];
+    snprintf(buf, sizeof buf, "%s", line);
+    char *argv[8];
+    int argc = 0;
+    for (char *p = strtok(buf, " \t"); p && argc < 8; p = strtok(0, " \t")) {
+        for (char *q = p; *q; ++q) *q = (char)tolower((unsigned char)*q);
+        argv[argc++] = p;
+    }
+    if (g_rec_file) rec_event("command %s", line);
+    if (argc == 0 || !strcmp(argv[0], "help")) {
+        nc_say("Night Client commands:  /!list  /!<module> [on|off]  /!set <field> <value>  /!get <field>");
+        nc_say("/!reset <module>  /!debug  /!record start|stop  /!deaths  /!pos  /!log [n]  /!save  /!clear  /!version");
+        nc_say("modules: first letters are enough, e.g. /!armor off  /!hit on  /!f3 off");
+        return;
+    }
+    const char *c = argv[0];
+    if (!strcmp(c, "version")) { nc_say("Night Client %s (MCPE 1.1.5)", NC_VERSION); return; }
+    if (!strcmp(c, "clear")) { pthread_mutex_lock(&g_toast_mu); memset(g_toasts, 0, sizeof g_toasts); pthread_mutex_unlock(&g_toast_mu); return; }
+    if (!strcmp(c, "save")) { nc_say(nc_cfg_save(&g_cfg, NC_CFG) ? "settings saved" : "could not save settings"); return; }
+    if (!strcmp(c, "pos")) {
+        nc_say("XYZ %.2f %.2f %.2f   block %d %d %d", g_snap.x, g_snap.y, g_snap.z,
+               (int)floorf(g_snap.x), (int)floorf(g_snap.y), (int)floorf(g_snap.z));
+        return;
+    }
+    if (!strcmp(c, "debug")) {
+        int v;
+        if (argc > 1 && nc_parse_bool(argv[1], &v)) g_debug_on = v; else g_debug_on = g_debug_on ? 0 : 1;
+        nc_say("debug overlay %s", g_debug_on ? "on" : "off");
+        return;
+    }
+    if (!strcmp(c, "record")) {
+        const char *a = argc > 1 ? argv[1] : "status";
+        if (!strcmp(a, "start")) { nc_say(rec_start() ? "recording started" : (g_rec_file ? "already recording" : "could not start recording")); }
+        else if (!strcmp(a, "stop")) { if (g_rec_file) { rec_stop(); nc_say("recording saved: %s", g_rec_path + strlen(NC_DIR)); } else nc_say("not recording"); }
+        else nc_say(g_rec_file ? "recording: %d rows so far" : "not recording", g_rec_rows);
+        return;
+    }
+    if (!strcmp(c, "deaths")) {
+        if (argc > 1 && !strcmp(argv[1], "clear")) { remove(NC_DIR "deaths.txt"); g_death_n = 0; nc_say("death log cleared"); return; }
+        if (g_death_n == 0) { nc_say("no deaths recorded this session (file: NightClient/deaths.txt)"); return; }
+        for (int i = 0; i < g_death_n && i < 4; i++)
+            nc_say("%s  %.0f %.0f %.0f  %s", g_deaths[i].when + 5, g_deaths[i].x, g_deaths[i].y, g_deaths[i].z, death_cause_name(g_deaths[i].cause));
+        return;
+    }
+    if (!strcmp(c, "log")) { nc_tail_log(argc > 1 ? atoi(argv[1]) : 5); return; }
+    if (!strcmp(c, "list")) {
+        char on[160] = "", off[160] = "";
+        for (int i = 0; i < NC_NMODS; i++) {
+            if (!g_mods[i].on) continue;
+            char *dst = *g_mods[i].on ? on : off;
+            size_t cap = sizeof on;
+            if (strlen(dst) + strlen(g_mods[i].name) + 3 < cap) { if (dst[0]) strcat(dst, ", "); strcat(dst, g_mods[i].name); }
+        }
+        nc_say("ON:  %s", on[0] ? on : "-");
+        nc_say("OFF: %s", off[0] ? off : "-");
+        return;
+    }
+    if (!strcmp(c, "set")) {
+        if (argc < 3) { nc_say("usage: /!set <field> <value>   (/!get <field> shows the range)"); return; }
+        if (!nc_set_field(argv[1], argv[2])) nc_say("no setting called \"%s\"", argv[1]);
+        return;
+    }
+    if (!strcmp(c, "get")) {
+        if (argc < 2) { nc_say("usage: /!get <field>"); return; }
+        if (!nc_get_field(argv[1])) nc_say("no setting called \"%s\"", argv[1]);
+        return;
+    }
+    if (!strcmp(c, "reset")) {
+        if (argc < 2) { nc_say("usage: /!reset <module>"); return; }
+        const int m = nc_find_module(argv[1]);
+        if (m < 0) { nc_say(m == -2 ? "\"%s\" matches several modules" : "no module called \"%s\"", argv[1]); return; }
+        reset_module(g_mods[m].name);
+        nc_say("%s reset to defaults", g_mods[m].name);
+        return;
+    }
+    /* /!<module> [on|off|toggle|status] */
+    const int m = nc_find_module(c);
+    if (m == -2) { nc_say("\"%s\" matches several modules - type a bit more", c); return; }
+    if (m < 0) { nc_say("unknown command \"%s\"  (try /!help)", c); return; }
+    if (!g_mods[m].on) { nc_say("%s has no on/off switch - open it in the menu", g_mods[m].name); return; }
+    const char *a = argc > 1 ? argv[1] : "toggle";
+    int v;
+    if (nc_parse_bool(a, &v)) *g_mods[m].on = v;
+    else if (!strcmp(a, "toggle")) *g_mods[m].on = *g_mods[m].on ? 0 : 1;
+    nc_say("%s: %s", g_mods[m].name, *g_mods[m].on ? "on" : "off");
+}
+
+/* Hooks on the game's chat: a message starting with /! is a command and is never sent. */
+typedef void (*fn_chat_model)(void *, const void *);
+static fn_chat_model g_orig_send_chat = 0, g_orig_player_chat = 0;
+static bool nc_chat_intercept(const void *str) {
+    if (!str) return false;
+    const char *u = *(const char *const *)str;                  /* libstdc++ string: a pointer to the characters */
+    if (!u || u[0] != '/' || u[1] != '!') return false;
+    nc_command(u + 2);
+    return true;
+}
+static void hook_send_chat(void *self, const void *str) {
+    if (nc_chat_intercept(str)) return;
+    if (g_orig_send_chat) g_orig_send_chat(self, str);
+}
+static void hook_player_chat(void *self, const void *str) {
+    if (nc_chat_intercept(str)) return;
+    if (g_orig_player_chat) g_orig_player_chat(self, str);
+}
+
+/* Death log hooks. */
+typedef void (*fn_player_die)(void *, const void *);
+typedef void (*fn_player_respawn)(void *);
+static fn_player_die g_orig_player_die = 0;
+static fn_player_respawn g_orig_player_respawn = 0;
+static void hook_player_die(void *self, const void *src) {
+    nc_record_death(self, src);
+    if (g_rec_file) rec_event("death");
+    if (g_orig_player_die) g_orig_player_die(self, src);
+}
+static void hook_player_respawn(void *self) {
+    g_death_active = 0;
+    if (g_orig_player_respawn) g_orig_player_respawn(self);
 }
 
 static char g_search[17] = "";
@@ -4129,10 +4666,17 @@ static void build_menu(float w, float h, NcRect *win_rect) {
     else if (!strcmp(selected_mod, "Perspective button")) g_edit_target = E_PERSP;
     else if (!strcmp(selected_mod, "Quick drop")) g_edit_target = E_DROP;
     else if (!strcmp(selected_mod, "Fast Totem")) g_edit_target = E_FAST_TOTEM;
+    else if (!strcmp(selected_mod, "Debug (F3)")) g_edit_target = E_F3;
     else if (!strcmp(selected_mod, "Client")) g_edit_target = E_N;
     g_mods[g_sel].panel();
     ImGui::EndChild();
     ImGui::EndChild();
+    if (g_kb_open) {                                    /* which text path is firing while you type */
+        char b[200];
+        snprintf(b, sizeof b, "keyboard (%s): java text %d  enter %d  bksp %d  char %d  key %d | game text %d  feed %d | queue keys %d",
+                 g_kb_native ? "game" : "java", g_kb_dbg[0], g_kb_dbg[1], g_kb_dbg[2], g_kb_dbg[3], g_kb_dbg[4], g_kb_dbg[5], g_kb_dbg[6], g_kb_dbg[7]);
+        ImGui::GetForegroundDrawList()->AddText(V(p.x + 14.0f * g_base, p.y + s.y - ImGui::GetFrameHeight() * 1.2f), IM_COL32(255, 220, 90, 255), b);
+    }
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
@@ -4186,10 +4730,16 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     /* Fast Totem remains on the in-game HUD for this test build, but only while
      * at least one totem exists in the inventory or offhand. */
     bool fast_totem_vis = g_cfg.fast_totem_on && hud_btns && g_snap.totem_present;
+    bool f3_vis = g_cfg.f3_on && hud_btns;
+    bool debug_vis = g_debug_on && (in_world || play_hud) && !g_menu_open && !g_edit;
+    bool toast_vis = nc_toasts_active() && !g_menu_open && !g_edit;
+    bool death_vis = g_death_active && g_cfg.deaths_on && g_cfg.deaths_screen && !g_menu_open && !g_edit;
+    bool rec_vis = g_rec_file != 0 && !g_menu_open && !g_edit;
+    if (g_death_active && in_world && gameplay_hud && g_local_player && mob_isAlive(g_local_player) && now_s() - g_death_time > 1.5) g_death_active = 0;
     if (!zoom_vis) g_zoom_active = 0;
 
     bool controls_vis = g_cfg.controls_mode == 1 && gameplay_hud && in_world && !g_menu_open && !g_edit;
-    bool need = fps_vis || armor_vis || offhand_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || controls_vis || menu_reach || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || offhand_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || fast_totem_vis || f3_vis || debug_vis || toast_vis || death_vis || rec_vis || controls_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -4299,6 +4849,16 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
                           false, false, g_cfg.fast_totem_bg_col, g_cfg.fast_totem_col, &hud[3]))
                 fast_totem_move();
         }
+        if (f3_vis) {
+            ImVec2 sz = elem_size(E_F3);
+            if (button_at("##night_f3", place(g_cfg.f3_x, g_cfg.f3_y, sz), sz, "F3",
+                          g_cfg.f3_alpha, g_cfg.f3_text_alpha, false, g_debug_on != 0, g_cfg.f3_bg_col, g_cfg.f3_col, &hud[4]))
+                g_debug_on = g_debug_on ? 0 : 1;
+        }
+        if (debug_vis) draw_debug_overlay(fg, (float)w, (float)h, fps);
+        if (toast_vis) draw_toasts(fg, (float)w, (float)h);
+        if (death_vis) draw_death_screen(fg, (float)w, (float)h);
+        if (rec_vis) draw_rec_indicator(fg, (float)w, (float)h);
         if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
             if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, button_text(E_N),
@@ -4426,6 +4986,10 @@ static void nc_init(void) {
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("keyboard text", "Java_com_mojang_minecraftpe_MainActivity_nativeSetTextboxText", (void *)hook_set_textbox, (void **)&g_orig_set_textbox);
+    reg("chat commands (screen)", "_ZN20MinecraftScreenModel15sendChatMessageERKSs", (void *)hook_send_chat, (void **)&g_orig_send_chat);
+    reg("chat commands (player)", "_ZN11LocalPlayer4chatERKSs", (void *)hook_player_chat, (void **)&g_orig_player_chat);
+    reg("death log", "_ZN11LocalPlayer3dieERK18EntityDamageSource", (void *)hook_player_die, (void **)&g_orig_player_die);
+    reg("death screen respawn", "_ZN11LocalPlayer7respawnEv", (void *)hook_player_respawn, (void **)&g_orig_player_respawn);
     reg("keyboard game text", "_ZN13MinecraftGame14setTextboxTextERKSs", (void *)hook_mg_settext, (void **)&g_orig_mg_settext);
     reg("keyboard game chars", "_ZN8Keyboard8feedTextERKSsbh", (void *)hook_feed_text, (void **)&g_orig_feed_text);
     reg("keyboard enter", "Java_com_mojang_minecraftpe_MainActivity_nativeReturnKeyPressed", (void *)hook_return_key, (void **)&g_orig_return_key);

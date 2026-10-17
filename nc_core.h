@@ -17,6 +17,9 @@ extern "C" {
   X(armor_alpha, F, 1.0, 0.05, 1) X(armor_bg_alpha, F, 0.75, 0.0, 1) X(armor_bg_col, I, 0x08080E, 0, 0xFFFFFF) X(armor_bg, I, 0, 0, 1) X(armor_bar, I, 0, 0, 1) X(armor_num, I, 1, 0, 2) \
   X(armor_horiz,  I, 0,    0, 1) X(armor_col, I, 0xEBEBF5, 0, 0xFFFFFF) \
   X(armor_scale, F, 1.0, 0.5, 2.0) X(armor_dx, F, 0.0, -800.0, 800.0) X(armor_dy, F, 0.0, -800.0, 800.0) \
+  X(deaths_on, I, 1, 0, 1) X(deaths_screen, I, 1, 0, 1) \
+  X(f3_on, I, 1, 0, 1) X(f3_x, F, 0.90, 0, 1) X(f3_y, F, 0.34, 0, 1) X(f3_btn, F, 3.0, 0.5, 12.0) \
+  X(f3_alpha, F, 0.85, 0.0, 1) X(f3_text_alpha, F, 1.0, 0.0, 1) X(f3_col, I, 0xF0F0FA, 0, 0xFFFFFF) X(f3_bg_col, I, 0x1A3A78, 0, 0xFFFFFF) \
   X(menu_blur, I, 1, 0, 1) X(menu_blur_str, F, 0.5, 0.0, 1.0) X(menu_click, I, 1, 0, 1) \
   X(offhand_on, I, 1, 0, 1) X(offhand_always, I, 0, 0, 1) X(offhand_scale, F, 1.0, 0.5, 2.0) X(offhand_alpha, F, 1.0, 0.05, 1.0) \
   X(offhand_dx, F, 0.0, -800.0, 800.0) X(offhand_dy, F, 0.0, -800.0, 800.0) \
