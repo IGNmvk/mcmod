@@ -3787,7 +3787,7 @@ static int nc_rss_mb() {
     return (int)(rss * 4096L / (1024L * 1024L));
 }
 static void draw_debug_overlay(ImDrawList *dl, float w, float h, float fps) {
-    const float s = fmaxf(1.0f, g_base * 0.62f), pad = 2.0f * s, lh = fpx(s) + pad * 2.0f;
+    const float s = fmaxf(1.0f, g_base * 0.62f * g_cfg.f3_size), pad = 2.0f * s, lh = fpx(s) + pad * 2.0f;
     char b[160];
     const float yaw = g_dbg_yaw, pitch = g_dbg_pitch;
     float yn = fmodf(yaw, 360.0f); if (yn < 0.0f) yn += 360.0f;
@@ -3807,6 +3807,8 @@ static void draw_debug_overlay(ImDrawList *dl, float w, float h, float fps) {
     snprintf(left[n++], 120, "Night Client %s (MCPE 1.1.5)", NC_VERSION);
     snprintf(left[n++], 120, "%d fps  (%.1f ms)", (int)(fps + 0.5f), fps > 1.0f ? 1000.0f / fps : 0.0f);
     snprintf(left[n++], 120, "XYZ: %.3f / %.5f / %.3f", g_snap.x, g_snap.y, g_snap.z);
+    if (dimv == 0)      snprintf(left[n++], 120, "Nether: %.3f / %.5f / %.3f", g_snap.x / 8.0f, g_snap.y, g_snap.z / 8.0f);
+    else if (dimv == 1) snprintf(left[n++], 120, "Overworld: %.3f / %.5f / %.3f", g_snap.x * 8.0f, g_snap.y, g_snap.z * 8.0f);
     snprintf(left[n++], 120, "Block: %d %d %d", bx, by, bz);
     snprintf(left[n++], 120, "Chunk: %d %d  (in chunk %d %d %d)", (int)floorf(g_snap.x / 16.0f), (int)floorf(g_snap.z / 16.0f), cmod(bx), by, cmod(bz));
     snprintf(left[n++], 120, "Facing: %s  (yaw %.1f / pitch %.1f)", face, yaw, pitch);
@@ -3863,6 +3865,7 @@ static void panel_deaths() {
 }
 static void panel_f3() {
     head("Debug (F3)", &g_cfg.f3_on, "A button on screen that shows or hides a debug overlay, like F3 in Java: position, facing, speed, FPS, memory.");
+    sl_f("Overlay text size", &g_cfg.f3_size, 0.5f, 3.0f);
     sl_f("Button size", &g_cfg.f3_btn, 0.5f, 12.0f);
     sl_f("Background opacity", &g_cfg.f3_alpha, 0.0f, 1.0f);
     sl_f("Text opacity", &g_cfg.f3_text_alpha, 0.0f, 1.0f);
@@ -4208,17 +4211,32 @@ static const Mod g_mods[] = {
 };
 #define NC_NMODS ((int)(sizeof(g_mods) / sizeof(g_mods[0])))
 
-/* ---- Menu blur: a copy of the game's frame, drawn blurred behind the menu ----
- * The frame is copied into a texture just before our own drawing starts, then
- * drawn several times with tiny offsets (each tap weighted so the result is an
- * average) under a dark tint. Pure ImGui + two GL copy calls; if the copy ever
+/* ---- Menu blur ----
+ * The game's frame is copied into a texture when the menu opens (and refreshed a few
+ * times a second), never every frame. On OpenGL ES 3 the copy gets mip levels and the
+ * menu draws a small level of it stretched over the screen: ONE cheap draw per frame,
+ * which is the blur. Without ES 3 it falls back to a few offset draws. If a GL call
  * errors, blur switches itself off. */
+#define NC_GL_TEXTURE_BASE_LEVEL 0x813C
+#define NC_GL_TEXTURE_MAX_LEVEL  0x813D
 static GLuint g_blur_tex = 0;
-static int    g_blur_w = 0, g_blur_h = 0, g_blur_frame = -1;
-static bool   g_blur_ok = false, g_blur_failed = false;
+static int    g_blur_w = 0, g_blur_h = 0, g_blur_cap_frame = -1000, g_blur_level_used = -1;
+static float  g_blur_str_used = -1.0f;
+static bool   g_blur_ok = false, g_blur_failed = false, g_blur_mip = false, g_blur_es3_known = false, g_blur_es3 = false;
+
+static bool menu_blur_needs_capture() {
+    if (g_blur_failed || !g_cfg.menu_blur || !g_menu_open) return false;
+    return !g_blur_ok || g_frames - g_blur_cap_frame >= 20 || g_blur_str_used != g_cfg.menu_blur_str;
+}
 
 static void menu_blur_capture(int w, int h) {
     if (g_blur_failed || w <= 0 || h <= 0) return;
+    if (!g_blur_es3_known) {
+        g_blur_es3_known = true;
+        const GLubyte *v = glGetString(GL_VERSION);
+        g_blur_es3 = v && strstr((const char *)v, "OpenGL ES 3") != 0;
+        nclog("menu blur: %s", g_blur_es3 ? "OpenGL ES 3 - using the mip-level blur" : "no OpenGL ES 3 - using the offset-draw blur");
+    }
     GLint prev_fbo = 0, prev_tex = 0, prev_active = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
@@ -4228,6 +4246,9 @@ static void menu_blur_capture(int w, int h) {
     if (!g_blur_tex) glGenTextures(1, &g_blur_tex);
     glBindTexture(GL_TEXTURE_2D, g_blur_tex);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);                  /* the real screen */
+    const int level = 2 + (int)(g_cfg.menu_blur_str * 2.0f + 0.5f);       /* mip level shown: 2..4 */
+    bool mip = g_blur_es3;
+    if (mip) glTexParameteri(GL_TEXTURE_2D, NC_GL_TEXTURE_BASE_LEVEL, 0);  /* the copy and the mip chain start at level 0 */
     if (w != g_blur_w || h != g_blur_h) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -4238,32 +4259,46 @@ static void menu_blur_capture(int w, int h) {
     } else {
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
     }
-    const GLenum err = glGetError();
+    if (mip) {
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, NC_GL_TEXTURE_BASE_LEVEL, level);   /* from now the small level is "the" texture */
+    }
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR && mip) {                       /* mip path failed: undo it and use the offset draws */
+        glTexParameteri(GL_TEXTURE_2D, NC_GL_TEXTURE_BASE_LEVEL, 0);
+        while (glGetError() != GL_NO_ERROR) {}
+        nclog("menu blur: mip levels failed (0x%x) - using the offset-draw blur", (unsigned)err);
+        g_blur_es3 = false; mip = false; err = GL_NO_ERROR;
+    }
     if (err != GL_NO_ERROR) {
         g_blur_failed = true; g_blur_ok = false;
         nclog("menu blur: copying the frame failed (0x%x) - blur turned off", (unsigned)err);
     } else {
-        g_blur_ok = true; g_blur_frame = g_frames;
+        g_blur_ok = true; g_blur_mip = mip;
+        g_blur_cap_frame = g_frames; g_blur_str_used = g_cfg.menu_blur_str; g_blur_level_used = level;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
     glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
     glActiveTexture((GLenum)prev_active);
 }
 
-static bool menu_blur_active() { return g_cfg.menu_blur && g_blur_ok && g_blur_frame == g_frames; }
+static bool menu_blur_active() { return g_cfg.menu_blur && g_blur_ok && !g_blur_failed && g_menu_open; }
 
 static void menu_blur_draw(float w, float h) {
     if (!menu_blur_active()) return;
     ImDrawList *bg = ImGui::GetBackgroundDrawList();
     const ImTextureID tex = (ImTextureID)(uintptr_t)g_blur_tex;
-    const int taps = 12;
-    const float r = (2.0f + 14.0f * g_cfg.menu_blur_str) * g_base;
-    bg->AddImage(tex, V(0, 0), V(w, h), V(0, 1), V(1, 0), IM_COL32_WHITE);          /* the frame is stored upside down */
-    for (int i = 1; i <= taps; i++) {
-        const float ang = (float)i * 2.399963f;                                      /* golden angle spiral */
-        const float rad = r * sqrtf((float)i / (float)taps);
-        const float ox = cosf(ang) * rad, oy = sinf(ang) * rad;
-        bg->AddImage(tex, V(ox, oy), V(w + ox, h + oy), V(0, 1), V(1, 0), IM_COL32(255, 255, 255, 255 / (i + 1)));
+    if (g_blur_mip) {
+        bg->AddImage(tex, V(0, 0), V(w, h), V(0, 1), V(1, 0), IM_COL32_WHITE);        /* the small level, stretched = blurred */
+    } else {
+        const int taps = 4;                                                          /* cheap fallback: a few offset draws */
+        const float r = (2.0f + 10.0f * g_cfg.menu_blur_str) * g_base;
+        bg->AddImage(tex, V(0, 0), V(w, h), V(0, 1), V(1, 0), IM_COL32_WHITE);
+        for (int i = 1; i <= taps; i++) {
+            const float ang = (float)i * 1.5707963f + 0.7853981f;
+            const float ox = cosf(ang) * r, oy = sinf(ang) * r;
+            bg->AddImage(tex, V(ox, oy), V(w + ox, h + oy), V(0, 1), V(1, 0), IM_COL32(255, 255, 255, 255 / (i + 1)));
+        }
     }
     bg->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 4, 14, 120));                    /* dark blue tint */
 }
@@ -4781,7 +4816,8 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     if (dt <= 0.0f) dt = 1.0f / 60.0f;
     if (dt > 0.25f) dt = 0.25f;
 
-    if (g_menu_open && g_cfg.menu_blur) menu_blur_capture((int)w, (int)h);       /* the game's frame, before we draw on it */
+    if (menu_blur_needs_capture()) menu_blur_capture((int)w, (int)h);            /* the game's frame, before we draw on it */
+    if (!g_menu_open) g_blur_ok = false;                                         /* a fresh copy each time the menu opens */
     ImGui_ImplOpenGL3_NewFrame();
     if (!g_tex_done) {           /* crisp pixel font: no smoothing when the texture is enlarged */
         g_tex_done = true;
