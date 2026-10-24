@@ -3680,7 +3680,10 @@ static const char *death_cause_name(int c) {
     return (c >= 0 && c < (int)(sizeof(names) / sizeof(names[0]))) ? names[c] : "unknown";
 }
 static void nc_record_death(void *player, const void *src) {
-    if (!g_cfg.deaths_on) return;
+    if (!g_cfg.deaths_on || !player || player != g_local_player) return;
+    static double last_rec = -100.0;
+    if (now_s() - last_rec < 3.0) return;                  /* several game functions announce the same death */
+    last_rec = now_s();
     const float *pos = entity_getPos(player);
     NcDeath d;
     memset(&d, 0, sizeof d);
@@ -4515,39 +4518,65 @@ static void nc_command(const char *line) {
     nc_say("%s: %s", g_mods[m].name, *g_mods[m].on ? "on" : "off");
 }
 
-/* Hooks on the game's chat: a message starting with /! is a command and is never sent. */
+/* Hooks on the game's chat: a message starting with /! is a command and is never sent.
+ * Typed text goes ChatScreenController::_handleChatMessage -> (slash commands)
+ * MinecraftScreenModel::executeCommand, or -> MinecraftScreenModel::sendChatMessage ->
+ * LocalPlayer::chat. All four are hooked, so whichever path the game takes, "/!..." is
+ * caught first. (libstdc++ string: the object is a pointer to the characters.) */
 typedef void (*fn_chat_model)(void *, const void *);
-static fn_chat_model g_orig_send_chat = 0, g_orig_player_chat = 0;
-static bool nc_chat_intercept(const void *str) {
+static fn_chat_model g_orig_send_chat = 0, g_orig_player_chat = 0, g_orig_handle_chat = 0, g_orig_exec_cmd = 0;
+static bool nc_chat_intercept(const void *str, const char *where, bool bang_ok) {
     if (!str) return false;
-    const char *u = *(const char *const *)str;                  /* libstdc++ string: a pointer to the characters */
-    if (!u || u[0] != '/' || u[1] != '!') return false;
-    nc_command(u + 2);
-    return true;
+    const char *u = *(const char *const *)str;
+    if (!u) return false;
+    static int logged = 0;
+    if (logged < 8 && (u[0] == '/' || u[0] == '!')) { logged++; nclog("chat hook %s: \"%.30s\"", where, u); }
+    if (u[0] == '/' && u[1] == '!') { nc_command(u + 2); return true; }
+    if (bang_ok && u[0] == '!') { nc_command(u + 1); return true; }   /* executeCommand may get the text without its "/" */
+    return false;
+}
+static void hook_handle_chat(void *self, const void *str) {
+    if (nc_chat_intercept(str, "handle", false)) return;
+    if (g_orig_handle_chat) g_orig_handle_chat(self, str);
+}
+static void hook_exec_cmd(void *self, const void *str) {
+    if (nc_chat_intercept(str, "execute", true)) return;
+    if (g_orig_exec_cmd) g_orig_exec_cmd(self, str);
 }
 static void hook_send_chat(void *self, const void *str) {
-    if (nc_chat_intercept(str)) return;
+    if (nc_chat_intercept(str, "send", false)) return;
     if (g_orig_send_chat) g_orig_send_chat(self, str);
 }
 static void hook_player_chat(void *self, const void *str) {
-    if (nc_chat_intercept(str)) return;
+    if (nc_chat_intercept(str, "player", false)) return;
     if (g_orig_player_chat) g_orig_player_chat(self, str);
 }
 
-/* Death log hooks. */
-typedef void (*fn_player_die)(void *, const void *);
-typedef void (*fn_player_respawn)(void *);
-static fn_player_die g_orig_player_die = 0;
-static fn_player_respawn g_orig_player_respawn = 0;
-static void hook_player_die(void *self, const void *src) {
-    nc_record_death(self, src);
-    if (g_rec_file) rec_event("death");
-    if (g_orig_player_die) g_orig_player_die(self, src);
+/* Death log hooks: every function the game runs for a player's death is hooked, the
+ * first one to fire writes the entry, the rest are ignored (see nc_record_death). */
+typedef void (*fn_die)(void *, const void *);
+typedef void (*fn_this_only)(void *);
+typedef void (*fn_on_player_death)(void *, void *, const void *);
+static fn_die g_orig_lp_die = 0, g_orig_pl_die = 0, g_orig_mob_die = 0;
+static fn_on_player_death g_orig_on_player_death = 0;
+static fn_this_only g_orig_push_death = 0, g_orig_lp_respawn = 0, g_orig_pl_respawn = 0, g_orig_model_respawn = 0;
+static void hook_lp_die(void *self, const void *src)  { nc_record_death(self, src); if (g_orig_lp_die)  g_orig_lp_die(self, src); }
+static void hook_pl_die(void *self, const void *src)  { nc_record_death(self, src); if (g_orig_pl_die)  g_orig_pl_die(self, src); }
+static void hook_mob_die(void *self, const void *src) { nc_record_death(self, src); if (g_orig_mob_die) g_orig_mob_die(self, src); }
+static void hook_on_player_death(void *level, void *player, const void *src) {
+    nc_record_death(player, src);
+    if (g_orig_on_player_death) g_orig_on_player_death(level, player, src);
 }
-static void hook_player_respawn(void *self) {
-    g_death_active = 0;
-    if (g_orig_player_respawn) g_orig_player_respawn(self);
+static void hook_push_death(void *self) {                /* the death screen is being opened */
+    nc_record_death(g_local_player, 0);
+    g_death_active = g_cfg.deaths_on ? 1 : 0;
+    if (g_death_time == 0.0 || now_s() - g_death_time > 3.0) g_death_time = now_s();
+    if (g_orig_push_death) g_orig_push_death(self);
 }
+static void nc_respawned() { g_death_active = 0; }
+static void hook_lp_respawn(void *self)    { nc_respawned(); if (g_orig_lp_respawn) g_orig_lp_respawn(self); }
+static void hook_pl_respawn(void *self)    { nc_respawned(); if (g_orig_pl_respawn) g_orig_pl_respawn(self); }
+static void hook_model_respawn(void *self) { nc_respawned(); if (g_orig_model_respawn) g_orig_model_respawn(self); }
 
 static char g_search[17] = "";
 static bool menu_name_matches(const char *name, const char *needle) {
@@ -5022,10 +5051,18 @@ static void nc_init(void) {
     reg("tap blocker (mining continue)", "_ZN8GameMode20continueDestroyBlockER6Player8BlockPosaRb", (void *)hook_continue_destroy, (void **)&g_orig_continue_destroy);
     reg("hide vanilla controls", "_ZNK15TouchControlSet6renderER18InputRenderContext", (void *)hook_touch_render, (void **)&g_orig_touch_render);
     reg("keyboard text", "Java_com_mojang_minecraftpe_MainActivity_nativeSetTextboxText", (void *)hook_set_textbox, (void **)&g_orig_set_textbox);
+    reg("chat commands (handle)", "_ZN20ChatScreenController18_handleChatMessageERKSs", (void *)hook_handle_chat, (void **)&g_orig_handle_chat);
+    reg("chat commands (execute)", "_ZN20MinecraftScreenModel14executeCommandERKSs", (void *)hook_exec_cmd, (void **)&g_orig_exec_cmd);
     reg("chat commands (screen)", "_ZN20MinecraftScreenModel15sendChatMessageERKSs", (void *)hook_send_chat, (void **)&g_orig_send_chat);
     reg("chat commands (player)", "_ZN11LocalPlayer4chatERKSs", (void *)hook_player_chat, (void **)&g_orig_player_chat);
-    reg("death log", "_ZN11LocalPlayer3dieERK18EntityDamageSource", (void *)hook_player_die, (void **)&g_orig_player_die);
-    reg("death screen respawn", "_ZN11LocalPlayer7respawnEv", (void *)hook_player_respawn, (void **)&g_orig_player_respawn);
+    reg("death log (local player)", "_ZN11LocalPlayer3dieERK18EntityDamageSource", (void *)hook_lp_die, (void **)&g_orig_lp_die);
+    reg("death log (player)", "_ZN6Player3dieERK18EntityDamageSource", (void *)hook_pl_die, (void **)&g_orig_pl_die);
+    reg("death log (mob)", "_ZN3Mob3dieERK18EntityDamageSource", (void *)hook_mob_die, (void **)&g_orig_mob_die);
+    reg("death log (level)", "_ZN5Level13onPlayerDeathER6PlayerRK18EntityDamageSource", (void *)hook_on_player_death, (void **)&g_orig_on_player_death);
+    reg("death screen opened", "_ZN13ScreenChooser15pushDeathScreenEv", (void *)hook_push_death, (void **)&g_orig_push_death);
+    reg("respawn (local player)", "_ZN11LocalPlayer7respawnEv", (void *)hook_lp_respawn, (void **)&g_orig_lp_respawn);
+    reg("respawn (player)", "_ZN6Player7respawnEv", (void *)hook_pl_respawn, (void **)&g_orig_pl_respawn);
+    reg("respawn (screen model)", "_ZN20MinecraftScreenModel13respawnPlayerEv", (void *)hook_model_respawn, (void **)&g_orig_model_respawn);
     reg("keyboard game text", "_ZN13MinecraftGame14setTextboxTextERKSs", (void *)hook_mg_settext, (void **)&g_orig_mg_settext);
     reg("keyboard game chars", "_ZN8Keyboard8feedTextERKSsbh", (void *)hook_feed_text, (void **)&g_orig_feed_text);
     reg("keyboard enter", "Java_com_mojang_minecraftpe_MainActivity_nativeReturnKeyPressed", (void *)hook_return_key, (void **)&g_orig_return_key);
